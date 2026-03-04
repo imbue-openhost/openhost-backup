@@ -1,3 +1,5 @@
+print("backup app module loading...", flush=True)
+
 import asyncio
 import json
 import logging
@@ -10,6 +12,7 @@ from quart import Quart, render_template, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+logger.info("backup app module loaded")
 
 app = Quart(__name__)
 

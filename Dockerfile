@@ -5,12 +5,12 @@ RUN apk add --no-cache rclone
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
-COPY pyproject.toml .
-RUN uv sync --no-dev --no-install-project
+COPY pyproject.toml uv.lock ./
+RUN uv sync
 
 COPY app.py .
 COPY templates/ templates/
 
 EXPOSE 8080
 
-CMD ["uv", "run", "hypercorn", "-b", "0.0.0.0:8080", "app:app"]
+CMD ["sh", "-c", "echo 'Starting hypercorn...' && uv run hypercorn -b 0.0.0.0:8080 app:app"]
