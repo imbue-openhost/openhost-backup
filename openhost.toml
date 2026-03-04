@@ -1,0 +1,21 @@
+[app]
+name = "backup"
+version = "0.1.0"
+description = "User-controlled backups of app data via rclone"
+
+[runtime]
+type = "serverfull"
+
+[runtime.container]
+image = "Dockerfile"
+port = 8080
+
+[routing]
+base_path = "/backup"
+
+[resources]
+memory_mb = 128
+cpu_millicores = 100
+
+[data]
+access_all_data = true

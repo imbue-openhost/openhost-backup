@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backup</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
+        h1 { font-size: 1.5rem; margin-bottom: 24px; }
+        h2 { font-size: 1.1rem; margin-bottom: 12px; color: #333; }
+        section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+        label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; color: #555; }
+        input[type="text"], input[type="number"], input[type="password"] {
+            width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px;
+            font-size: 0.9rem; margin-bottom: 12px;
+        }
+        textarea {
+            width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px;
+            font-family: monospace; font-size: 0.85rem; resize: vertical; min-height: 160px;
+            margin-bottom: 12px;
+        }
+        button {
+            padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;
+            font-size: 0.9rem; font-weight: 500;
+        }
+        .btn-primary { background: #2563eb; color: white; }
+        .btn-primary:hover { background: #1d4ed8; }
+        .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+        .btn-secondary { background: #e5e7eb; color: #333; }
+        .btn-secondary:hover { background: #d1d5db; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-row { display: flex; gap: 8px; align-items: center; }
+        .status-badge {
+            display: inline-block; padding: 2px 8px; border-radius: 12px;
+            font-size: 0.8rem; font-weight: 600;
+        }
+        .status-success { background: #dcfce7; color: #166534; }
+        .status-error { background: #fee2e2; color: #991b1b; }
+        .status-running { background: #dbeafe; color: #1e40af; }
+        .status-none { background: #f3f4f6; color: #6b7280; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .info { font-size: 0.85rem; color: #666; margin-bottom: 12px; line-height: 1.5; }
+        .field-row { margin-bottom: 0; }
+        .msg { font-size: 0.85rem; margin-top: 8px; padding: 8px; border-radius: 4px; }
+        .msg-ok { background: #dcfce7; color: #166534; }
+        .msg-err { background: #fee2e2; color: #991b1b; }
+        dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; font-size: 0.9rem; }
+        dt { font-weight: 600; color: #555; }
+    </style>
+</head>
+<body>
+    <h1>Backup</h1>
+
+    <!-- Status -->
+    <section>
+        <h2>Status</h2>
+        <dl>
+            <dt>State</dt>
+            <dd id="status-state">
+                {% if state.running %}
+                    <span class="status-badge status-running">running</span>
+                {% elif state.last_status == "success" %}
+                    <span class="status-badge status-success">ok</span>
+                {% elif state.last_status and state.last_status.startswith("error") %}
+                    <span class="status-badge status-error">{{ state.last_status }}</span>
+                {% else %}
+                    <span class="status-badge status-none">no backups yet</span>
+                {% endif %}
+            </dd>
+            <dt>Last backup</dt>
+            <dd id="status-last">{{ state.last_backup or "never" }}</dd>
+            <dt>Interval</dt>
+            <dd>{{ config.interval_seconds }}s</dd>
+        </dl>
+        <div class="btn-row" style="margin-top: 12px;">
+            <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
+        </div>
+        <div id="backup-msg"></div>
+    </section>
+
+    <!-- Quick Setup: S3 -->
+    <section>
+        <h2>Quick Setup: S3</h2>
+        <p class="info">Fill in your S3 credentials to generate an rclone config. This overwrites the config below.</p>
+        <div class="grid-2">
+            <div>
+                <label>Remote name</label>
+                <input type="text" id="s3-remote" value="{{ config.remote_name }}">
+            </div>
+            <div>
+                <label>Bucket</label>
+                <input type="text" id="s3-bucket" value="{{ config.remote_path }}" placeholder="my-backups">
+            </div>
+        </div>
+        <div class="grid-2">
+            <div>
+                <label>Access key</label>
+                <input type="text" id="s3-access-key" placeholder="AKIA...">
+            </div>
+            <div>
+                <label>Secret key</label>
+                <input type="password" id="s3-secret-key" placeholder="...">
+            </div>
+        </div>
+        <label>Region</label>
+        <input type="text" id="s3-region" value="us-east-1">
+        <button class="btn-primary" onclick="setupS3()">Generate config</button>
+        <div id="s3-msg"></div>
+    </section>
+
+    <!-- rclone.conf editor -->
+    <section>
+        <h2>rclone.conf</h2>
+        <p class="info">
+            Edit the rclone config directly. For backends other than S3, run
+            <code>rclone config</code> on your local machine and paste the contents of
+            <code>~/.config/rclone/rclone.conf</code> here.
+        </p>
+        <textarea id="rclone-conf">{{ rclone_conf }}</textarea>
+        <div class="grid-2">
+            <div>
+                <label>Remote name (must match a section above)</label>
+                <input type="text" id="conf-remote-name" value="{{ config.remote_name }}">
+            </div>
+            <div>
+                <label>Remote path (bucket or path)</label>
+                <input type="text" id="conf-remote-path" value="{{ config.remote_path }}">
+            </div>
+        </div>
+        <label>Backup interval (seconds, minimum 60)</label>
+        <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
+        <button class="btn-primary" onclick="saveConfig()">Save</button>
+        <div id="conf-msg"></div>
+    </section>
+
+    <script>
+        const BASE = "{{ base_path }}";
+
+        async function api(path, opts = {}) {
+            const url = BASE + path;
+            if (opts.body && typeof opts.body === "object") {
+                opts.headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+                opts.body = JSON.stringify(opts.body);
+            }
+            const r = await fetch(url, opts);
+            return r.json();
+        }
+
+        function showMsg(id, text, ok) {
+            const el = document.getElementById(id);
+            el.textContent = text;
+            el.className = "msg " + (ok ? "msg-ok" : "msg-err");
+            setTimeout(() => { el.textContent = ""; el.className = ""; }, 4000);
+        }
+
+        async function setupS3() {
+            const data = {
+                remote_name: document.getElementById("s3-remote").value,
+                bucket: document.getElementById("s3-bucket").value,
+                access_key: document.getElementById("s3-access-key").value,
+                secret_key: document.getElementById("s3-secret-key").value,
+                region: document.getElementById("s3-region").value,
+            };
+            const res = await api("/api/setup-s3", { method: "POST", body: data });
+            if (res.ok) {
+                document.getElementById("rclone-conf").value = res.rclone_conf;
+                document.getElementById("conf-remote-name").value = data.remote_name;
+                document.getElementById("conf-remote-path").value = data.bucket;
+                showMsg("s3-msg", "Config generated", true);
+            } else {
+                showMsg("s3-msg", "Error: " + (res.error || "unknown"), false);
+            }
+        }
+
+        async function saveConfig() {
+            const data = {
+                rclone_conf: document.getElementById("rclone-conf").value,
+                remote_name: document.getElementById("conf-remote-name").value,
+                remote_path: document.getElementById("conf-remote-path").value,
+                interval_seconds: parseInt(document.getElementById("conf-interval").value, 10),
+            };
+            const res = await api("/api/config", { method: "POST", body: data });
+            showMsg("conf-msg", res.ok ? "Saved" : "Error", res.ok);
+        }
+
+        async function triggerBackup() {
+            const btn = document.getElementById("btn-backup");
+            btn.disabled = true;
+            btn.textContent = "Starting...";
+            const res = await api("/api/backup", { method: "POST" });
+            if (res.ok) {
+                showMsg("backup-msg", "Backup started", true);
+                pollStatus();
+            } else {
+                showMsg("backup-msg", res.error || "Failed", false);
+                btn.disabled = false;
+                btn.textContent = "Run backup now";
+            }
+        }
+
+        async function pollStatus() {
+            const btn = document.getElementById("btn-backup");
+            const stateEl = document.getElementById("status-state");
+            const lastEl = document.getElementById("status-last");
+
+            const poll = async () => {
+                const res = await api("/api/status");
+                if (res.running) {
+                    stateEl.innerHTML = '<span class="status-badge status-running">running</span>';
+                    setTimeout(poll, 2000);
+                } else {
+                    if (res.last_status === "success") {
+                        stateEl.innerHTML = '<span class="status-badge status-success">ok</span>';
+                    } else {
+                        stateEl.innerHTML = '<span class="status-badge status-error">' + (res.last_status || "error") + '</span>';
+                    }
+                    lastEl.textContent = res.last_backup || "never";
+                    btn.disabled = false;
+                    btn.textContent = "Run backup now";
+                }
+            };
+            poll();
+        }
+    </script>
+</body>
+</html>
