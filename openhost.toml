@@ -10,9 +10,6 @@ type = "serverfull"
 image = "Dockerfile"
 port = 8080
 
-[routing]
-base_path = "/backup"
-
 [resources]
 memory_mb = 128
 cpu_millicores = 1000
