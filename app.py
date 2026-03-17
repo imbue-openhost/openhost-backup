@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ ALL_APP_DATA = Path("/data/app_data")
 CONFIG_DIR = APP_DATA_DIR
 RCLONE_CONF = CONFIG_DIR / "rclone.conf"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+DB_FILE = CONFIG_DIR / "backups.db"
 
 DEFAULT_CONFIG = {
     "interval_seconds": 3600,
@@ -30,12 +32,59 @@ DEFAULT_CONFIG = {
     "remote_path": "",
 }
 
-# Backup state
-backup_state = {
-    "last_backup": None,
-    "last_status": None,
-    "running": False,
-}
+
+def init_db():
+    """Initialize SQLite database and return a connection."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_FILE))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            status TEXT NOT NULL,
+            error_message TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_db():
+    """Get a database connection (creates one per call, safe for sync use)."""
+    return init_db()
+
+
+def record_backup(timestamp, status, error_message=None):
+    """Insert a backup record into the database."""
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO backups (timestamp, status, error_message) VALUES (?, ?, ?)",
+            (timestamp, status, error_message),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_last_backup():
+    """Return the most recent backup record, or None."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT timestamp, status, error_message FROM backups ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return {"timestamp": row[0], "status": row[1], "error_message": row[2]}
+        return None
+    finally:
+        conn.close()
+
+
+# In-memory flag — not persisted (reset on startup is correct behavior)
+backup_running = False
 
 scheduler_task = None
 
@@ -78,7 +127,8 @@ def generate_s3_conf(remote_name, bucket, access_key, secret_key, region):
 
 
 async def run_backup():
-    if backup_state["running"]:
+    global backup_running
+    if backup_running:
         logger.warning("Backup already in progress, skipping")
         return False
 
@@ -88,18 +138,18 @@ async def run_backup():
 
     if not RCLONE_CONF.exists():
         logger.error("No rclone.conf configured, skipping backup")
-        backup_state["last_status"] = "error: no rclone.conf"
+        record_backup("", "error", "no rclone.conf")
         return False
 
     if not remote_name or not remote_path:
         logger.error("Remote name or path not configured, skipping backup")
-        backup_state["last_status"] = "error: remote not configured"
+        record_backup("", "error", "remote not configured")
         return False
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     dest = f"{remote_name}:{remote_path}/{timestamp}"
 
-    backup_state["running"] = True
+    backup_running = True
     logger.info("Starting backup to %s", dest)
 
     try:
@@ -119,34 +169,53 @@ async def run_backup():
                 logger.info("rclone: %s", line)
 
         if proc.returncode == 0:
-            backup_state["last_backup"] = timestamp
-            backup_state["last_status"] = "success"
+            record_backup(timestamp, "success")
             logger.info("Backup completed successfully")
+            return True
         else:
-            backup_state["last_status"] = f"error: rclone exit code {proc.returncode}"
+            error_msg = f"rclone exit code {proc.returncode}"
+            record_backup(timestamp, "error", error_msg)
             logger.error("Backup failed with exit code %d", proc.returncode)
+            return False
     except Exception as e:
-        backup_state["last_status"] = f"error: {e}"
+        record_backup(timestamp, "error", str(e))
         logger.exception("Backup failed")
+        return False
     finally:
-        backup_state["running"] = False
-
-    return backup_state["last_status"] == "success"
+        backup_running = False
 
 
 async def scheduler_loop():
+    # On first iteration, account for time already elapsed since last backup
+    first_run = True
     while True:
         conf = load_config()
         interval = conf["interval_seconds"]
-        logger.info("Next backup in %d seconds", interval)
-        await asyncio.sleep(interval)
+
+        if first_run:
+            first_run = False
+            last = get_last_backup()
+            if last and last["timestamp"]:
+                try:
+                    last_dt = datetime.strptime(last["timestamp"], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                    wait = max(0, interval - elapsed)
+                except (ValueError, TypeError):
+                    wait = interval
+            else:
+                wait = interval
+        else:
+            wait = interval
+
+        logger.info("Next backup in %d seconds", int(wait))
+        await asyncio.sleep(wait)
         await run_backup()
 
 
 @app.before_serving
 async def startup():
     global scheduler_task
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    init_db()
     scheduler_task = asyncio.create_task(scheduler_loop())
     logger.info("Backup scheduler started")
 
@@ -161,12 +230,19 @@ async def shutdown():
 async def index():
     conf = load_config()
     rclone_conf = load_rclone_conf()
+    last = get_last_backup()
+    state = {
+        "running": backup_running,
+        "last_backup": last["timestamp"] if last else None,
+        "last_status": last["status"] if last else None,
+        "last_error": last["error_message"] if last else None,
+    }
     return await render_template(
         "index.html",
         base_path=BASE_PATH,
         config=conf,
         rclone_conf=rclone_conf,
-        state=backup_state,
+        state=state,
     )
 
 
@@ -215,7 +291,7 @@ async def setup_s3():
 
 @app.route("/api/backup", methods=["POST"])
 async def trigger_backup():
-    if backup_state["running"]:
+    if backup_running:
         return jsonify(ok=False, error="Backup already in progress"), 409
     asyncio.create_task(run_backup())
     return jsonify(ok=True, message="Backup started")
@@ -224,10 +300,12 @@ async def trigger_backup():
 @app.route("/api/status")
 async def status():
     conf = load_config()
+    last = get_last_backup()
     return jsonify(
-        running=backup_state["running"],
-        last_backup=backup_state["last_backup"],
-        last_status=backup_state["last_status"],
+        running=backup_running,
+        last_backup=last["timestamp"] if last else None,
+        last_status=last["status"] if last else None,
+        last_error=last["error_message"] if last else None,
         interval_seconds=conf["interval_seconds"],
     )
 
