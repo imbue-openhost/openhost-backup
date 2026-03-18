@@ -63,8 +63,8 @@
                     <span class="status-badge status-running">running</span>
                 {% elif state.last_status == "success" %}
                     <span class="status-badge status-success">ok</span>
-                {% elif state.last_status and state.last_status.startswith("error") %}
-                    <span class="status-badge status-error">{{ state.last_status }}</span>
+                {% elif state.last_status == "error" %}
+                    <span class="status-badge status-error">error: {{ state.last_error }}</span>
                 {% else %}
                     <span class="status-badge status-none">no backups yet</span>
                 {% endif %}
@@ -231,8 +231,10 @@
                 } else {
                     if (res.last_status === "success") {
                         stateEl.innerHTML = '<span class="status-badge status-success">ok</span>';
+                    } else if (res.last_status === "error") {
+                        stateEl.innerHTML = '<span class="status-badge status-error">error: ' + (res.last_error || "unknown") + '</span>';
                     } else {
-                        stateEl.innerHTML = '<span class="status-badge status-error">' + (res.last_status || "error") + '</span>';
+                        stateEl.innerHTML = '<span class="status-badge status-none">no backups yet</span>';
                     }
                     lastEl.textContent = res.last_backup || "never";
                     btn.disabled = false;
