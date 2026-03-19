@@ -333,7 +333,8 @@ async def shutdown():
         scheduler_task.cancel()
 
 
-@app.route("/")
+@app.route(f"{BASE_PATH}/")
+@app.route(f"{BASE_PATH}")
 async def index():
     conf = load_config()
     rclone_conf = load_rclone_conf()
@@ -353,12 +354,12 @@ async def index():
     )
 
 
-@app.route("/api/config", methods=["GET"])
+@app.route(f"{BASE_PATH}/api/config", methods=["GET"])
 async def get_config():
     return jsonify(config=load_config(), rclone_conf=load_rclone_conf())
 
 
-@app.route("/api/config", methods=["POST"])
+@app.route(f"{BASE_PATH}/api/config", methods=["POST"])
 async def post_config():
     data = await request.get_json()
 
@@ -376,7 +377,7 @@ async def post_config():
     return jsonify(ok=True)
 
 
-@app.route("/api/setup-s3", methods=["POST"])
+@app.route(f"{BASE_PATH}/api/setup-s3", methods=["POST"])
 async def setup_s3():
     data = await request.get_json()
     remote_name = data.get("remote_name", "openhost-backup")
@@ -396,7 +397,7 @@ async def setup_s3():
     return jsonify(ok=True, rclone_conf=rclone_text)
 
 
-@app.route("/api/backup", methods=["POST"])
+@app.route(f"{BASE_PATH}/api/backup", methods=["POST"])
 async def trigger_backup():
     if backup_running:
         return jsonify(ok=False, error="Backup already in progress"), 409
@@ -404,7 +405,7 @@ async def trigger_backup():
     return jsonify(ok=True, message="Backup started")
 
 
-@app.route("/api/status")
+@app.route(f"{BASE_PATH}/api/status")
 async def status():
     conf = load_config()
     last = get_last_backup()
@@ -417,13 +418,13 @@ async def status():
     )
 
 
-@app.route("/api/backups")
+@app.route(f"{BASE_PATH}/api/backups")
 async def get_backups():
     snapshots = await list_snapshots()
     return jsonify(snapshots=snapshots)
 
 
-@app.route("/api/restore", methods=["POST"])
+@app.route(f"{BASE_PATH}/api/restore", methods=["POST"])
 async def trigger_restore():
     if restore_state["running"]:
         return jsonify(ok=False, error="Restore already in progress"), 409
@@ -439,7 +440,7 @@ async def trigger_restore():
     return jsonify(ok=True, message="Restore started")
 
 
-@app.route("/api/restore/status")
+@app.route(f"{BASE_PATH}/api/restore/status")
 async def restore_status():
     return jsonify(
         running=restore_state["running"],
@@ -448,6 +449,6 @@ async def restore_status():
     )
 
 
-@app.route("/health")
+@app.route(f"{BASE_PATH}/health")
 async def health():
     return "ok"
