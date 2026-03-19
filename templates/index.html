@@ -39,6 +39,7 @@
         .status-error { background: #fee2e2; color: #991b1b; }
         .status-running { background: #dbeafe; color: #1e40af; }
         .status-none { background: #f3f4f6; color: #6b7280; }
+        .status-restore { background: #fef3c7; color: #92400e; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
         .info { font-size: 0.85rem; color: #666; margin-bottom: 12px; line-height: 1.5; }
         .field-row { margin-bottom: 0; }
@@ -77,6 +78,24 @@
             <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
         </div>
         <div id="backup-msg"></div>
+    </section>
+
+    <!-- Restore -->
+    <section>
+        <h2>Restore</h2>
+        <p class="info">Restore app data from a previous backup snapshot. This will overwrite current app data.</p>
+        <div class="btn-row" style="margin-bottom: 12px;">
+            <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
+        </div>
+        <div id="snapshots-container" style="display:none;">
+            <label>Select a snapshot</label>
+            <select id="snapshot-select" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:0.9rem;margin-bottom:12px;font-family:monospace;"></select>
+            <div class="btn-row">
+                <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
+            </div>
+        </div>
+        <div id="restore-state" style="margin-top:12px;"></div>
+        <div id="restore-msg"></div>
     </section>
 
     <!-- Quick Setup: S3 -->
@@ -220,6 +239,74 @@
                     lastEl.textContent = res.last_backup || "never";
                     btn.disabled = false;
                     btn.textContent = "Run backup now";
+                }
+            };
+            poll();
+        }
+        async function loadSnapshots() {
+            const btn = document.getElementById("btn-load-snapshots");
+            btn.disabled = true;
+            btn.textContent = "Loading...";
+            const res = await api("/api/backups");
+            btn.disabled = false;
+            btn.textContent = "Load snapshots";
+
+            const container = document.getElementById("snapshots-container");
+            const select = document.getElementById("snapshot-select");
+            select.innerHTML = "";
+
+            if (res.snapshots && res.snapshots.length > 0) {
+                res.snapshots.forEach(s => {
+                    const opt = document.createElement("option");
+                    opt.value = s;
+                    opt.textContent = s;
+                    select.appendChild(opt);
+                });
+                container.style.display = "block";
+            } else {
+                container.style.display = "none";
+                showMsg("restore-msg", "No snapshots found", false);
+            }
+        }
+
+        async function triggerRestore() {
+            const snapshot = document.getElementById("snapshot-select").value;
+            if (!snapshot) return;
+            if (!confirm("This will overwrite current app data with the backup from " + snapshot + ". Continue?")) return;
+
+            const btn = document.getElementById("btn-restore");
+            btn.disabled = true;
+            btn.textContent = "Restoring...";
+            const res = await api("/api/restore", { method: "POST", body: { snapshot } });
+            if (res.ok) {
+                showMsg("restore-msg", "Restore started", true);
+                pollRestore();
+            } else {
+                showMsg("restore-msg", res.error || "Failed", false);
+                btn.disabled = false;
+                btn.textContent = "Restore";
+            }
+        }
+
+        async function pollRestore() {
+            const btn = document.getElementById("btn-restore");
+            const stateEl = document.getElementById("restore-state");
+
+            const poll = async () => {
+                const res = await api("/api/restore/status");
+                if (res.running) {
+                    stateEl.innerHTML = '<span class="status-badge status-restore">restoring...</span>';
+                    setTimeout(poll, 2000);
+                } else {
+                    if (res.last_status === "success") {
+                        stateEl.innerHTML = '<span class="status-badge status-success">restored: ' + (res.last_restore || "") + '</span>';
+                    } else if (res.last_status) {
+                        stateEl.innerHTML = '<span class="status-badge status-error">' + res.last_status + '</span>';
+                    } else {
+                        stateEl.innerHTML = "";
+                    }
+                    btn.disabled = false;
+                    btn.textContent = "Restore";
                 }
             };
             poll();

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -85,6 +86,13 @@ def get_last_backup():
 
 # In-memory flag — not persisted (reset on startup is correct behavior)
 backup_running = False
+
+# Restore state
+restore_state = {
+    "last_restore": None,
+    "last_status": None,
+    "running": False,
+}
 
 scheduler_task = None
 
@@ -185,6 +193,105 @@ async def run_backup():
         backup_running = False
 
 
+SNAPSHOT_RE = re.compile(r"^[\w\-:.T]+$")
+
+
+async def list_snapshots():
+    """List available backup snapshots from the remote."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    if not RCLONE_CONF.exists() or not remote_name or not remote_path:
+        return []
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "rclone", "lsjson",
+            f"{remote_name}:{remote_path}",
+            "--config", str(RCLONE_CONF),
+            "--dirs-only",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error("Failed to list snapshots: %s", stderr.decode())
+            return []
+
+        entries = json.loads(stdout.decode())
+        names = sorted(
+            [e["Path"] for e in entries if e.get("IsDir")],
+            reverse=True,
+        )
+        return names
+    except Exception as e:
+        logger.exception("Failed to list snapshots")
+        return []
+
+
+async def run_restore(snapshot):
+    """Restore app data from a remote backup snapshot."""
+    if restore_state["running"]:
+        logger.warning("Restore already in progress, skipping")
+        return False
+
+    if backup_running:
+        logger.warning("Backup in progress, cannot restore")
+        return False
+
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    if not RCLONE_CONF.exists():
+        restore_state["last_status"] = "error: no rclone.conf"
+        return False
+
+    if not remote_name or not remote_path:
+        restore_state["last_status"] = "error: remote not configured"
+        return False
+
+    if not SNAPSHOT_RE.match(snapshot):
+        restore_state["last_status"] = "error: invalid snapshot name"
+        return False
+
+    src = f"{remote_name}:{remote_path}/{snapshot}"
+    restore_state["running"] = True
+    logger.info("Starting restore from %s", src)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "rclone", "copy",
+            src,
+            str(ALL_APP_DATA),
+            "--config", str(RCLONE_CONF),
+            "--exclude", "backup/**",
+            "-v",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        if stdout:
+            for line in stdout.decode().splitlines():
+                logger.info("rclone: %s", line)
+
+        if proc.returncode == 0:
+            restore_state["last_restore"] = snapshot
+            restore_state["last_status"] = "success"
+            logger.info("Restore completed successfully")
+        else:
+            restore_state["last_status"] = f"error: rclone exit code {proc.returncode}"
+            logger.error("Restore failed with exit code %d", proc.returncode)
+    except Exception as e:
+        restore_state["last_status"] = f"error: {e}"
+        logger.exception("Restore failed")
+    finally:
+        restore_state["running"] = False
+
+    return restore_state["last_status"] == "success"
+
+
 async def scheduler_loop():
     # On first iteration, account for time already elapsed since last backup
     first_run = True
@@ -226,7 +333,18 @@ async def shutdown():
         scheduler_task.cancel()
 
 
-@app.route("/")
+def route(path, **kwargs):
+    """Register a route at both /path and BASE_PATH/path to handle proxies."""
+    def decorator(func):
+        app.route(path, **kwargs)(func)
+        if BASE_PATH and BASE_PATH != "/":
+            prefixed = BASE_PATH.rstrip("/") + path
+            app.route(prefixed, **kwargs)(func)
+        return func
+    return decorator
+
+
+@route("/")
 async def index():
     conf = load_config()
     rclone_conf = load_rclone_conf()
@@ -246,12 +364,12 @@ async def index():
     )
 
 
-@app.route("/api/config", methods=["GET"])
+@route("/api/config", methods=["GET"])
 async def get_config():
     return jsonify(config=load_config(), rclone_conf=load_rclone_conf())
 
 
-@app.route("/api/config", methods=["POST"])
+@route("/api/config", methods=["POST"])
 async def post_config():
     data = await request.get_json()
 
@@ -269,7 +387,7 @@ async def post_config():
     return jsonify(ok=True)
 
 
-@app.route("/api/setup-s3", methods=["POST"])
+@route("/api/setup-s3", methods=["POST"])
 async def setup_s3():
     data = await request.get_json()
     remote_name = data.get("remote_name", "openhost-backup")
@@ -289,7 +407,7 @@ async def setup_s3():
     return jsonify(ok=True, rclone_conf=rclone_text)
 
 
-@app.route("/api/backup", methods=["POST"])
+@route("/api/backup", methods=["POST"])
 async def trigger_backup():
     if backup_running:
         return jsonify(ok=False, error="Backup already in progress"), 409
@@ -297,7 +415,7 @@ async def trigger_backup():
     return jsonify(ok=True, message="Backup started")
 
 
-@app.route("/api/status")
+@route("/api/status")
 async def status():
     conf = load_config()
     last = get_last_backup()
@@ -310,6 +428,37 @@ async def status():
     )
 
 
-@app.route("/health")
+@route("/api/backups")
+async def get_backups():
+    snapshots = await list_snapshots()
+    return jsonify(snapshots=snapshots)
+
+
+@route("/api/restore", methods=["POST"])
+async def trigger_restore():
+    if restore_state["running"]:
+        return jsonify(ok=False, error="Restore already in progress"), 409
+    if backup_running:
+        return jsonify(ok=False, error="Backup in progress, cannot restore"), 409
+
+    data = await request.get_json()
+    snapshot = data.get("snapshot", "")
+    if not snapshot or not SNAPSHOT_RE.match(snapshot):
+        return jsonify(ok=False, error="Invalid snapshot name"), 400
+
+    asyncio.create_task(run_restore(snapshot))
+    return jsonify(ok=True, message="Restore started")
+
+
+@route("/api/restore/status")
+async def restore_status():
+    return jsonify(
+        running=restore_state["running"],
+        last_restore=restore_state["last_restore"],
+        last_status=restore_state["last_status"],
+    )
+
+
+@route("/health")
 async def health():
     return "ok"
