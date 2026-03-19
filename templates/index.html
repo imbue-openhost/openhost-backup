@@ -84,35 +84,9 @@
         <div id="backup-msg"></div>
     </section>
 
-    <!-- Backup History -->
+    <!-- Backups -->
     <section>
-        <h2>Backup History</h2>
-        <div class="btn-row" style="margin-bottom: 12px;">
-            <button class="btn-secondary" onclick="loadHistory(0)">Load history</button>
-        </div>
-        <div id="history-container" style="display:none;">
-            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
-                <thead>
-                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
-                        <th style="padding:6px 8px;">Time</th>
-                        <th style="padding:6px 8px;">Status</th>
-                        <th style="padding:6px 8px;text-align:right;">Size</th>
-                        <th style="padding:6px 8px;">Error</th>
-                    </tr>
-                </thead>
-                <tbody id="history-body"></tbody>
-            </table>
-            <div class="btn-row" style="justify-content:space-between;">
-                <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
-                <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
-                <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
-            </div>
-        </div>
-    </section>
-
-    <!-- Manage Backups -->
-    <section>
-        <h2>Manage Backups</h2>
+        <h2>Backups</h2>
         <p class="info">Browse, inspect, restore, or delete backup snapshots from remote storage.</p>
         <div class="btn-row" style="margin-bottom: 12px;">
             <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
@@ -143,6 +117,25 @@
         </div>
         <div id="restore-state" style="margin-top:12px;"></div>
         <div id="manage-msg"></div>
+        <div id="history-container" style="display:none;margin-top:16px;border-top:1px solid #eee;padding-top:16px;">
+            <h3 style="font-size:1rem;margin-bottom:8px;color:#333;">History</h3>
+            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
+                <thead>
+                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                        <th style="padding:6px 8px;">Time</th>
+                        <th style="padding:6px 8px;">Status</th>
+                        <th style="padding:6px 8px;text-align:right;">Size</th>
+                        <th style="padding:6px 8px;">Error</th>
+                    </tr>
+                </thead>
+                <tbody id="history-body"></tbody>
+            </table>
+            <div class="btn-row" style="justify-content:space-between;">
+                <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
+                <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
+                <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
+            </div>
+        </div>
     </section>
 
     <!-- Quick Setup: S3 -->
@@ -329,6 +322,13 @@
             res.history.forEach(h => {
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
+                if (h.status === "success" && h.timestamp) {
+                    tr.style.cursor = "pointer";
+                    tr.title = "Click to select this snapshot";
+                    tr.onmouseenter = () => tr.style.background = "#f8fafc";
+                    tr.onmouseleave = () => tr.style.background = "";
+                    tr.onclick = () => selectSnapshot(h.timestamp);
+                }
                 const badge = h.status === "success"
                     ? '<span class="status-badge status-success">ok</span>'
                     : '<span class="status-badge status-error">error</span>';
@@ -375,11 +375,23 @@
                 container.style.display = "none";
                 showMsg("manage-msg", "No snapshots found", false);
             }
+            loadHistory(0);
         }
 
         function onSnapshotChange() {
             document.getElementById("size-info").textContent = "";
             document.getElementById("browse-container").style.display = "none";
+        }
+
+        function selectSnapshot(timestamp) {
+            const select = document.getElementById("snapshot-select");
+            for (let i = 0; i < select.options.length; i++) {
+                if (select.options[i].value === timestamp) {
+                    select.selectedIndex = i;
+                    onSnapshotChange();
+                    return;
+                }
+            }
         }
 
         /* --- Snapshot Size --- */
