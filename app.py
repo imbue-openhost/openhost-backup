@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import sqlite3
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,7 +34,7 @@ DEFAULT_CONFIG = {
 
 
 def init_db():
-    """Initialize SQLite database and return a connection."""
+    """Create tables if they don't exist. Call once at startup."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_FILE))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -49,12 +48,12 @@ def init_db():
         )
     """)
     conn.commit()
-    return conn
+    conn.close()
 
 
 def get_db():
-    """Get a database connection (creates one per call, safe for sync use)."""
-    return init_db()
+    """Get a database connection."""
+    return sqlite3.connect(str(DB_FILE))
 
 
 def record_backup(timestamp, status, error_message=None):
@@ -84,15 +83,11 @@ def get_last_backup():
         conn.close()
 
 
-# In-memory flag — not persisted (reset on startup is correct behavior)
+# In-memory flags — not persisted (reset on startup is correct behavior)
 backup_running = False
-
-# Restore state
-restore_state = {
-    "last_restore": None,
-    "last_status": None,
-    "running": False,
-}
+restore_running = False
+restore_last_snapshot = None
+restore_last_status = None
 
 scheduler_task = None
 
@@ -146,12 +141,10 @@ async def run_backup():
 
     if not RCLONE_CONF.exists():
         logger.error("No rclone.conf configured, skipping backup")
-        record_backup("", "error", "no rclone.conf")
         return False
 
     if not remote_name or not remote_path:
         logger.error("Remote name or path not configured, skipping backup")
-        record_backup("", "error", "remote not configured")
         return False
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -193,7 +186,7 @@ async def run_backup():
         backup_running = False
 
 
-SNAPSHOT_RE = re.compile(r"^[\w\-:.T]+$")
+SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 
 
 async def list_snapshots():
@@ -220,10 +213,7 @@ async def list_snapshots():
             return []
 
         entries = json.loads(stdout.decode())
-        names = sorted(
-            [e["Path"] for e in entries if e.get("IsDir")],
-            reverse=True,
-        )
+        names = sorted([e["Path"] for e in entries], reverse=True)
         return names
     except Exception as e:
         logger.exception("Failed to list snapshots")
@@ -232,7 +222,8 @@ async def list_snapshots():
 
 async def run_restore(snapshot):
     """Restore app data from a remote backup snapshot."""
-    if restore_state["running"]:
+    global restore_running, restore_last_snapshot, restore_last_status
+    if restore_running:
         logger.warning("Restore already in progress, skipping")
         return False
 
@@ -245,19 +236,19 @@ async def run_restore(snapshot):
     remote_path = conf["remote_path"]
 
     if not RCLONE_CONF.exists():
-        restore_state["last_status"] = "error: no rclone.conf"
+        restore_last_status = "error: no rclone.conf"
         return False
 
     if not remote_name or not remote_path:
-        restore_state["last_status"] = "error: remote not configured"
+        restore_last_status = "error: remote not configured"
         return False
 
     if not SNAPSHOT_RE.match(snapshot):
-        restore_state["last_status"] = "error: invalid snapshot name"
+        restore_last_status = "error: invalid snapshot name"
         return False
 
     src = f"{remote_name}:{remote_path}/{snapshot}"
-    restore_state["running"] = True
+    restore_running = True
     logger.info("Starting restore from %s", src)
 
     try:
@@ -277,19 +268,19 @@ async def run_restore(snapshot):
                 logger.info("rclone: %s", line)
 
         if proc.returncode == 0:
-            restore_state["last_restore"] = snapshot
-            restore_state["last_status"] = "success"
+            restore_last_snapshot = snapshot
+            restore_last_status = "success"
             logger.info("Restore completed successfully")
         else:
-            restore_state["last_status"] = f"error: rclone exit code {proc.returncode}"
+            restore_last_status = f"error: rclone exit code {proc.returncode}"
             logger.error("Restore failed with exit code %d", proc.returncode)
     except Exception as e:
-        restore_state["last_status"] = f"error: {e}"
+        restore_last_status = f"error: {e}"
         logger.exception("Restore failed")
     finally:
-        restore_state["running"] = False
+        restore_running = False
 
-    return restore_state["last_status"] == "success"
+    return restore_last_status == "success"
 
 
 async def scheduler_loop():
@@ -436,7 +427,7 @@ async def get_backups():
 
 @route("/api/restore", methods=["POST"])
 async def trigger_restore():
-    if restore_state["running"]:
+    if restore_running:
         return jsonify(ok=False, error="Restore already in progress"), 409
     if backup_running:
         return jsonify(ok=False, error="Backup in progress, cannot restore"), 409
@@ -453,9 +444,9 @@ async def trigger_restore():
 @route("/api/restore/status")
 async def restore_status():
     return jsonify(
-        running=restore_state["running"],
-        last_restore=restore_state["last_restore"],
-        last_status=restore_state["last_status"],
+        running=restore_running,
+        last_restore=restore_last_snapshot,
+        last_status=restore_last_status,
     )
 
 
