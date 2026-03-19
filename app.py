@@ -44,9 +44,18 @@ def init_db():
             timestamp TEXT NOT NULL,
             status TEXT NOT NULL,
             error_message TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            size_bytes INTEGER,
+            file_count INTEGER
         )
     """)
+    # Migrate existing tables that lack the new columns
+    cursor = conn.execute("PRAGMA table_info(backups)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "size_bytes" not in columns:
+        conn.execute("ALTER TABLE backups ADD COLUMN size_bytes INTEGER")
+    if "file_count" not in columns:
+        conn.execute("ALTER TABLE backups ADD COLUMN file_count INTEGER")
     conn.commit()
     conn.close()
 
@@ -56,13 +65,13 @@ def get_db():
     return sqlite3.connect(str(DB_FILE))
 
 
-def record_backup(timestamp, status, error_message=None):
+def record_backup(timestamp, status, error_message=None, size_bytes=None, file_count=None):
     """Insert a backup record into the database."""
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO backups (timestamp, status, error_message) VALUES (?, ?, ?)",
-            (timestamp, status, error_message),
+            "INSERT INTO backups (timestamp, status, error_message, size_bytes, file_count) VALUES (?, ?, ?, ?, ?)",
+            (timestamp, status, error_message, size_bytes, file_count),
         )
         conn.commit()
     finally:
@@ -170,7 +179,16 @@ async def run_backup():
                 logger.info("rclone: %s", line)
 
         if proc.returncode == 0:
-            record_backup(timestamp, "success")
+            # Record size from the just-completed backup
+            size_bytes = None
+            file_count = None
+            try:
+                size_info = await get_snapshot_size(timestamp)
+                size_bytes = size_info["bytes"]
+                file_count = size_info["count"]
+            except Exception:
+                logger.warning("Could not get backup size, recording without it")
+            record_backup(timestamp, "success", size_bytes=size_bytes, file_count=file_count)
             logger.info("Backup completed successfully")
             return True
         else:
@@ -218,6 +236,131 @@ async def list_snapshots():
     except Exception as e:
         logger.exception("Failed to list snapshots")
         return []
+
+
+def validate_subpath(path):
+    """Validate a browse subpath to prevent directory traversal."""
+    if not path:
+        return True
+    segments = path.split("/")
+    for seg in segments:
+        if seg == ".." or seg == "." or not seg:
+            return False
+        if not re.match(r"^[\w\-:. ]+$", seg):
+            return False
+    return True
+
+
+async def get_snapshot_size(snapshot):
+    """Get total size and file count for a snapshot."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    proc = await asyncio.create_subprocess_exec(
+        "rclone", "size", "--json",
+        f"{remote_name}:{remote_path}/{snapshot}",
+        "--config", str(RCLONE_CONF),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"rclone size failed: {stderr.decode().strip()}")
+
+    data = json.loads(stdout.decode())
+    return {"bytes": data.get("bytes", 0), "count": data.get("count", 0)}
+
+
+async def list_snapshot_files(snapshot, subpath=""):
+    """List files and directories within a snapshot."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    target = f"{remote_name}:{remote_path}/{snapshot}"
+    if subpath:
+        target += f"/{subpath}"
+
+    proc = await asyncio.create_subprocess_exec(
+        "rclone", "lsjson",
+        target,
+        "--config", str(RCLONE_CONF),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"rclone lsjson failed: {stderr.decode().strip()}")
+
+    entries = json.loads(stdout.decode())
+    return [
+        {
+            "path": e["Path"],
+            "size": e.get("Size", 0),
+            "is_dir": e.get("IsDir", False),
+            "mod_time": e.get("ModTime", ""),
+        }
+        for e in entries
+    ]
+
+
+async def delete_snapshot(snapshot):
+    """Delete a snapshot from remote storage."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    proc = await asyncio.create_subprocess_exec(
+        "rclone", "purge",
+        f"{remote_name}:{remote_path}/{snapshot}",
+        "--config", str(RCLONE_CONF),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"rclone purge failed: {stderr.decode().strip()}")
+    logger.info("Deleted snapshot %s", snapshot)
+    return True
+
+
+def get_backup_history(limit=20, offset=0):
+    """Get paginated backup history from the database."""
+    conn = get_db()
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM backups").fetchone()[0]
+        rows = conn.execute(
+            "SELECT id, timestamp, status, error_message, created_at, size_bytes, file_count FROM backups ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        history = [
+            {
+                "id": r[0],
+                "timestamp": r[1],
+                "status": r[2],
+                "error_message": r[3],
+                "created_at": r[4],
+                "size_bytes": r[5],
+                "file_count": r[6],
+            }
+            for r in rows
+        ]
+        return history, total
+    finally:
+        conn.close()
+
+
+def get_backup_sizes():
+    """Get a map of timestamp -> {size_bytes, file_count} for all successful backups."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, size_bytes, file_count FROM backups WHERE status = 'success' AND size_bytes IS NOT NULL"
+        ).fetchall()
+        return {r[0]: {"size_bytes": r[1], "file_count": r[2]} for r in rows}
+    finally:
+        conn.close()
 
 
 async def run_restore(snapshot):
@@ -422,7 +565,15 @@ async def status():
 @route("/api/backups")
 async def get_backups():
     snapshots = await list_snapshots()
-    return jsonify(snapshots=snapshots)
+    sizes = get_backup_sizes()
+    enriched = []
+    for name in snapshots:
+        entry = {"name": name}
+        if name in sizes:
+            entry["size_bytes"] = sizes[name]["size_bytes"]
+            entry["file_count"] = sizes[name]["file_count"]
+        enriched.append(entry)
+    return jsonify(snapshots=enriched)
 
 
 @route("/api/restore", methods=["POST"])
@@ -448,6 +599,66 @@ async def restore_status():
         last_restore=restore_last_snapshot,
         last_status=restore_last_status,
     )
+
+
+@route("/api/snapshot/<name>/size")
+async def snapshot_size(name):
+    if not SNAPSHOT_RE.match(name):
+        return jsonify(ok=False, error="Invalid snapshot name"), 400
+    try:
+        result = await get_snapshot_size(name)
+        # Human-readable size
+        b = result["bytes"]
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if b < 1024:
+                human = f"{b:.2f} {unit}"
+                break
+            b /= 1024
+        else:
+            human = f"{b:.2f} PiB"
+        return jsonify(ok=True, total_size=result["bytes"], file_count=result["count"], human_size=human)
+    except Exception as e:
+        logger.exception("Failed to get snapshot size")
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/snapshot/<name>/files")
+async def snapshot_files(name):
+    if not SNAPSHOT_RE.match(name):
+        return jsonify(ok=False, error="Invalid snapshot name"), 400
+    subpath = request.args.get("path", "")
+    if not validate_subpath(subpath):
+        return jsonify(ok=False, error="Invalid path"), 400
+    try:
+        files = await list_snapshot_files(name, subpath)
+        return jsonify(ok=True, files=files)
+    except Exception as e:
+        logger.exception("Failed to list snapshot files")
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/snapshot/<name>", methods=["DELETE"])
+async def snapshot_delete(name):
+    if not SNAPSHOT_RE.match(name):
+        return jsonify(ok=False, error="Invalid snapshot name"), 400
+    if backup_running:
+        return jsonify(ok=False, error="Backup in progress"), 409
+    if restore_state["running"]:
+        return jsonify(ok=False, error="Restore in progress"), 409
+    try:
+        await delete_snapshot(name)
+        return jsonify(ok=True)
+    except Exception as e:
+        logger.exception("Failed to delete snapshot")
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/history")
+async def backup_history():
+    limit = min(int(request.args.get("limit", 20)), 100)
+    offset = int(request.args.get("offset", 0))
+    history, total = get_backup_history(limit, offset)
+    return jsonify(ok=True, history=history, total=total)
 
 
 @route("/health")
