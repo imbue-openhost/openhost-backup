@@ -601,30 +601,10 @@ async def restore_status():
     )
 
 
-@route("/api/snapshot/<name>/size")
-async def snapshot_size(name):
-    if not SNAPSHOT_RE.match(name):
-        return jsonify(ok=False, error="Invalid snapshot name"), 400
-    try:
-        result = await get_snapshot_size(name)
-        # Human-readable size
-        b = result["bytes"]
-        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-            if b < 1024:
-                human = f"{b:.2f} {unit}"
-                break
-            b /= 1024
-        else:
-            human = f"{b:.2f} PiB"
-        return jsonify(ok=True, total_size=result["bytes"], file_count=result["count"], human_size=human)
-    except Exception as e:
-        logger.exception("Failed to get snapshot size")
-        return jsonify(ok=False, error=str(e)), 500
-
-
-@route("/api/snapshot/<name>/files")
-async def snapshot_files(name):
-    if not SNAPSHOT_RE.match(name):
+@route("/api/snapshot/files")
+async def snapshot_files():
+    name = request.args.get("snapshot", "")
+    if not name or not SNAPSHOT_RE.match(name):
         return jsonify(ok=False, error="Invalid snapshot name"), 400
     subpath = request.args.get("path", "")
     if not validate_subpath(subpath):
@@ -637,9 +617,11 @@ async def snapshot_files(name):
         return jsonify(ok=False, error=str(e)), 500
 
 
-@route("/api/snapshot/<name>", methods=["DELETE"])
-async def snapshot_delete(name):
-    if not SNAPSHOT_RE.match(name):
+@route("/api/snapshot/delete", methods=["POST"])
+async def snapshot_delete():
+    data = await request.get_json()
+    name = data.get("snapshot", "")
+    if not name or not SNAPSHOT_RE.match(name):
         return jsonify(ok=False, error="Invalid snapshot name"), 400
     if backup_running:
         return jsonify(ok=False, error="Backup in progress"), 409

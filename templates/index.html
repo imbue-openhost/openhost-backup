@@ -87,18 +87,34 @@
     <!-- Backups -->
     <section>
         <h2>Backups</h2>
-        <p class="info">Browse, inspect, restore, or delete backup snapshots from remote storage.</p>
+        <p class="info">Click a snapshot row to browse, restore, or delete it.</p>
         <div class="btn-row" style="margin-bottom: 12px;">
             <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
         </div>
-        <div id="action-panel" style="display:none;margin-bottom:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
+        <div id="history-container" style="display:none;">
+            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
+                <thead>
+                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                        <th style="padding:6px 8px;">Time</th>
+                        <th style="padding:6px 8px;">Status</th>
+                        <th style="padding:6px 8px;text-align:right;">Size</th>
+                        <th style="padding:6px 8px;">Error</th>
+                    </tr>
+                </thead>
+                <tbody id="history-body"></tbody>
+            </table>
+            <div class="btn-row" style="justify-content:space-between;">
+                <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
+                <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
+                <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
+            </div>
+        </div>
+        <div id="action-panel" style="display:none;margin-top:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                 <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
-                <span id="size-info" style="font-size:0.85rem;color:#555;"></span>
             </div>
             <div class="btn-row" style="flex-wrap:wrap;">
                 <button class="btn-secondary" onclick="browseSnapshot('')">Browse</button>
-                <button class="btn-secondary" id="btn-size" onclick="getSnapshotSize()">Size</button>
                 <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
                 <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
             </div>
@@ -118,25 +134,6 @@
         </div>
         <div id="restore-state" style="margin-top:12px;"></div>
         <div id="manage-msg"></div>
-        <div id="history-container" style="display:none;margin-top:16px;border-top:1px solid #eee;padding-top:16px;">
-            <h3 style="font-size:1rem;margin-bottom:8px;color:#333;">History</h3>
-            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
-                <thead>
-                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
-                        <th style="padding:6px 8px;">Time</th>
-                        <th style="padding:6px 8px;">Status</th>
-                        <th style="padding:6px 8px;text-align:right;">Size</th>
-                        <th style="padding:6px 8px;">Error</th>
-                    </tr>
-                </thead>
-                <tbody id="history-body"></tbody>
-            </table>
-            <div class="btn-row" style="justify-content:space-between;">
-                <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
-                <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
-                <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
-            </div>
-        </div>
     </section>
 
     <!-- Quick Setup: S3 -->
@@ -373,10 +370,9 @@
         function selectSnapshot(timestamp) {
             selectedSnapshot = timestamp;
             document.getElementById("selected-snapshot-label").textContent = timestamp;
-            document.getElementById("size-info").textContent = "";
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
-            // Re-render history to highlight selected row
+            // Highlight selected row
             const rows = document.getElementById("history-body").querySelectorAll("tr");
             rows.forEach(tr => {
                 const cell = tr.querySelector("td");
@@ -386,25 +382,6 @@
                     tr.style.background = "";
                 }
             });
-        }
-
-        /* --- Snapshot Size --- */
-        async function getSnapshotSize() {
-            const snapshot = selectedSnapshot;
-            if (!snapshot) return;
-            const btn = document.getElementById("btn-size");
-            const info = document.getElementById("size-info");
-            btn.disabled = true;
-            btn.textContent = "Loading...";
-            info.textContent = "";
-            const res = await api("/api/snapshot/" + encodeURIComponent(snapshot) + "/size");
-            btn.disabled = false;
-            btn.textContent = "Size";
-            if (res.ok) {
-                info.textContent = res.file_count + " files, " + res.human_size;
-            } else {
-                showMsg("manage-msg", res.error || "Failed to get size", false);
-            }
         }
 
         /* --- Browse Snapshot --- */
@@ -418,8 +395,8 @@
             body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
             container.style.display = "block";
 
-            let url = "/api/snapshot/" + encodeURIComponent(snapshot) + "/files";
-            if (subpath) url += "?path=" + encodeURIComponent(subpath);
+            let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(snapshot);
+            if (subpath) url += "&path=" + encodeURIComponent(subpath);
             const res = await api(url);
 
             if (!res.ok) {
@@ -518,7 +495,7 @@
             const btn = document.getElementById("btn-delete");
             btn.disabled = true;
             btn.textContent = "Deleting...";
-            const res = await api("/api/snapshot/" + encodeURIComponent(snapshot), { method: "DELETE" });
+            const res = await api("/api/snapshot/delete", { method: "POST", body: { snapshot } });
             btn.disabled = false;
             btn.textContent = "Delete";
 
