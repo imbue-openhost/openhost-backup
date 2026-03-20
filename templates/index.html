@@ -52,6 +52,9 @@
         .browse-link { color: #2563eb; cursor: pointer; text-decoration: underline; }
         .browse-link:hover { color: #1d4ed8; }
         .btn-danger:disabled { background: #fca5a5; cursor: not-allowed; }
+        .inline-name { border: 1px solid #ccc; border-radius: 3px; padding: 2px 6px; font-size: 0.8rem; width: 120px; }
+        .name-label { font-size: 0.8rem; color: #2563eb; cursor: pointer; }
+        .name-label:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -78,7 +81,11 @@
             <dt>Interval</dt>
             <dd>{{ config.interval_seconds }}s</dd>
         </dl>
-        <div class="btn-row" style="margin-top: 12px;">
+        <div style="margin-top: 12px;">
+            <label>Backup name (optional)</label>
+            <input type="text" id="backup-name" placeholder="e.g. before-deploy, weekly" style="margin-bottom:8px;">
+        </div>
+        <div class="btn-row">
             <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
         </div>
         <div id="backup-msg"></div>
@@ -96,6 +103,7 @@
                 <thead>
                     <tr style="border-bottom:2px solid #ddd;text-align:left;">
                         <th style="padding:6px 8px;">Time</th>
+                        <th style="padding:6px 8px;">Name</th>
                         <th style="padding:6px 8px;">Status</th>
                         <th style="padding:6px 8px;text-align:right;">Size</th>
                         <th style="padding:6px 8px;">Error</th>
@@ -195,7 +203,9 @@
         const BASE = "{{ base_path }}";
         let historyOffset = 0;
         let selectedSnapshot = null;
+        let selectedBackupId = null;
         let snapshotList = null; // null = not yet loaded, [] = loaded but empty
+        let browseMode = null; // "remote" or "local"
 
         async function api(path, opts = {}) {
             const url = BASE + path;
@@ -266,8 +276,10 @@
             const btn = document.getElementById("btn-backup");
             btn.disabled = true;
             btn.textContent = "Starting...";
-            const res = await api("/api/backup", { method: "POST" });
+            const name = document.getElementById("backup-name").value.trim() || undefined;
+            const res = await api("/api/backup", { method: "POST", body: { name } });
             if (res.ok) {
+                document.getElementById("backup-name").value = "";
                 showMsg("backup-msg", "Backup started", true);
                 pollStatus();
             } else {
@@ -329,21 +341,25 @@
                     tr.style.cursor = "pointer";
                     tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
                     tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
-                    tr.onclick = () => selectSnapshot(h.timestamp);
+                    tr.onclick = () => selectSnapshot(h.timestamp, h.id);
                     if (selectedSnapshot === h.timestamp) {
                         tr.style.background = "#eff6ff";
                     }
                     if (!existsOnRemote) {
                         tr.style.opacity = "0.6";
-                        tr.title = "Snapshot no longer on remote — browse unavailable";
+                        tr.title = "Snapshot may not be on remote";
                     }
                 }
                 const badge = h.status === "success"
                     ? '<span class="status-badge status-success">ok</span>'
                     : '<span class="status-badge status-error">error</span>';
                 const sizeText = h.size_bytes != null ? formatBytes(h.size_bytes) + " (" + h.file_count + " files)" : "-";
+                const nameHtml = h.name
+                    ? '<span class="name-label" onclick="event.stopPropagation(); renameBackup(' + h.id + ', this)" title="Click to rename">' + escapeHtml(h.name) + '</span>'
+                    : '<span class="name-label" style="color:#aaa;" onclick="event.stopPropagation(); renameBackup(' + h.id + ', this)" title="Click to name">-</span>';
                 tr.innerHTML =
                     '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(h.timestamp || h.created_at) + '</td>' +
+                    '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
                     '<td style="padding:6px 8px;">' + badge + '</td>' +
                     '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>' +
                     '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(h.error_message || "") + '</td>';
@@ -355,6 +371,35 @@
             document.getElementById("history-page").textContent =
                 "Showing " + (offset + 1) + "-" + Math.min(offset + 20, res.total) + " of " + res.total;
             container.style.display = "block";
+        }
+
+        /* --- Rename backup inline --- */
+        async function renameBackup(id, el) {
+            const current = el.textContent === "-" ? "" : el.textContent;
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "inline-name";
+            input.value = current;
+            input.placeholder = "name";
+            el.replaceWith(input);
+            input.focus();
+            input.select();
+
+            const save = async () => {
+                const newName = input.value.trim();
+                const res = await api("/api/backup/rename", { method: "POST", body: { id, name: newName } });
+                if (res.ok) {
+                    loadHistory(historyOffset);
+                } else {
+                    input.style.borderColor = "#dc2626";
+                }
+            };
+
+            input.onblur = save;
+            input.onkeydown = (e) => {
+                if (e.key === "Enter") { input.blur(); }
+                if (e.key === "Escape") { loadHistory(historyOffset); }
+            };
         }
 
         /* --- Manage Backups: Load snapshots --- */
@@ -372,19 +417,20 @@
                 snapshotList = null; // remote unreachable, don't grey out rows
             }
             selectedSnapshot = null;
+            selectedBackupId = null;
             document.getElementById("action-panel").style.display = "none";
             document.getElementById("browse-container").style.display = "none";
             loadHistory(0);
         }
 
-        function selectSnapshot(timestamp) {
+        function selectSnapshot(timestamp, backupId) {
             selectedSnapshot = timestamp;
+            selectedBackupId = backupId;
             const remoteLoaded = snapshotList !== null;
             const onRemote = !remoteLoaded || snapshotList.includes(timestamp);
-            document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (not on remote)");
+            document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (may not be on remote)");
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
-            document.getElementById("btn-browse").style.display = onRemote ? "" : "none";
             // Highlight selected row
             const rows = document.getElementById("history-body").querySelectorAll("tr");
             rows.forEach(tr => {
@@ -397,34 +443,26 @@
             });
         }
 
-        /* --- Browse Snapshot --- */
-        async function browseSnapshot(subpath) {
-            const snapshot = selectedSnapshot;
-            if (!snapshot) return;
+        /* --- Generic file browser (shared by remote + local) --- */
+        function renderFileBrowser(res, subpath, browseFunc, label) {
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
 
-            body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
-            container.style.display = "block";
-
-            let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(snapshot);
-            if (subpath) url += "&path=" + encodeURIComponent(subpath);
-            const res = await api(url);
-
             if (!res.ok) {
-                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#991b1b;">' + escapeHtml(res.error || "Failed") + '</td></tr>';
+                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#991b1b;">' + escapeHtml(res.error || "Failed to load files") + '</td></tr>';
                 return;
             }
 
             // Breadcrumb
             const parts = subpath ? subpath.split("/") : [];
-            let bc = '<span class="browse-link" onclick="browseSnapshot(\'\')">root</span>';
+            let bc = '<span style="font-size:0.75rem;background:#e0e7ff;color:#3730a3;padding:1px 6px;border-radius:3px;margin-right:6px;">' + escapeHtml(label) + '</span>';
+            bc += '<span class="browse-link" onclick="' + browseFunc + '(\'\')">root</span>';
             let accumulated = "";
             parts.forEach((p, i) => {
                 accumulated += (i > 0 ? "/" : "") + p;
                 const path = accumulated;
-                bc += ' / <span class="browse-link" onclick="browseSnapshot(\'' + escapeHtml(path) + '\')">' + escapeHtml(p) + '</span>';
+                bc += ' / <span class="browse-link" onclick="' + browseFunc + '(\'' + escapeHtml(path) + '\')">' + escapeHtml(p) + '</span>';
             });
             breadcrumb.innerHTML = bc;
 
@@ -435,7 +473,6 @@
                 return;
             }
 
-            // Sort: dirs first, then by name
             const sorted = res.files.sort((a, b) => {
                 if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
                 return a.path.localeCompare(b.path);
@@ -446,13 +483,53 @@
                 tr.style.borderBottom = "1px solid #eee";
                 const fullPath = subpath ? subpath + "/" + f.path : f.path;
                 const nameCell = f.is_dir
-                    ? '<td style="padding:6px 8px;"><span class="browse-link" onclick="browseSnapshot(\'' + escapeHtml(fullPath) + '\')">&#128193; ' + escapeHtml(f.path) + '</span></td>'
+                    ? '<td style="padding:6px 8px;"><span class="browse-link" onclick="' + browseFunc + '(\'' + escapeHtml(fullPath) + '\')">&#128193; ' + escapeHtml(f.path) + '</span></td>'
                     : '<td style="padding:6px 8px;">&#128196; ' + escapeHtml(f.path) + '</td>';
                 const sizeCell = '<td style="padding:6px 8px;text-align:right;">' + (f.is_dir ? "-" : formatBytes(f.size)) + '</td>';
                 const modCell = '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(f.mod_time ? f.mod_time.substring(0, 19) : "") + '</td>';
                 tr.innerHTML = nameCell + sizeCell + modCell;
                 body.appendChild(tr);
             });
+        }
+
+        /* --- Browse Snapshot (remote, falls back to local) --- */
+        async function browseSnapshot(subpath) {
+            const snapshot = selectedSnapshot;
+            if (!snapshot) return;
+            browseMode = "remote";
+            const container = document.getElementById("browse-container");
+            const body = document.getElementById("browse-body");
+
+            body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
+            container.style.display = "block";
+
+            let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(snapshot);
+            if (subpath) url += "&path=" + encodeURIComponent(subpath);
+            const res = await api(url);
+
+            if (!res.ok) {
+                // Remote failed — fall back to local browse automatically
+                browseLocal(subpath, true);
+                return;
+            }
+            renderFileBrowser(res, subpath, "browseSnapshot", "remote");
+        }
+
+        /* --- Browse Local app data (backup source) --- */
+        async function browseLocal(subpath, isFallback) {
+            if (!selectedSnapshot) return;
+            browseMode = "local";
+            const container = document.getElementById("browse-container");
+            const body = document.getElementById("browse-body");
+
+            body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
+            container.style.display = "block";
+
+            let url = "/api/local/files";
+            if (subpath) url += "?path=" + encodeURIComponent(subpath);
+            const res = await api(url);
+            const label = isFallback ? "local (snapshot not on remote)" : "local";
+            renderFileBrowser(res, subpath, "browseLocal", label);
         }
 
         /* --- Restore --- */
@@ -515,6 +592,7 @@
             if (res.ok) {
                 showMsg("manage-msg", "Snapshot deleted", true);
                 selectedSnapshot = null;
+                selectedBackupId = null;
                 document.getElementById("action-panel").style.display = "none";
                 document.getElementById("browse-container").style.display = "none";
                 loadHistory(historyOffset);

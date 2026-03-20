@@ -46,7 +46,8 @@ def init_db():
             error_message TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
             size_bytes INTEGER,
-            file_count INTEGER
+            file_count INTEGER,
+            name TEXT
         )
     """)
     # Migrate existing tables that lack the new columns
@@ -56,6 +57,8 @@ def init_db():
         conn.execute("ALTER TABLE backups ADD COLUMN size_bytes INTEGER")
     if "file_count" not in columns:
         conn.execute("ALTER TABLE backups ADD COLUMN file_count INTEGER")
+    if "name" not in columns:
+        conn.execute("ALTER TABLE backups ADD COLUMN name TEXT")
     conn.commit()
     conn.close()
 
@@ -65,13 +68,13 @@ def get_db():
     return sqlite3.connect(str(DB_FILE))
 
 
-def record_backup(timestamp, status, error_message=None, size_bytes=None, file_count=None):
+def record_backup(timestamp, status, error_message=None, size_bytes=None, file_count=None, name=None):
     """Insert a backup record into the database."""
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO backups (timestamp, status, error_message, size_bytes, file_count) VALUES (?, ?, ?, ?, ?)",
-            (timestamp, status, error_message, size_bytes, file_count),
+            "INSERT INTO backups (timestamp, status, error_message, size_bytes, file_count, name) VALUES (?, ?, ?, ?, ?, ?)",
+            (timestamp, status, error_message, size_bytes, file_count, name),
         )
         conn.commit()
     finally:
@@ -138,7 +141,7 @@ def generate_s3_conf(remote_name, bucket, access_key, secret_key, region):
     )
 
 
-async def run_backup():
+async def run_backup(name=None):
     global backup_running
     if backup_running:
         logger.warning("Backup already in progress, skipping")
@@ -188,7 +191,7 @@ async def run_backup():
                 file_count = size_info["count"]
             except Exception:
                 logger.warning("Could not get backup size, recording without it")
-            record_backup(timestamp, "success", size_bytes=size_bytes, file_count=file_count)
+            record_backup(timestamp, "success", size_bytes=size_bytes, file_count=file_count, name=name)
             logger.info("Backup completed successfully")
             return True
         else:
@@ -279,7 +282,10 @@ async def get_snapshot_size(snapshot):
 
 
 async def list_snapshot_files(snapshot, subpath=""):
-    """List files and directories within a snapshot."""
+    """List files and directories within a snapshot.
+
+    Returns (files, error) where error is a user-friendly string or None.
+    """
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
@@ -297,7 +303,10 @@ async def list_snapshot_files(snapshot, subpath=""):
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"rclone lsjson failed: {stderr.decode().strip()}")
+        err = stderr.decode().strip()
+        if "directory not found" in err or "not found" in err.lower():
+            return [], "Snapshot not found on remote"
+        return [], f"rclone error: {err}"
 
     entries = json.loads(stdout.decode())
     return [
@@ -308,7 +317,7 @@ async def list_snapshot_files(snapshot, subpath=""):
             "mod_time": e.get("ModTime", ""),
         }
         for e in entries
-    ]
+    ], None
 
 
 async def delete_snapshot(snapshot):
@@ -337,7 +346,7 @@ def get_backup_history(limit=20, offset=0):
     try:
         total = conn.execute("SELECT COUNT(*) FROM backups").fetchone()[0]
         rows = conn.execute(
-            "SELECT id, timestamp, status, error_message, created_at, size_bytes, file_count FROM backups ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, timestamp, status, error_message, created_at, size_bytes, file_count, name FROM backups ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
         history = [
@@ -349,6 +358,7 @@ def get_backup_history(limit=20, offset=0):
                 "created_at": r[4],
                 "size_bytes": r[5],
                 "file_count": r[6],
+                "name": r[7],
             }
             for r in rows
         ]
@@ -551,7 +561,9 @@ async def setup_s3():
 async def trigger_backup():
     if backup_running:
         return jsonify(ok=False, error="Backup already in progress"), 409
-    asyncio.create_task(run_backup())
+    data = await request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip() or None
+    asyncio.create_task(run_backup(name=name))
     return jsonify(ok=True, message="Backup started")
 
 
@@ -616,7 +628,10 @@ async def snapshot_files():
     if not validate_subpath(subpath):
         return jsonify(ok=False, error="Invalid path"), 400
     try:
-        files = await list_snapshot_files(name, subpath)
+        files, error = await list_snapshot_files(name, subpath)
+        if error:
+            status_code = 404 if "not found" in error.lower() else 500
+            return jsonify(ok=False, error=error), status_code
         return jsonify(ok=True, files=files)
     except Exception as e:
         logger.exception("Failed to list snapshot files")
@@ -647,6 +662,62 @@ async def backup_history():
     offset = int(request.args.get("offset", 0))
     history, total = get_backup_history(limit, offset)
     return jsonify(ok=True, history=history, total=total)
+
+
+@route("/api/local/files")
+async def local_files():
+    """Browse the current local app data (the backup source)."""
+    subpath = request.args.get("path", "")
+    if not validate_subpath(subpath):
+        return jsonify(ok=False, error="Invalid path"), 400
+
+    target = ALL_APP_DATA / subpath if subpath else ALL_APP_DATA
+    if not target.exists() or not target.is_dir():
+        return jsonify(ok=False, error="Directory not found"), 404
+
+    # Prevent traversal outside ALL_APP_DATA
+    try:
+        target.resolve().relative_to(ALL_APP_DATA.resolve())
+    except ValueError:
+        return jsonify(ok=False, error="Invalid path"), 400
+
+    files = []
+    try:
+        for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name)):
+            # Skip the backup app's own data directory
+            rel = entry.relative_to(ALL_APP_DATA)
+            if str(rel).startswith("backup"):
+                continue
+            stat = entry.stat()
+            files.append({
+                "path": entry.name,
+                "size": stat.st_size if entry.is_file() else 0,
+                "is_dir": entry.is_dir(),
+                "mod_time": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+    except PermissionError:
+        return jsonify(ok=False, error="Permission denied"), 403
+
+    return jsonify(ok=True, files=files)
+
+
+@route("/api/backup/rename", methods=["POST"])
+async def rename_backup():
+    """Set or update the name for a backup entry."""
+    data = await request.get_json()
+    backup_id = data.get("id")
+    new_name = (data.get("name") or "").strip() or None
+    if not backup_id:
+        return jsonify(ok=False, error="Missing backup id"), 400
+    conn = get_db()
+    try:
+        conn.execute("UPDATE backups SET name = ? WHERE id = ?", (new_name, backup_id))
+        conn.commit()
+        if conn.total_changes == 0:
+            return jsonify(ok=False, error="Backup not found"), 404
+    finally:
+        conn.close()
+    return jsonify(ok=True)
 
 
 @route("/health")
