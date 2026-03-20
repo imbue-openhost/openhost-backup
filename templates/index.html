@@ -339,8 +339,6 @@
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
                 const isSuccess = h.status === "success" && h.timestamp;
-                const remoteLoaded = snapshotList !== null;
-                const existsOnRemote = !remoteLoaded || snapshotList.includes(h.timestamp);
                 if (isSuccess) {
                     tr.style.cursor = "pointer";
                     tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
@@ -348,10 +346,6 @@
                     tr.onclick = () => selectSnapshot(h.timestamp, h.id);
                     if (selectedSnapshot === h.timestamp) {
                         tr.style.background = "#eff6ff";
-                    }
-                    if (!existsOnRemote) {
-                        tr.style.opacity = "0.6";
-                        tr.title = "Snapshot may not be on remote";
                     }
                 }
                 const badge = h.status === "success"
@@ -432,12 +426,10 @@
             selectedBackupId = backupId;
             const remoteLoaded = snapshotList !== null;
             const onRemote = !remoteLoaded || snapshotList.includes(timestamp);
-            document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (not on remote)");
+            document.getElementById("selected-snapshot-label").textContent = timestamp;
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
-            const restoreBtn = document.getElementById("btn-restore");
-            restoreBtn.disabled = !onRemote;
-            restoreBtn.title = onRemote ? "" : "Cannot restore — snapshot not on remote";
+            document.getElementById("btn-restore").disabled = false;
             // Highlight selected row
             const rows = document.getElementById("history-body").querySelectorAll("tr");
             rows.forEach(tr => {
