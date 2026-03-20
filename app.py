@@ -670,7 +670,7 @@ async def snapshot_delete():
         return jsonify(ok=False, error="Invalid snapshot name"), 400
     if backup_running:
         return jsonify(ok=False, error="Backup in progress"), 409
-    if restore_state["running"]:
+    if restore_running:
         return jsonify(ok=False, error="Restore in progress"), 409
     try:
         remote_deleted = await delete_snapshot(name)
