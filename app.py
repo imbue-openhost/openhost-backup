@@ -321,23 +321,47 @@ async def list_snapshot_files(snapshot, subpath=""):
 
 
 async def delete_snapshot(snapshot):
-    """Delete a snapshot from remote storage."""
+    """Delete a snapshot from remote storage and the local DB record."""
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
 
-    proc = await asyncio.create_subprocess_exec(
-        "rclone", "purge",
-        f"{remote_name}:{remote_path}/{snapshot}",
-        "--config", str(RCLONE_CONF),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"rclone purge failed: {stderr.decode().strip()}")
-    logger.info("Deleted snapshot %s", snapshot)
-    return True
+    remote_deleted = False
+    if RCLONE_CONF.exists() and remote_name and remote_path:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "rclone", "purge",
+                f"{remote_name}:{remote_path}/{snapshot}",
+                "--config", str(RCLONE_CONF),
+                "--contimeout", "10s",
+                "--timeout", "30s",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            if proc.returncode == 0:
+                remote_deleted = True
+                logger.info("Deleted snapshot %s from remote", snapshot)
+            else:
+                err = stderr.decode().strip()
+                if "not found" in err.lower() or "directory not found" in err:
+                    remote_deleted = True
+                    logger.info("Snapshot %s already gone from remote", snapshot)
+                else:
+                    logger.warning("rclone purge failed for %s: %s", snapshot, err)
+        except asyncio.TimeoutError:
+            logger.warning("rclone purge timed out for %s", snapshot)
+
+    # Always remove the DB record
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM backups WHERE timestamp = ?", (snapshot,))
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("Deleted DB record for snapshot %s", snapshot)
+
+    return remote_deleted
 
 
 def get_backup_history(limit=20, offset=0):
@@ -649,8 +673,8 @@ async def snapshot_delete():
     if restore_state["running"]:
         return jsonify(ok=False, error="Restore in progress"), 409
     try:
-        await delete_snapshot(name)
-        return jsonify(ok=True)
+        remote_deleted = await delete_snapshot(name)
+        return jsonify(ok=True, remote_deleted=remote_deleted)
     except Exception as e:
         logger.exception("Failed to delete snapshot")
         return jsonify(ok=False, error=str(e)), 500
