@@ -195,7 +195,7 @@
         const BASE = "{{ base_path }}";
         let historyOffset = 0;
         let selectedSnapshot = null;
-        let snapshotList = [];
+        let snapshotList = null; // null = not yet loaded, [] = loaded but empty
 
         async function api(path, opts = {}) {
             const url = BASE + path;
@@ -323,12 +323,13 @@
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
                 const isSuccess = h.status === "success" && h.timestamp;
-                const existsOnRemote = isSuccess && snapshotList.includes(h.timestamp);
+                const remoteLoaded = snapshotList !== null;
+                const existsOnRemote = !remoteLoaded || snapshotList.includes(h.timestamp);
                 if (isSuccess) {
                     tr.style.cursor = "pointer";
                     tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
                     tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
-                    tr.onclick = () => selectSnapshot(h.timestamp, existsOnRemote);
+                    tr.onclick = () => selectSnapshot(h.timestamp);
                     if (selectedSnapshot === h.timestamp) {
                         tr.style.background = "#eff6ff";
                     }
@@ -372,8 +373,10 @@
             loadHistory(0);
         }
 
-        function selectSnapshot(timestamp, onRemote) {
+        function selectSnapshot(timestamp) {
             selectedSnapshot = timestamp;
+            const remoteLoaded = snapshotList !== null;
+            const onRemote = !remoteLoaded || snapshotList.includes(timestamp);
             document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (not on remote)");
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
@@ -515,6 +518,9 @@
                 showMsg("manage-msg", res.error || "Delete failed", false);
             }
         }
+
+        // Auto-load on page load
+        loadSnapshots();
     </script>
 </body>
 </html>
