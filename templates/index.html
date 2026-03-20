@@ -204,7 +204,6 @@
         let historyOffset = 0;
         let selectedSnapshot = null;
         let selectedBackupId = null;
-        let snapshotList = null; // null = not yet loaded, [] = loaded but empty
         let browseMode = null; // "remote" or "local"
 
         async function api(path, opts = {}) {
@@ -405,27 +404,18 @@
             const btn = document.getElementById("btn-load-snapshots");
             btn.disabled = true;
             btn.textContent = "Loading...";
-            const [snapshotsRes] = await Promise.all([api("/api/backups")]);
-            btn.disabled = false;
-            btn.textContent = "Load snapshots";
-
-            if (snapshotsRes.remote_ok) {
-                snapshotList = (snapshotsRes.snapshots || []).map(s => typeof s === "string" ? s : s.name);
-            } else {
-                snapshotList = null; // remote unreachable, don't grey out rows
-            }
             selectedSnapshot = null;
             selectedBackupId = null;
             document.getElementById("action-panel").style.display = "none";
             document.getElementById("browse-container").style.display = "none";
-            loadHistory(0);
+            await loadHistory(0);
+            btn.disabled = false;
+            btn.textContent = "Load snapshots";
         }
 
         function selectSnapshot(timestamp, backupId) {
             selectedSnapshot = timestamp;
             selectedBackupId = backupId;
-            const remoteLoaded = snapshotList !== null;
-            const onRemote = !remoteLoaded || snapshotList.includes(timestamp);
             document.getElementById("selected-snapshot-label").textContent = timestamp;
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
