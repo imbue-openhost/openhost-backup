@@ -366,7 +366,11 @@
             btn.disabled = false;
             btn.textContent = "Load snapshots";
 
-            snapshotList = (snapshotsRes.snapshots || []).map(s => typeof s === "string" ? s : s.name);
+            if (snapshotsRes.remote_ok) {
+                snapshotList = (snapshotsRes.snapshots || []).map(s => typeof s === "string" ? s : s.name);
+            } else {
+                snapshotList = null; // remote unreachable, don't grey out rows
+            }
             selectedSnapshot = null;
             document.getElementById("action-panel").style.display = "none";
             document.getElementById("browse-container").style.display = "none";

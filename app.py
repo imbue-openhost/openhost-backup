@@ -208,13 +208,16 @@ SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 
 
 async def list_snapshots():
-    """List available backup snapshots from the remote."""
+    """List available backup snapshots from the remote.
+
+    Returns (names, ok) where ok indicates if the remote was reachable.
+    """
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
 
     if not RCLONE_CONF.exists() or not remote_name or not remote_path:
-        return []
+        return [], False
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -228,14 +231,17 @@ async def list_snapshots():
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             logger.error("Failed to list snapshots: %s", stderr.decode())
-            return []
+            return [], False
 
         entries = json.loads(stdout.decode())
-        names = sorted([e["Path"] for e in entries], reverse=True)
-        return names
+        names = sorted(
+            [e["Path"] for e in entries if e.get("IsDir")],
+            reverse=True,
+        )
+        return names, True
     except Exception as e:
         logger.exception("Failed to list snapshots")
-        return []
+        return [], False
 
 
 def validate_subpath(path):
@@ -564,7 +570,7 @@ async def status():
 
 @route("/api/backups")
 async def get_backups():
-    snapshots = await list_snapshots()
+    snapshots, remote_ok = await list_snapshots()
     sizes = get_backup_sizes()
     enriched = []
     for name in snapshots:
@@ -573,7 +579,7 @@ async def get_backups():
             entry["size_bytes"] = sizes[name]["size_bytes"]
             entry["file_count"] = sizes[name]["file_count"]
         enriched.append(entry)
-    return jsonify(snapshots=enriched)
+    return jsonify(snapshots=enriched, remote_ok=remote_ok)
 
 
 @route("/api/restore", methods=["POST"])
