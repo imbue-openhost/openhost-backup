@@ -322,8 +322,8 @@
             res.history.forEach(h => {
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
-                const isSelectable = h.status === "success" && h.timestamp;
-                if (isSelectable) {
+                const existsOnRemote = h.status === "success" && h.timestamp && snapshotList.includes(h.timestamp);
+                if (existsOnRemote) {
                     tr.style.cursor = "pointer";
                     tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
                     tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
@@ -331,6 +331,9 @@
                     if (selectedSnapshot === h.timestamp) {
                         tr.style.background = "#eff6ff";
                     }
+                } else if (h.status === "success" && h.timestamp) {
+                    tr.style.opacity = "0.5";
+                    tr.title = "Snapshot no longer exists on remote";
                 }
                 const badge = h.status === "success"
                     ? '<span class="status-badge status-success">ok</span>'
