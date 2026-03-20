@@ -114,7 +114,7 @@
                 <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
             </div>
             <div class="btn-row" style="flex-wrap:wrap;">
-                <button class="btn-secondary" onclick="browseSnapshot('')">Browse</button>
+                <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
                 <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
                 <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
             </div>
@@ -322,18 +322,20 @@
             res.history.forEach(h => {
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
-                const existsOnRemote = h.status === "success" && h.timestamp && snapshotList.includes(h.timestamp);
-                if (existsOnRemote) {
+                const isSuccess = h.status === "success" && h.timestamp;
+                const existsOnRemote = isSuccess && snapshotList.includes(h.timestamp);
+                if (isSuccess) {
                     tr.style.cursor = "pointer";
                     tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
                     tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
-                    tr.onclick = () => selectSnapshot(h.timestamp);
+                    tr.onclick = () => selectSnapshot(h.timestamp, existsOnRemote);
                     if (selectedSnapshot === h.timestamp) {
                         tr.style.background = "#eff6ff";
                     }
-                } else if (h.status === "success" && h.timestamp) {
-                    tr.style.opacity = "0.5";
-                    tr.title = "Snapshot no longer exists on remote";
+                    if (!existsOnRemote) {
+                        tr.style.opacity = "0.6";
+                        tr.title = "Snapshot no longer on remote — browse unavailable";
+                    }
                 }
                 const badge = h.status === "success"
                     ? '<span class="status-badge status-success">ok</span>'
@@ -370,11 +372,12 @@
             loadHistory(0);
         }
 
-        function selectSnapshot(timestamp) {
+        function selectSnapshot(timestamp, onRemote) {
             selectedSnapshot = timestamp;
-            document.getElementById("selected-snapshot-label").textContent = timestamp;
+            document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (not on remote)");
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
+            document.getElementById("btn-browse").style.display = onRemote ? "" : "none";
             // Highlight selected row
             const rows = document.getElementById("history-body").querySelectorAll("tr");
             rows.forEach(tr => {
