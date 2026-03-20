@@ -214,6 +214,10 @@
                 opts.body = JSON.stringify(opts.body);
             }
             const r = await fetch(url, opts);
+            const ct = r.headers.get("content-type") || "";
+            if (!ct.includes("application/json")) {
+                return { ok: false, error: "Server error (HTTP " + r.status + ")" };
+            }
             return r.json();
         }
 
@@ -428,9 +432,12 @@
             selectedBackupId = backupId;
             const remoteLoaded = snapshotList !== null;
             const onRemote = !remoteLoaded || snapshotList.includes(timestamp);
-            document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (may not be on remote)");
+            document.getElementById("selected-snapshot-label").textContent = timestamp + (onRemote ? "" : " (not on remote)");
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
+            const restoreBtn = document.getElementById("btn-restore");
+            restoreBtn.disabled = !onRemote;
+            restoreBtn.title = onRemote ? "" : "Cannot restore — snapshot not on remote";
             // Highlight selected row
             const rows = document.getElementById("history-body").querySelectorAll("tr");
             rows.forEach(tr => {
