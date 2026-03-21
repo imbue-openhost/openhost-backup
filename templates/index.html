@@ -49,6 +49,12 @@
         .msg-err { background: #fee2e2; color: #991b1b; }
         dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; font-size: 0.9rem; }
         dt { font-weight: 600; color: #555; }
+        .browse-link { color: #2563eb; cursor: pointer; text-decoration: underline; }
+        .browse-link:hover { color: #1d4ed8; }
+        .btn-danger:disabled { background: #fca5a5; cursor: not-allowed; }
+        .inline-name { border: 1px solid #ccc; border-radius: 3px; padding: 2px 6px; font-size: 0.8rem; width: 120px; }
+        .name-label { font-size: 0.8rem; color: #2563eb; cursor: pointer; }
+        .name-label:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -75,28 +81,67 @@
             <dt>Interval</dt>
             <dd>{{ config.interval_seconds }}s</dd>
         </dl>
-        <div class="btn-row" style="margin-top: 12px;">
+        <div style="margin-top: 12px;">
+            <label>Backup name (optional)</label>
+            <input type="text" id="backup-name" placeholder="e.g. before-deploy, weekly" style="margin-bottom:8px;">
+        </div>
+        <div class="btn-row">
             <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
         </div>
         <div id="backup-msg"></div>
     </section>
 
-    <!-- Restore -->
+    <!-- Backups -->
     <section>
-        <h2>Restore</h2>
-        <p class="info">Restore app data from a previous backup snapshot. This will overwrite current app data.</p>
+        <h2>Backups</h2>
+        <p class="info">Click a snapshot row to browse, restore, or delete it.</p>
         <div class="btn-row" style="margin-bottom: 12px;">
             <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
         </div>
-        <div id="snapshots-container" style="display:none;">
-            <label>Select a snapshot</label>
-            <select id="snapshot-select" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:0.9rem;margin-bottom:12px;font-family:monospace;"></select>
-            <div class="btn-row">
-                <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
+        <div id="history-container" style="display:none;">
+            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
+                <thead>
+                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                        <th style="padding:6px 8px;">Time</th>
+                        <th style="padding:6px 8px;">Name</th>
+                        <th style="padding:6px 8px;">Status</th>
+                        <th style="padding:6px 8px;text-align:right;">Size</th>
+                        <th style="padding:6px 8px;">Error</th>
+                    </tr>
+                </thead>
+                <tbody id="history-body"></tbody>
+            </table>
+            <div class="btn-row" style="justify-content:space-between;">
+                <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
+                <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
+                <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
             </div>
         </div>
+        <div id="action-panel" style="display:none;margin-top:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
+            </div>
+            <div class="btn-row" style="flex-wrap:wrap;">
+                <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
+                <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
+                <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
+            </div>
+        </div>
+        <div id="browse-container" style="display:none;margin-top:12px;">
+            <div id="browse-breadcrumb" style="font-size:0.85rem;margin-bottom:8px;font-family:monospace;"></div>
+            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                <thead>
+                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                        <th style="padding:6px 8px;">Name</th>
+                        <th style="padding:6px 8px;text-align:right;">Size</th>
+                        <th style="padding:6px 8px;">Modified</th>
+                    </tr>
+                </thead>
+                <tbody id="browse-body"></tbody>
+            </table>
+        </div>
         <div id="restore-state" style="margin-top:12px;"></div>
-        <div id="restore-msg"></div>
+        <div id="manage-msg"></div>
     </section>
 
     <!-- Quick Setup: S3 -->
@@ -156,6 +201,10 @@
 
     <script>
         const BASE = "{{ base_path }}";
+        let historyOffset = 0;
+        let selectedSnapshot = null;
+        let selectedBackupId = null;
+        let browseMode = null; // "remote" or "local"
 
         async function api(path, opts = {}) {
             const url = BASE + path;
@@ -164,6 +213,10 @@
                 opts.body = JSON.stringify(opts.body);
             }
             const r = await fetch(url, opts);
+            const ct = r.headers.get("content-type") || "";
+            if (!ct.includes("application/json")) {
+                return { ok: false, error: "Server error (HTTP " + r.status + ")" };
+            }
             return r.json();
         }
 
@@ -174,6 +227,22 @@
             setTimeout(() => { el.textContent = ""; el.className = ""; }, 4000);
         }
 
+        function formatBytes(bytes) {
+            if (bytes === 0) return "0 B";
+            const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+            let i = 0;
+            let b = bytes;
+            while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+            return b.toFixed(i === 0 ? 0 : 2) + " " + units[i];
+        }
+
+        function escapeHtml(str) {
+            const d = document.createElement("div");
+            d.textContent = str;
+            return d.innerHTML;
+        }
+
+        /* --- S3 Setup --- */
         async function setupS3() {
             const data = {
                 remote_name: document.getElementById("s3-remote").value,
@@ -193,6 +262,7 @@
             }
         }
 
+        /* --- Config --- */
         async function saveConfig() {
             const data = {
                 rclone_conf: document.getElementById("rclone-conf").value,
@@ -204,12 +274,15 @@
             showMsg("conf-msg", res.ok ? "Saved" : "Error", res.ok);
         }
 
+        /* --- Backup trigger & polling --- */
         async function triggerBackup() {
             const btn = document.getElementById("btn-backup");
             btn.disabled = true;
             btn.textContent = "Starting...";
-            const res = await api("/api/backup", { method: "POST" });
+            const name = document.getElementById("backup-name").value.trim() || undefined;
+            const res = await api("/api/backup", { method: "POST", body: { name } });
             if (res.ok) {
+                document.getElementById("backup-name").value = "";
                 showMsg("backup-msg", "Backup started", true);
                 pollStatus();
             } else {
@@ -233,7 +306,7 @@
                     if (res.last_status === "success") {
                         stateEl.innerHTML = '<span class="status-badge status-success">ok</span>';
                     } else if (res.last_status === "error") {
-                        stateEl.innerHTML = '<span class="status-badge status-error">error: ' + (res.last_error || "unknown") + '</span>';
+                        stateEl.innerHTML = '<span class="status-badge status-error">error: ' + escapeHtml(res.last_error || "unknown") + '</span>';
                     } else {
                         stateEl.innerHTML = '<span class="status-badge status-none">no backups yet</span>';
                     }
@@ -244,34 +317,213 @@
             };
             poll();
         }
+
+        /* --- Backup History --- */
+        async function loadHistory(offset) {
+            if (offset < 0) offset = 0;
+            historyOffset = offset;
+            const res = await api("/api/history?limit=20&offset=" + offset);
+            if (!res.ok) return;
+
+            const container = document.getElementById("history-container");
+            const body = document.getElementById("history-body");
+            body.innerHTML = "";
+
+            if (res.history.length === 0 && offset === 0) {
+                container.style.display = "none";
+                return;
+            }
+
+            res.history.forEach(h => {
+                const tr = document.createElement("tr");
+                tr.style.borderBottom = "1px solid #eee";
+                const isSuccess = h.status === "success" && h.timestamp;
+                if (isSuccess) {
+                    tr.style.cursor = "pointer";
+                    tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
+                    tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
+                    tr.onclick = () => selectSnapshot(h.timestamp, h.id);
+                    if (selectedSnapshot === h.timestamp) {
+                        tr.style.background = "#eff6ff";
+                    }
+                }
+                const badge = h.status === "success"
+                    ? '<span class="status-badge status-success">ok</span>'
+                    : '<span class="status-badge status-error">error</span>';
+                const sizeText = h.size_bytes != null ? formatBytes(h.size_bytes) + " (" + h.file_count + " files)" : "-";
+                const nameHtml = h.name
+                    ? '<span class="name-label" onclick="event.stopPropagation(); renameBackup(' + h.id + ', this)" title="Click to rename">' + escapeHtml(h.name) + '</span>'
+                    : '<span class="name-label" style="color:#aaa;" onclick="event.stopPropagation(); renameBackup(' + h.id + ', this)" title="Click to name">-</span>';
+                tr.innerHTML =
+                    '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(h.timestamp || h.created_at) + '</td>' +
+                    '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
+                    '<td style="padding:6px 8px;">' + badge + '</td>' +
+                    '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>' +
+                    '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(h.error_message || "") + '</td>';
+                body.appendChild(tr);
+            });
+
+            document.getElementById("btn-hist-prev").disabled = offset === 0;
+            document.getElementById("btn-hist-next").disabled = offset + 20 >= res.total;
+            document.getElementById("history-page").textContent =
+                "Showing " + (offset + 1) + "-" + Math.min(offset + 20, res.total) + " of " + res.total;
+            container.style.display = "block";
+        }
+
+        /* --- Rename backup inline --- */
+        async function renameBackup(id, el) {
+            const current = el.textContent === "-" ? "" : el.textContent;
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "inline-name";
+            input.value = current;
+            input.placeholder = "name";
+            el.replaceWith(input);
+            input.focus();
+            input.select();
+
+            const save = async () => {
+                const newName = input.value.trim();
+                const res = await api("/api/backup/rename", { method: "POST", body: { id, name: newName } });
+                if (res.ok) {
+                    loadHistory(historyOffset);
+                } else {
+                    input.style.borderColor = "#dc2626";
+                }
+            };
+
+            input.onblur = save;
+            input.onkeydown = (e) => {
+                if (e.key === "Enter") { input.blur(); }
+                if (e.key === "Escape") { loadHistory(historyOffset); }
+            };
+        }
+
+        /* --- Manage Backups: Load snapshots --- */
         async function loadSnapshots() {
             const btn = document.getElementById("btn-load-snapshots");
             btn.disabled = true;
             btn.textContent = "Loading...";
-            const res = await api("/api/backups");
+            selectedSnapshot = null;
+            selectedBackupId = null;
+            document.getElementById("action-panel").style.display = "none";
+            document.getElementById("browse-container").style.display = "none";
+            await loadHistory(0);
             btn.disabled = false;
             btn.textContent = "Load snapshots";
-
-            const container = document.getElementById("snapshots-container");
-            const select = document.getElementById("snapshot-select");
-            select.innerHTML = "";
-
-            if (res.snapshots && res.snapshots.length > 0) {
-                res.snapshots.forEach(s => {
-                    const opt = document.createElement("option");
-                    opt.value = s;
-                    opt.textContent = s;
-                    select.appendChild(opt);
-                });
-                container.style.display = "block";
-            } else {
-                container.style.display = "none";
-                showMsg("restore-msg", "No snapshots found", false);
-            }
         }
 
+        function selectSnapshot(timestamp, backupId) {
+            selectedSnapshot = timestamp;
+            selectedBackupId = backupId;
+            document.getElementById("selected-snapshot-label").textContent = timestamp;
+            document.getElementById("browse-container").style.display = "none";
+            document.getElementById("action-panel").style.display = "block";
+            document.getElementById("btn-restore").disabled = false;
+            // Highlight selected row
+            const rows = document.getElementById("history-body").querySelectorAll("tr");
+            rows.forEach(tr => {
+                const cell = tr.querySelector("td");
+                if (cell && cell.textContent === timestamp) {
+                    tr.style.background = "#eff6ff";
+                } else {
+                    tr.style.background = "";
+                }
+            });
+        }
+
+        /* --- Generic file browser (shared by remote + local) --- */
+        function renderFileBrowser(res, subpath, browseFunc, label) {
+            const container = document.getElementById("browse-container");
+            const body = document.getElementById("browse-body");
+            const breadcrumb = document.getElementById("browse-breadcrumb");
+
+            if (!res.ok) {
+                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#991b1b;">' + escapeHtml(res.error || "Failed to load files") + '</td></tr>';
+                return;
+            }
+
+            // Breadcrumb
+            const parts = subpath ? subpath.split("/") : [];
+            let bc = '<span style="font-size:0.75rem;background:#e0e7ff;color:#3730a3;padding:1px 6px;border-radius:3px;margin-right:6px;">' + escapeHtml(label) + '</span>';
+            bc += '<span class="browse-link" onclick="' + browseFunc + '(\'\')">root</span>';
+            let accumulated = "";
+            parts.forEach((p, i) => {
+                accumulated += (i > 0 ? "/" : "") + p;
+                const path = accumulated;
+                bc += ' / <span class="browse-link" onclick="' + browseFunc + '(\'' + escapeHtml(path) + '\')">' + escapeHtml(p) + '</span>';
+            });
+            breadcrumb.innerHTML = bc;
+
+            // File listing
+            body.innerHTML = "";
+            if (res.files.length === 0) {
+                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Empty directory</td></tr>';
+                return;
+            }
+
+            const sorted = res.files.sort((a, b) => {
+                if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+                return a.path.localeCompare(b.path);
+            });
+
+            sorted.forEach(f => {
+                const tr = document.createElement("tr");
+                tr.style.borderBottom = "1px solid #eee";
+                const fullPath = subpath ? subpath + "/" + f.path : f.path;
+                const nameCell = f.is_dir
+                    ? '<td style="padding:6px 8px;"><span class="browse-link" onclick="' + browseFunc + '(\'' + escapeHtml(fullPath) + '\')">&#128193; ' + escapeHtml(f.path) + '</span></td>'
+                    : '<td style="padding:6px 8px;">&#128196; ' + escapeHtml(f.path) + '</td>';
+                const sizeCell = '<td style="padding:6px 8px;text-align:right;">' + (f.is_dir ? "-" : formatBytes(f.size)) + '</td>';
+                const modCell = '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(f.mod_time ? f.mod_time.substring(0, 19) : "") + '</td>';
+                tr.innerHTML = nameCell + sizeCell + modCell;
+                body.appendChild(tr);
+            });
+        }
+
+        /* --- Browse Snapshot (remote, falls back to local) --- */
+        async function browseSnapshot(subpath) {
+            const snapshot = selectedSnapshot;
+            if (!snapshot) return;
+            browseMode = "remote";
+            const container = document.getElementById("browse-container");
+            const body = document.getElementById("browse-body");
+
+            body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
+            container.style.display = "block";
+
+            let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(snapshot);
+            if (subpath) url += "&path=" + encodeURIComponent(subpath);
+            const res = await api(url);
+
+            if (!res.ok) {
+                // Remote failed — fall back to local browse automatically
+                browseLocal(subpath, true);
+                return;
+            }
+            renderFileBrowser(res, subpath, "browseSnapshot", "remote");
+        }
+
+        /* --- Browse Local app data (backup source) --- */
+        async function browseLocal(subpath, isFallback) {
+            if (!selectedSnapshot) return;
+            browseMode = "local";
+            const container = document.getElementById("browse-container");
+            const body = document.getElementById("browse-body");
+
+            body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
+            container.style.display = "block";
+
+            let url = "/api/local/files";
+            if (subpath) url += "?path=" + encodeURIComponent(subpath);
+            const res = await api(url);
+            const label = isFallback ? "local (snapshot not on remote)" : "local";
+            renderFileBrowser(res, subpath, "browseLocal", label);
+        }
+
+        /* --- Restore --- */
         async function triggerRestore() {
-            const snapshot = document.getElementById("snapshot-select").value;
+            const snapshot = selectedSnapshot;
             if (!snapshot) return;
             if (!confirm("This will overwrite current app data with the backup from " + snapshot + ". Continue?")) return;
 
@@ -280,10 +532,10 @@
             btn.textContent = "Restoring...";
             const res = await api("/api/restore", { method: "POST", body: { snapshot } });
             if (res.ok) {
-                showMsg("restore-msg", "Restore started", true);
+                showMsg("manage-msg", "Restore started", true);
                 pollRestore();
             } else {
-                showMsg("restore-msg", res.error || "Failed", false);
+                showMsg("manage-msg", res.error || "Failed", false);
                 btn.disabled = false;
                 btn.textContent = "Restore";
             }
@@ -300,9 +552,9 @@
                     setTimeout(poll, 2000);
                 } else {
                     if (res.last_status === "success") {
-                        stateEl.innerHTML = '<span class="status-badge status-success">restored: ' + (res.last_restore || "") + '</span>';
+                        stateEl.innerHTML = '<span class="status-badge status-success">restored: ' + escapeHtml(res.last_restore || "") + '</span>';
                     } else if (res.last_status) {
-                        stateEl.innerHTML = '<span class="status-badge status-error">' + res.last_status + '</span>';
+                        stateEl.innerHTML = '<span class="status-badge status-error">' + escapeHtml(res.last_status) + '</span>';
                     } else {
                         stateEl.innerHTML = "";
                     }
@@ -312,6 +564,34 @@
             };
             poll();
         }
+
+        /* --- Delete Snapshot --- */
+        async function deleteSnapshot() {
+            const snapshot = selectedSnapshot;
+            if (!snapshot) return;
+            if (!confirm("Permanently delete backup snapshot " + snapshot + "? This cannot be undone.")) return;
+
+            const btn = document.getElementById("btn-delete");
+            btn.disabled = true;
+            btn.textContent = "Deleting...";
+            const res = await api("/api/snapshot/delete", { method: "POST", body: { snapshot } });
+            btn.disabled = false;
+            btn.textContent = "Delete";
+
+            if (res.ok) {
+                showMsg("manage-msg", "Snapshot deleted", true);
+                selectedSnapshot = null;
+                selectedBackupId = null;
+                document.getElementById("action-panel").style.display = "none";
+                document.getElementById("browse-container").style.display = "none";
+                loadHistory(historyOffset);
+            } else {
+                showMsg("manage-msg", res.error || "Delete failed", false);
+            }
+        }
+
+        // Auto-load on page load
+        loadSnapshots();
     </script>
 </body>
 </html>
