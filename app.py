@@ -25,11 +25,15 @@ CONFIG_DIR = APP_DATA_DIR
 RCLONE_CONF = CONFIG_DIR / "rclone.conf"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_FILE = CONFIG_DIR / "backups.db"
+LOCAL_SNAPSHOTS_DIR = APP_DATA_DIR / "snapshots"
+
+DEFAULT_REMOTE_NAME = "local-backup"
+DEFAULT_REMOTE_PATH = str(LOCAL_SNAPSHOTS_DIR)
 
 DEFAULT_CONFIG = {
     "interval_seconds": 3600,
-    "remote_name": "openhost-backup",
-    "remote_path": "",
+    "remote_name": DEFAULT_REMOTE_NAME,
+    "remote_path": DEFAULT_REMOTE_PATH,
 }
 
 
@@ -493,10 +497,22 @@ async def scheduler_loop():
         await run_backup()
 
 
+def ensure_default_config():
+    """Set up local backup config if nothing is configured yet."""
+    if not RCLONE_CONF.exists():
+        LOCAL_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        save_rclone_conf(f"[{DEFAULT_REMOTE_NAME}]\ntype = local\n")
+        logger.info("Created default rclone.conf with local backup to %s", LOCAL_SNAPSHOTS_DIR)
+    if not CONFIG_FILE.exists():
+        save_config(dict(DEFAULT_CONFIG))
+        logger.info("Created default config.json")
+
+
 @app.before_serving
 async def startup():
     global scheduler_task
     init_db()
+    ensure_default_config()
     scheduler_task = asyncio.create_task(scheduler_loop())
     logger.info("Backup scheduler started")
 
