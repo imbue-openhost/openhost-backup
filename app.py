@@ -134,6 +134,17 @@ def save_rclone_conf(text):
     RCLONE_CONF.write_text(text)
 
 
+def rclone_target(snapshot="", subpath=""):
+    """Build an rclone target string from config, e.g. 'remote:path/snapshot/sub'."""
+    conf = load_config()
+    parts = [conf["remote_name"] + ":" + conf["remote_path"]]
+    if snapshot:
+        parts.append(snapshot)
+    if subpath:
+        parts.append(subpath)
+    return "/".join(parts)
+
+
 def generate_s3_conf(remote_name, bucket, access_key, secret_key, region):
     return (
         f"[{remote_name}]\n"
@@ -151,20 +162,17 @@ async def run_backup(name=None):
         logger.warning("Backup already in progress, skipping")
         return False
 
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
     if not RCLONE_CONF.exists():
         logger.error("No rclone.conf configured, skipping backup")
         return False
 
-    if not remote_name or not remote_path:
+    conf = load_config()
+    if not conf["remote_name"] or not conf["remote_path"]:
         logger.error("Remote name or path not configured, skipping backup")
         return False
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    dest = f"{remote_name}:{remote_path}/{timestamp}"
+    dest = rclone_target(timestamp)
 
     backup_running = True
     logger.info("Starting backup to %s", dest)
@@ -214,43 +222,6 @@ async def run_backup(name=None):
 SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 
 
-async def list_snapshots():
-    """List available backup snapshots from the remote.
-
-    Returns (names, ok) where ok indicates if the remote was reachable.
-    """
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
-    if not RCLONE_CONF.exists() or not remote_name or not remote_path:
-        return [], False
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "rclone", "lsjson",
-            f"{remote_name}:{remote_path}",
-            "--config", str(RCLONE_CONF),
-            "--dirs-only",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error("Failed to list snapshots: %s", stderr.decode())
-            return [], False
-
-        entries = json.loads(stdout.decode())
-        names = sorted(
-            [e["Path"] for e in entries if e.get("IsDir")],
-            reverse=True,
-        )
-        return names, True
-    except Exception as e:
-        logger.exception("Failed to list snapshots")
-        return [], False
-
-
 def validate_subpath(path):
     """Validate a browse subpath to prevent directory traversal."""
     if not path:
@@ -266,13 +237,9 @@ def validate_subpath(path):
 
 async def get_snapshot_size(snapshot):
     """Get total size and file count for a snapshot."""
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
     proc = await asyncio.create_subprocess_exec(
         "rclone", "size", "--json",
-        f"{remote_name}:{remote_path}/{snapshot}",
+        rclone_target(snapshot),
         "--config", str(RCLONE_CONF),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -290,17 +257,9 @@ async def list_snapshot_files(snapshot, subpath=""):
 
     Returns (files, error) where error is a user-friendly string or None.
     """
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
-    target = f"{remote_name}:{remote_path}/{snapshot}"
-    if subpath:
-        target += f"/{subpath}"
-
     proc = await asyncio.create_subprocess_exec(
         "rclone", "lsjson",
-        target,
+        rclone_target(snapshot, subpath),
         "--config", str(RCLONE_CONF),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -326,16 +285,13 @@ async def list_snapshot_files(snapshot, subpath=""):
 
 async def delete_snapshot(snapshot):
     """Delete a snapshot from remote storage and the local DB record."""
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
     remote_deleted = False
-    if RCLONE_CONF.exists() and remote_name and remote_path:
+    conf = load_config()
+    if RCLONE_CONF.exists() and conf["remote_name"] and conf["remote_path"]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "rclone", "purge",
-                f"{remote_name}:{remote_path}/{snapshot}",
+                rclone_target(snapshot),
                 "--config", str(RCLONE_CONF),
                 "--contimeout", "10s",
                 "--timeout", "30s",
@@ -395,18 +351,6 @@ def get_backup_history(limit=20, offset=0):
         conn.close()
 
 
-def get_backup_sizes():
-    """Get a map of timestamp -> {size_bytes, file_count} for all successful backups."""
-    conn = get_db()
-    try:
-        rows = conn.execute(
-            "SELECT timestamp, size_bytes, file_count FROM backups WHERE status = 'success' AND size_bytes IS NOT NULL"
-        ).fetchall()
-        return {r[0]: {"size_bytes": r[1], "file_count": r[2]} for r in rows}
-    finally:
-        conn.close()
-
-
 async def run_restore(snapshot):
     """Restore app data from a remote backup snapshot."""
     global restore_running, restore_last_snapshot, restore_last_status
@@ -418,15 +362,12 @@ async def run_restore(snapshot):
         logger.warning("Backup in progress, cannot restore")
         return False
 
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
     if not RCLONE_CONF.exists():
         restore_last_status = "error: no rclone.conf"
         return False
 
-    if not remote_name or not remote_path:
+    conf = load_config()
+    if not conf["remote_name"] or not conf["remote_path"]:
         restore_last_status = "error: remote not configured"
         return False
 
@@ -434,7 +375,7 @@ async def run_restore(snapshot):
         restore_last_status = "error: invalid snapshot name"
         return False
 
-    src = f"{remote_name}:{remote_path}/{snapshot}"
+    src = rclone_target(snapshot)
     restore_running = True
     logger.info("Starting restore from %s", src)
 
@@ -618,20 +559,6 @@ async def status():
         last_error=last["error_message"] if last else None,
         interval_seconds=conf["interval_seconds"],
     )
-
-
-@route("/api/backups")
-async def get_backups():
-    snapshots, remote_ok = await list_snapshots()
-    sizes = get_backup_sizes()
-    enriched = []
-    for name in snapshots:
-        entry = {"name": name}
-        if name in sizes:
-            entry["size_bytes"] = sizes[name]["size_bytes"]
-            entry["file_count"] = sizes[name]["file_count"]
-        enriched.append(entry)
-    return jsonify(snapshots=enriched, remote_ok=remote_ok)
 
 
 @route("/api/restore", methods=["POST"])

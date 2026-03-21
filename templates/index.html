@@ -203,8 +203,6 @@
         const BASE = "{{ base_path }}";
         let historyOffset = 0;
         let selectedSnapshot = null;
-        let selectedBackupId = null;
-        let browseMode = null; // "remote" or "local"
 
         async function api(path, opts = {}) {
             const url = BASE + path;
@@ -342,7 +340,7 @@
                     tr.style.cursor = "pointer";
                     tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
                     tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
-                    tr.onclick = () => selectSnapshot(h.timestamp, h.id);
+                    tr.onclick = () => selectSnapshot(h.timestamp);
                     if (selectedSnapshot === h.timestamp) {
                         tr.style.background = "#eff6ff";
                     }
@@ -405,7 +403,6 @@
             btn.disabled = true;
             btn.textContent = "Loading...";
             selectedSnapshot = null;
-            selectedBackupId = null;
             document.getElementById("action-panel").style.display = "none";
             document.getElementById("browse-container").style.display = "none";
             await loadHistory(0);
@@ -413,9 +410,8 @@
             btn.textContent = "Load snapshots";
         }
 
-        function selectSnapshot(timestamp, backupId) {
+        function selectSnapshot(timestamp) {
             selectedSnapshot = timestamp;
-            selectedBackupId = backupId;
             document.getElementById("selected-snapshot-label").textContent = timestamp;
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
@@ -485,7 +481,6 @@
         async function browseSnapshot(subpath) {
             const snapshot = selectedSnapshot;
             if (!snapshot) return;
-            browseMode = "remote";
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
 
@@ -507,7 +502,6 @@
         /* --- Browse Local app data (backup source) --- */
         async function browseLocal(subpath, isFallback) {
             if (!selectedSnapshot) return;
-            browseMode = "local";
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
 
@@ -581,7 +575,6 @@
             if (res.ok) {
                 showMsg("manage-msg", "Snapshot deleted", true);
                 selectedSnapshot = null;
-                selectedBackupId = null;
                 document.getElementById("action-panel").style.display = "none";
                 document.getElementById("browse-container").style.display = "none";
                 loadHistory(historyOffset);
