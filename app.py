@@ -1,5 +1,3 @@
-print("backup app module loading...", flush=True)
-
 import asyncio
 import json
 import logging
@@ -246,7 +244,7 @@ async def list_snapshots():
             reverse=True,
         )
         return names, True
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to list snapshots")
         return [], False
 
