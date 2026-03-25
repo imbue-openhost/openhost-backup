@@ -70,7 +70,9 @@ def get_db():
     return sqlite3.connect(str(DB_FILE))
 
 
-def record_backup(timestamp, status, error_message=None, size_bytes=None, file_count=None, name=None):
+def record_backup(
+    timestamp, status, error_message=None, size_bytes=None, file_count=None, name=None
+):
     """Insert a backup record into the database."""
     conn = get_db()
     try:
@@ -169,11 +171,14 @@ async def run_backup(name=None):
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "copy",
+            "rclone",
+            "copy",
             str(ALL_APP_DATA),
             dest,
-            "--config", str(RCLONE_CONF),
-            "--exclude", "backup/**",
+            "--config",
+            str(RCLONE_CONF),
+            "--exclude",
+            "backup/**",
             "-v",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -193,7 +198,13 @@ async def run_backup(name=None):
                 file_count = size_info["count"]
             except Exception:
                 logger.warning("Could not get backup size, recording without it")
-            record_backup(timestamp, "success", size_bytes=size_bytes, file_count=file_count, name=name)
+            record_backup(
+                timestamp,
+                "success",
+                size_bytes=size_bytes,
+                file_count=file_count,
+                name=name,
+            )
             logger.info("Backup completed successfully")
             return True
         else:
@@ -226,9 +237,11 @@ async def list_snapshots():
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "lsjson",
+            "rclone",
+            "lsjson",
             f"{remote_name}:{remote_path}",
-            "--config", str(RCLONE_CONF),
+            "--config",
+            str(RCLONE_CONF),
             "--dirs-only",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -269,9 +282,12 @@ async def get_snapshot_size(snapshot):
     remote_path = conf["remote_path"]
 
     proc = await asyncio.create_subprocess_exec(
-        "rclone", "size", "--json",
+        "rclone",
+        "size",
+        "--json",
         f"{remote_name}:{remote_path}/{snapshot}",
-        "--config", str(RCLONE_CONF),
+        "--config",
+        str(RCLONE_CONF),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -297,9 +313,11 @@ async def list_snapshot_files(snapshot, subpath=""):
         target += f"/{subpath}"
 
     proc = await asyncio.create_subprocess_exec(
-        "rclone", "lsjson",
+        "rclone",
+        "lsjson",
         target,
-        "--config", str(RCLONE_CONF),
+        "--config",
+        str(RCLONE_CONF),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -332,11 +350,15 @@ async def delete_snapshot(snapshot):
     if RCLONE_CONF.exists() and remote_name and remote_path:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "rclone", "purge",
+                "rclone",
+                "purge",
                 f"{remote_name}:{remote_path}/{snapshot}",
-                "--config", str(RCLONE_CONF),
-                "--contimeout", "10s",
-                "--timeout", "30s",
+                "--config",
+                str(RCLONE_CONF),
+                "--contimeout",
+                "10s",
+                "--timeout",
+                "30s",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -438,11 +460,14 @@ async def run_restore(snapshot):
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "copy",
+            "rclone",
+            "copy",
             src,
             str(ALL_APP_DATA),
-            "--config", str(RCLONE_CONF),
-            "--exclude", "backup/**",
+            "--config",
+            str(RCLONE_CONF),
+            "--exclude",
+            "backup/**",
             "-v",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -480,7 +505,9 @@ async def scheduler_loop():
             last = get_last_backup()
             if last and last["timestamp"]:
                 try:
-                    last_dt = datetime.strptime(last["timestamp"], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    last_dt = datetime.strptime(
+                        last["timestamp"], "%Y-%m-%dT%H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
                     elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
                     wait = max(0, interval - elapsed)
                 except (ValueError, TypeError):
@@ -500,7 +527,9 @@ def ensure_default_config():
     if not RCLONE_CONF.exists():
         LOCAL_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         save_rclone_conf(f"[{DEFAULT_REMOTE_NAME}]\ntype = local\n")
-        logger.info("Created default rclone.conf with local backup to %s", LOCAL_SNAPSHOTS_DIR)
+        logger.info(
+            "Created default rclone.conf with local backup to %s", LOCAL_SNAPSHOTS_DIR
+        )
     if not CONFIG_FILE.exists():
         save_config(dict(DEFAULT_CONFIG))
         logger.info("Created default config.json")
@@ -523,12 +552,14 @@ async def shutdown():
 
 def route(path, **kwargs):
     """Register a route at both /path and BASE_PATH/path to handle proxies."""
+
     def decorator(func):
         app.route(path, **kwargs)(func)
         if BASE_PATH and BASE_PATH != "/":
             prefixed = BASE_PATH.rstrip("/") + path
             app.route(prefixed, **kwargs)(func)
         return func
+
     return decorator
 
 
@@ -727,12 +758,16 @@ async def local_files():
             if str(rel).startswith("backup"):
                 continue
             stat = entry.stat()
-            files.append({
-                "path": entry.name,
-                "size": stat.st_size if entry.is_file() else 0,
-                "is_dir": entry.is_dir(),
-                "mod_time": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
-            })
+            files.append(
+                {
+                    "path": entry.name,
+                    "size": stat.st_size if entry.is_file() else 0,
+                    "is_dir": entry.is_dir(),
+                    "mod_time": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
     except PermissionError:
         return jsonify(ok=False, error="Permission denied"), 403
 
