@@ -514,6 +514,32 @@ MIGRATION_BUNDLE_VERSION = 1
 MIGRATION_DIR_PREFIX = "migration-"
 
 
+def _strip_url_credentials(url: str | None) -> str | None:
+    """Remove embedded credentials (e.g. x-access-token) from a URL."""
+    if not url or not url.startswith("http"):
+        return url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.username or parsed.password:
+            # Rebuild without credentials
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunparse(
+                (
+                    parsed.scheme,
+                    netloc,
+                    parsed.path,
+                    parsed.params,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+    except Exception:
+        pass
+    return url
+
+
 def _migration_log(msg: str):
     """Append a timestamped message to the migration log."""
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -634,7 +660,7 @@ async def _build_manifest(apps: list[dict], app_filter: str | None = None) -> di
         "apps": [
             {
                 "name": a["name"],
-                "repo_url": a.get("repo_url"),
+                "repo_url": _strip_url_credentials(a.get("repo_url")),
                 "version": a.get("version"),
                 "description": a.get("description"),
                 "manifest_raw": a.get("manifest_raw"),
@@ -689,11 +715,14 @@ async def run_migration_export(app_filter: str | None = None, name: str | None =
 
         # 2. Create a temp staging directory
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-        bundle_name = f"{MIGRATION_DIR_PREFIX}{timestamp}"
-        if app_filter:
+        if app_filter and name:
+            bundle_name = f"{MIGRATION_DIR_PREFIX}app-{app_filter}-{name}-{timestamp}"
+        elif app_filter:
             bundle_name = f"{MIGRATION_DIR_PREFIX}app-{app_filter}-{timestamp}"
-        if name:
+        elif name:
             bundle_name = f"{MIGRATION_DIR_PREFIX}{name}-{timestamp}"
+        else:
+            bundle_name = f"{MIGRATION_DIR_PREFIX}{timestamp}"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             staging = Path(tmpdir) / bundle_name
