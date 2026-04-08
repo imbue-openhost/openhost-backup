@@ -174,6 +174,81 @@
         <div id="s3-msg"></div>
     </section>
 
+    <!-- Migration -->
+    <section>
+        <h2>Migration</h2>
+        <p class="info">Export apps and data as migration bundles, or import from a bundle onto another instance.</p>
+
+        <!-- Export -->
+        <div style="margin-bottom: 16px;">
+            <h3 style="font-size: 0.95rem; margin-bottom: 8px;">Export</h3>
+            <div class="grid-2" style="margin-bottom: 8px;">
+                <div>
+                    <label>App (leave blank for all)</label>
+                    <select id="mig-export-app" style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;font-size:0.9rem;margin-bottom:0;">
+                        <option value="">All apps (full instance)</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Bundle name (optional)</label>
+                    <input type="text" id="mig-export-name" placeholder="e.g. pre-upgrade">
+                </div>
+            </div>
+            <div class="btn-row">
+                <button class="btn-primary" id="btn-mig-export" onclick="triggerMigrationExport()">Export migration bundle</button>
+            </div>
+        </div>
+
+        <!-- Import -->
+        <div style="margin-bottom: 16px;">
+            <h3 style="font-size: 0.95rem; margin-bottom: 8px;">Import</h3>
+            <div style="margin-bottom: 8px;">
+                <label>Target instance URL</label>
+                <input type="text" id="mig-target-url" placeholder="https://my-other-instance.selfhost.imbue.com" style="margin-bottom: 4px;">
+                <label>Target API token</label>
+                <input type="password" id="mig-target-token" placeholder="Bearer token for the target instance">
+            </div>
+            <div class="btn-row" style="margin-bottom: 8px;">
+                <button class="btn-secondary" onclick="loadMigrationBundles()">Load bundles</button>
+            </div>
+            <div id="mig-bundles-container" style="display: none;">
+                <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
+                    <thead>
+                        <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                            <th style="padding:6px 8px;">Bundle</th>
+                            <th style="padding:6px 8px;">Type</th>
+                            <th style="padding:6px 8px;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="mig-bundles-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Bundle detail / import panel -->
+        <div id="mig-import-panel" style="display:none;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;margin-bottom:12px;">
+            <div style="font-family:monospace;font-size:0.9rem;font-weight:600;margin-bottom:8px;" id="mig-bundle-label"></div>
+            <div id="mig-bundle-apps" style="margin-bottom: 8px;"></div>
+            <div class="btn-row">
+                <button class="btn-primary" id="btn-mig-import" onclick="triggerMigrationImport()">Import selected apps</button>
+                <button class="btn-danger" onclick="deleteMigrationBundle()">Delete bundle</button>
+            </div>
+        </div>
+
+        <!-- Progress -->
+        <div id="mig-progress" style="display:none;margin-top:12px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                <span class="status-badge status-running" id="mig-phase">starting</span>
+                <span style="font-size:0.85rem;" id="mig-pct">0%</span>
+            </div>
+            <div style="width:100%;height:6px;background:#e5e7eb;border-radius:3px;overflow:hidden;margin-bottom:8px;">
+                <div id="mig-bar" style="height:100%;background:#2563eb;border-radius:3px;transition:width 0.3s;width:0%;"></div>
+            </div>
+            <div id="mig-log" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.8rem;background:#1a1a1a;color:#e5e7eb;padding:8px;border-radius:4px;white-space:pre-wrap;"></div>
+        </div>
+        <div id="mig-msg"></div>
+    </section>
+
     <!-- rclone.conf editor -->
     <section>
         <h2>rclone.conf</h2>
@@ -590,8 +665,251 @@
             }
         }
 
+        /* ================================================================
+         * Migration
+         * ================================================================ */
+        let migSelectedBundle = null;
+        let migBundleManifest = null;
+        let migPolling = false;
+
+        /* Load apps for export dropdown */
+        async function loadMigrationApps() {
+            const res = await api("/api/migration/apps");
+            const sel = document.getElementById("mig-export-app");
+            // Keep the "All apps" option
+            while (sel.options.length > 1) sel.remove(1);
+            if (res.ok && res.apps) {
+                res.apps.forEach(a => {
+                    const opt = document.createElement("option");
+                    opt.value = a.name;
+                    opt.textContent = a.name + (a.version ? " v" + a.version : "") + (a.status ? " (" + a.status + ")" : "");
+                    sel.appendChild(opt);
+                });
+            }
+        }
+
+        /* Export */
+        async function triggerMigrationExport() {
+            const btn = document.getElementById("btn-mig-export");
+            btn.disabled = true;
+            btn.textContent = "Exporting...";
+
+            const appVal = document.getElementById("mig-export-app").value;
+            const nameVal = document.getElementById("mig-export-name").value.trim();
+            const body = {};
+            if (appVal) body.app = appVal;
+            if (nameVal) body.name = nameVal;
+
+            const res = await api("/api/migration/export", { method: "POST", body });
+            if (res.ok) {
+                showMsg("mig-msg", "Export started", true);
+                pollMigration();
+            } else {
+                showMsg("mig-msg", res.error || "Export failed", false);
+                btn.disabled = false;
+                btn.textContent = "Export migration bundle";
+            }
+        }
+
+        /* Poll migration progress */
+        async function pollMigration() {
+            if (migPolling) return;
+            migPolling = true;
+            const progress = document.getElementById("mig-progress");
+            const phase = document.getElementById("mig-phase");
+            const pct = document.getElementById("mig-pct");
+            const bar = document.getElementById("mig-bar");
+            const log = document.getElementById("mig-log");
+            progress.style.display = "block";
+
+            const poll = async () => {
+                const res = await api("/api/migration/status");
+                const s = res.status || {};
+
+                phase.textContent = s.phase || "unknown";
+                pct.textContent = (s.progress || 0) + "%";
+                bar.style.width = (s.progress || 0) + "%";
+
+                if (res.log) {
+                    log.textContent = res.log.join("\n");
+                    log.scrollTop = log.scrollHeight;
+                }
+
+                if (res.running) {
+                    phase.className = "status-badge status-running";
+                    setTimeout(poll, 2000);
+                } else {
+                    migPolling = false;
+                    if (s.phase === "done") {
+                        phase.className = "status-badge status-success";
+                        phase.textContent = "done";
+                        bar.style.background = "#16a34a";
+                    } else if (s.phase === "error") {
+                        phase.className = "status-badge status-error";
+                        phase.textContent = "error";
+                        bar.style.background = "#dc2626";
+                    }
+                    // Reset buttons
+                    const expBtn = document.getElementById("btn-mig-export");
+                    expBtn.disabled = false;
+                    expBtn.textContent = "Export migration bundle";
+                    const impBtn = document.getElementById("btn-mig-import");
+                    if (impBtn) { impBtn.disabled = false; impBtn.textContent = "Import selected apps"; }
+                }
+            };
+            poll();
+        }
+
+        /* Load migration bundles */
+        async function loadMigrationBundles() {
+            const res = await api("/api/migration/bundles");
+            const container = document.getElementById("mig-bundles-container");
+            const body = document.getElementById("mig-bundles-body");
+            body.innerHTML = "";
+
+            if (!res.ok || !res.bundles || res.bundles.length === 0) {
+                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">No migration bundles found</td></tr>';
+                container.style.display = "block";
+                return;
+            }
+
+            res.bundles.forEach(b => {
+                const tr = document.createElement("tr");
+                tr.style.borderBottom = "1px solid #eee";
+                tr.style.cursor = "pointer";
+                tr.onmouseenter = () => { if (migSelectedBundle !== b.name) tr.style.background = "#f8fafc"; };
+                tr.onmouseleave = () => { if (migSelectedBundle !== b.name) tr.style.background = ""; };
+                tr.onclick = () => selectMigrationBundle(b.name);
+
+                const typeLabel = b.type === "app"
+                    ? '<span class="status-badge" style="background:#e0e7ff;color:#3730a3;">app</span>'
+                    : '<span class="status-badge" style="background:#dcfce7;color:#166534;">full</span>';
+
+                tr.innerHTML =
+                    '<td style="padding:6px 8px;font-family:monospace;font-size:0.8rem;">' + escapeHtml(b.name) + '</td>' +
+                    '<td style="padding:6px 8px;">' + typeLabel + '</td>' +
+                    '<td style="padding:6px 8px;"><button class="btn-secondary" style="font-size:0.8rem;padding:4px 8px;" onclick="event.stopPropagation();selectMigrationBundle(\'' + escapeHtml(b.name) + '\')">Details</button></td>';
+                body.appendChild(tr);
+            });
+
+            container.style.display = "block";
+        }
+
+        /* Select a bundle and load its manifest */
+        async function selectMigrationBundle(name) {
+            migSelectedBundle = name;
+            document.getElementById("mig-bundle-label").textContent = name;
+
+            const panel = document.getElementById("mig-import-panel");
+            const appsDiv = document.getElementById("mig-bundle-apps");
+            appsDiv.innerHTML = "Loading manifest...";
+            panel.style.display = "block";
+
+            const res = await api("/api/migration/bundle/manifest?bundle=" + encodeURIComponent(name));
+            if (!res.ok || !res.manifest) {
+                appsDiv.innerHTML = '<span style="color:#991b1b;">Could not load manifest</span>';
+                migBundleManifest = null;
+                return;
+            }
+
+            migBundleManifest = res.manifest;
+            const apps = res.manifest.apps || [];
+            const source = res.manifest.source_instance || "unknown";
+
+            let html = '<div style="font-size:0.85rem;margin-bottom:6px;">Source: <strong>' + escapeHtml(source) + '</strong> &mdash; ' + apps.length + ' app(s)</div>';
+            html += '<div style="font-size:0.85rem;">';
+            apps.forEach(a => {
+                html += '<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;font-weight:normal;">' +
+                    '<input type="checkbox" class="mig-app-check" value="' + escapeHtml(a.name) + '" checked>' +
+                    '<span>' + escapeHtml(a.name) + '</span>' +
+                    (a.version ? '<span style="color:#666;font-size:0.8rem;">v' + escapeHtml(a.version) + '</span>' : '') +
+                    (a.repo_url ? '<span style="color:#888;font-size:0.75rem;">(' + escapeHtml(a.repo_url) + ')</span>' : '') +
+                    '</label>';
+            });
+            html += '</div>';
+            appsDiv.innerHTML = html;
+
+            // Highlight in table
+            const rows = document.getElementById("mig-bundles-body").querySelectorAll("tr");
+            rows.forEach(tr => {
+                const cell = tr.querySelector("td");
+                if (cell && cell.textContent === name) {
+                    tr.style.background = "#eff6ff";
+                } else {
+                    tr.style.background = "";
+                }
+            });
+        }
+
+        /* Import */
+        async function triggerMigrationImport() {
+            if (!migSelectedBundle) return;
+
+            const targetUrl = document.getElementById("mig-target-url").value.trim();
+            const targetToken = document.getElementById("mig-target-token").value.trim();
+
+            if (!targetUrl) {
+                showMsg("mig-msg", "Please enter the target instance URL", false);
+                return;
+            }
+            if (!targetToken) {
+                showMsg("mig-msg", "Please enter the target API token", false);
+                return;
+            }
+
+            // Get selected apps
+            const checks = document.querySelectorAll(".mig-app-check:checked");
+            const apps = Array.from(checks).map(c => c.value);
+            if (apps.length === 0) {
+                showMsg("mig-msg", "Please select at least one app to import", false);
+                return;
+            }
+
+            const msg = "Import " + apps.length + " app(s) from bundle '" + migSelectedBundle +
+                "' onto " + targetUrl + "?\n\nThis will deploy apps and overwrite their data on the target.";
+            if (!confirm(msg)) return;
+
+            const btn = document.getElementById("btn-mig-import");
+            btn.disabled = true;
+            btn.textContent = "Importing...";
+
+            const body = {
+                bundle: migSelectedBundle,
+                target_url: targetUrl,
+                target_token: targetToken,
+                apps: apps,
+            };
+
+            const res = await api("/api/migration/import", { method: "POST", body });
+            if (res.ok) {
+                showMsg("mig-msg", "Import started", true);
+                pollMigration();
+            } else {
+                showMsg("mig-msg", res.error || "Import failed", false);
+                btn.disabled = false;
+                btn.textContent = "Import selected apps";
+            }
+        }
+
+        /* Delete bundle */
+        async function deleteMigrationBundle() {
+            if (!migSelectedBundle) return;
+            if (!confirm("Delete migration bundle '" + migSelectedBundle + "'? This cannot be undone.")) return;
+
+            const res = await api("/api/migration/bundle/delete", { method: "POST", body: { bundle: migSelectedBundle } });
+            if (res.ok) {
+                showMsg("mig-msg", "Bundle deleted", true);
+                migSelectedBundle = null;
+                document.getElementById("mig-import-panel").style.display = "none";
+                loadMigrationBundles();
+            } else {
+                showMsg("mig-msg", "Delete failed", false);
+            }
+        }
+
         // Auto-load on page load
         loadSnapshots();
+        loadMigrationApps();
     </script>
 </body>
 </html>

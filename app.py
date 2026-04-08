@@ -1,12 +1,17 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from quart import Quart, render_template, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -18,6 +23,9 @@ app = Quart(__name__)
 BASE_PATH = os.environ.get("OPENHOST_APP_BASE_PATH", "/backup")
 APP_DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/backup"))
 ALL_APP_DATA = Path("/data/app_data")
+VM_DATA_DIR = Path("/data/vm_data")
+ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
+ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 
 CONFIG_DIR = APP_DATA_DIR
 RCLONE_CONF = CONFIG_DIR / "rclone.conf"
@@ -104,6 +112,11 @@ backup_running = False
 restore_running = False
 restore_last_snapshot = None
 restore_last_status = None
+
+# Migration state
+migration_running = False
+migration_status = None  # dict with progress details
+migration_log: list[str] = []
 
 scheduler_task = None
 
@@ -493,6 +506,619 @@ async def run_restore(snapshot):
     return restore_last_status == "success"
 
 
+# ---------------------------------------------------------------------------
+# Migration helpers
+# ---------------------------------------------------------------------------
+
+MIGRATION_BUNDLE_VERSION = 1
+MIGRATION_DIR_PREFIX = "migration-"
+
+
+def _migration_log(msg: str):
+    """Append a timestamped message to the migration log."""
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    migration_log.append(entry)
+    logger.info("migration: %s", msg)
+
+
+async def _router_get(path: str, token: str | None = None, base_url: str | None = None):
+    """GET request to the OpenHost router API."""
+    url = (base_url or ROUTER_URL) + path
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _router_post(
+    path: str,
+    data: dict | None = None,
+    token: str | None = None,
+    base_url: str | None = None,
+):
+    """POST form-encoded request to the OpenHost router API."""
+    url = (base_url or ROUTER_URL) + path
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    async with httpx.AsyncClient(verify=False, timeout=120) as client:
+        r = await client.post(url, data=data or {}, headers=headers)
+        r.raise_for_status()
+        ct = r.headers.get("content-type", "")
+        if "json" in ct:
+            return r.json()
+        return {"ok": True, "text": r.text}
+
+
+async def _get_apps_metadata(token: str | None = None, base_url: str | None = None):
+    """Query the router for full app details by reading the apps table directly.
+
+    Returns list of dicts with app metadata needed for migration.
+    If we have filesystem access to router.db, use that (more data).
+    Otherwise fall back to the router API.
+    """
+    apps = []
+    router_db = VM_DATA_DIR / "router.db"
+
+    if router_db.exists():
+        # Direct DB access — more complete data
+        conn = sqlite3.connect(str(router_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT name, manifest_name, version, description, repo_url, "
+                "health_check, local_port, container_port, status, memory_mb, "
+                "cpu_millicores, gpu, public_paths, manifest_raw, runtime_type "
+                "FROM apps ORDER BY name"
+            ).fetchall()
+            for row in rows:
+                apps.append(
+                    {
+                        "name": row["name"],
+                        "manifest_name": row["manifest_name"],
+                        "version": row["version"],
+                        "description": row["description"],
+                        "repo_url": row["repo_url"],
+                        "health_check": row["health_check"],
+                        "status": row["status"],
+                        "memory_mb": row["memory_mb"],
+                        "cpu_millicores": row["cpu_millicores"],
+                        "gpu": row["gpu"],
+                        "public_paths": row["public_paths"],
+                        "manifest_raw": row["manifest_raw"],
+                        "runtime_type": row["runtime_type"],
+                    }
+                )
+        finally:
+            conn.close()
+    else:
+        # Fall back to API
+        data = await _router_get("/api/apps", token=token, base_url=base_url)
+        for name, info in data.items():
+            apps.append(
+                {
+                    "name": name,
+                    "status": info.get("status"),
+                    "repo_url": None,
+                    "manifest_raw": None,
+                }
+            )
+
+    return apps
+
+
+def _safe_copy_sqlite(src: Path, dst: Path):
+    """Copy a SQLite database safely using the backup API."""
+    src_conn = sqlite3.connect(str(src))
+    dst_conn = sqlite3.connect(str(dst))
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
+
+
+async def _build_manifest(apps: list[dict], app_filter: str | None = None) -> dict:
+    """Build a migration manifest.json."""
+    if app_filter:
+        apps = [a for a in apps if a["name"] == app_filter]
+
+    return {
+        "version": MIGRATION_BUNDLE_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_instance": ZONE_DOMAIN or "unknown",
+        "apps": [
+            {
+                "name": a["name"],
+                "repo_url": a.get("repo_url"),
+                "version": a.get("version"),
+                "description": a.get("description"),
+                "manifest_raw": a.get("manifest_raw"),
+                "memory_mb": a.get("memory_mb"),
+                "cpu_millicores": a.get("cpu_millicores"),
+                "runtime_type": a.get("runtime_type"),
+            }
+            for a in apps
+        ],
+    }
+
+
+async def run_migration_export(app_filter: str | None = None, name: str | None = None):
+    """Export a migration bundle to the configured rclone remote.
+
+    If app_filter is set, only export that single app.
+    """
+    global migration_running, migration_status
+    if migration_running:
+        _migration_log("Migration already in progress")
+        return False
+
+    migration_running = True
+    migration_log.clear()
+    migration_status = {"phase": "starting", "progress": 0}
+
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    try:
+        if not RCLONE_CONF.exists():
+            raise RuntimeError("No rclone.conf configured")
+
+        # 1. Gather app metadata
+        _migration_log("Gathering app metadata from router...")
+        migration_status = {"phase": "gathering_metadata", "progress": 5}
+        apps = await _get_apps_metadata()
+
+        if app_filter:
+            matching = [a for a in apps if a["name"] == app_filter]
+            if not matching:
+                raise RuntimeError(f"App '{app_filter}' not found")
+            # Don't include the backup app itself in single-app exports
+        else:
+            # Exclude backup app from full instance exports
+            apps = [a for a in apps if a["name"] != "backup"]
+
+        manifest = await _build_manifest(apps, app_filter)
+        app_names = [a["name"] for a in manifest["apps"]]
+        _migration_log(f"Found {len(app_names)} apps: {', '.join(app_names)}")
+
+        # 2. Create a temp staging directory
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        bundle_name = f"{MIGRATION_DIR_PREFIX}{timestamp}"
+        if app_filter:
+            bundle_name = f"{MIGRATION_DIR_PREFIX}app-{app_filter}-{timestamp}"
+        if name:
+            bundle_name = f"{MIGRATION_DIR_PREFIX}{name}-{timestamp}"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            staging = Path(tmpdir) / bundle_name
+            staging.mkdir()
+
+            # 3. Write manifest
+            manifest_path = staging / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2))
+            _migration_log("Wrote manifest.json")
+            migration_status = {"phase": "copying_metadata", "progress": 10}
+
+            # 4. Copy router.db safely (full instance export only)
+            if not app_filter:
+                router_db = VM_DATA_DIR / "router.db"
+                if router_db.exists():
+                    vm_staging = staging / "vm_data"
+                    vm_staging.mkdir()
+                    _safe_copy_sqlite(router_db, vm_staging / "router.db")
+                    _migration_log("Copied router.db (safe backup)")
+
+                    # Copy identity keys
+                    keys_dir = VM_DATA_DIR / "identity_keys"
+                    if keys_dir.exists():
+                        keys_staging = vm_staging / "identity_keys"
+                        keys_staging.mkdir()
+                        for key_file in keys_dir.iterdir():
+                            if key_file.is_file():
+                                shutil.copy2(key_file, keys_staging / key_file.name)
+                        _migration_log("Copied identity keys")
+
+            migration_status = {"phase": "copying_app_data", "progress": 20}
+
+            # 5. Copy app data for selected apps
+            app_data_staging = staging / "app_data"
+            app_data_staging.mkdir()
+
+            for i, app_name in enumerate(app_names):
+                src = ALL_APP_DATA / app_name
+                if src.exists():
+                    _migration_log(f"Copying data for app: {app_name}")
+                    # Use rclone for the actual copy to handle large dirs efficiently
+                    dst = app_data_staging / app_name
+                    proc = await asyncio.create_subprocess_exec(
+                        "rclone",
+                        "copy",
+                        str(src),
+                        str(dst),
+                        "--config",
+                        str(RCLONE_CONF),
+                        "-v",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
+                    stdout, _ = await proc.communicate()
+                    if proc.returncode != 0:
+                        _migration_log(f"Warning: failed to copy data for {app_name}")
+                else:
+                    _migration_log(f"No data directory for app: {app_name}")
+
+                pct = 20 + int(60 * (i + 1) / len(app_names))
+                migration_status = {
+                    "phase": "copying_app_data",
+                    "progress": pct,
+                    "current_app": app_name,
+                }
+
+            # 6. Upload the staged bundle to the remote
+            _migration_log("Uploading migration bundle to remote storage...")
+            migration_status = {"phase": "uploading", "progress": 85}
+
+            dest = f"{remote_name}:{remote_path}/migrations/{bundle_name}"
+            proc = await asyncio.create_subprocess_exec(
+                "rclone",
+                "copy",
+                str(staging),
+                dest,
+                "--config",
+                str(RCLONE_CONF),
+                "-v",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await proc.communicate()
+            if stdout:
+                for line in stdout.decode().splitlines():
+                    logger.info("rclone: %s", line)
+
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"rclone upload failed with exit code {proc.returncode}"
+                )
+
+            _migration_log(f"Migration bundle uploaded: {bundle_name}")
+            migration_status = {"phase": "done", "progress": 100, "bundle": bundle_name}
+            return True
+
+    except Exception as e:
+        _migration_log(f"Export failed: {e}")
+        migration_status = {"phase": "error", "progress": 0, "error": str(e)}
+        return False
+    finally:
+        migration_running = False
+
+
+async def list_migration_bundles():
+    """List available migration bundles on the remote."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    if not RCLONE_CONF.exists() or not remote_name or not remote_path:
+        return [], False
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "rclone",
+            "lsjson",
+            f"{remote_name}:{remote_path}/migrations",
+            "--config",
+            str(RCLONE_CONF),
+            "--dirs-only",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            if "directory not found" in err.lower() or "not found" in err.lower():
+                return [], True  # no migrations dir yet is fine
+            logger.error("Failed to list migration bundles: %s", err)
+            return [], False
+
+        entries = json.loads(stdout.decode())
+        names = sorted(
+            [
+                e["Path"]
+                for e in entries
+                if e.get("IsDir") and e["Path"].startswith(MIGRATION_DIR_PREFIX)
+            ],
+            reverse=True,
+        )
+        return names, True
+    except Exception:
+        logger.exception("Failed to list migration bundles")
+        return [], False
+
+
+async def get_migration_manifest(bundle_name: str) -> dict | None:
+    """Download and parse the manifest.json from a migration bundle."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = f"{remote_name}:{remote_path}/migrations/{bundle_name}/manifest.json"
+        dst = Path(tmpdir) / "manifest.json"
+        proc = await asyncio.create_subprocess_exec(
+            "rclone",
+            "copyto",
+            src,
+            str(dst),
+            "--config",
+            str(RCLONE_CONF),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0 or not dst.exists():
+            return None
+        return json.loads(dst.read_text())
+
+
+async def run_migration_import(
+    bundle_name: str,
+    target_url: str,
+    target_token: str,
+    selected_apps: list[str] | None = None,
+):
+    """Import a migration bundle onto a target instance.
+
+    Args:
+        bundle_name: Name of the migration bundle on the remote.
+        target_url: URL of the target OpenHost instance (e.g. https://my-instance.selfhost.imbue.com)
+        target_token: API bearer token for the target instance.
+        selected_apps: Optional list of app names to import. If None, import all.
+    """
+    global migration_running, migration_status
+    if migration_running:
+        _migration_log("Migration already in progress")
+        return False
+
+    migration_running = True
+    migration_log.clear()
+    migration_status = {"phase": "starting", "progress": 0}
+
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    try:
+        # 1. Download the manifest
+        _migration_log(f"Downloading manifest from bundle: {bundle_name}")
+        migration_status = {"phase": "downloading_manifest", "progress": 5}
+
+        manifest = await get_migration_manifest(bundle_name)
+        if not manifest:
+            raise RuntimeError("Could not download or parse manifest.json")
+
+        apps_in_bundle = manifest.get("apps", [])
+        if selected_apps:
+            apps_in_bundle = [a for a in apps_in_bundle if a["name"] in selected_apps]
+
+        if not apps_in_bundle:
+            raise RuntimeError("No apps found in bundle (or none match selection)")
+
+        app_names = [a["name"] for a in apps_in_bundle]
+        _migration_log(f"Bundle from: {manifest.get('source_instance', 'unknown')}")
+        _migration_log(f"Apps to import: {', '.join(app_names)}")
+
+        # 2. Check which apps already exist on the target
+        _migration_log("Checking existing apps on target instance...")
+        migration_status = {"phase": "checking_target", "progress": 10}
+
+        try:
+            existing = await _router_get(
+                "/api/apps", token=target_token, base_url=target_url
+            )
+        except Exception as e:
+            raise RuntimeError(f"Cannot reach target instance: {e}")
+
+        existing_names = set(existing.keys()) if isinstance(existing, dict) else set()
+
+        # 3. Deploy apps that don't exist yet on the target
+        migration_status = {"phase": "deploying_apps", "progress": 15}
+        apps_to_deploy = [
+            a
+            for a in apps_in_bundle
+            if a["name"] not in existing_names and a.get("repo_url")
+        ]
+        apps_existing = [a for a in apps_in_bundle if a["name"] in existing_names]
+
+        if apps_to_deploy:
+            _migration_log(f"Deploying {len(apps_to_deploy)} new apps on target...")
+            for i, app_info in enumerate(apps_to_deploy):
+                app_name = app_info["name"]
+                repo_url = app_info.get("repo_url")
+                if not repo_url:
+                    _migration_log(f"Skipping {app_name}: no repo_url in manifest")
+                    continue
+
+                _migration_log(f"Deploying {app_name} from {repo_url}...")
+                try:
+                    await _router_post(
+                        "/api/add_app",
+                        data={"repo_url": repo_url, "app_name": app_name},
+                        token=target_token,
+                        base_url=target_url,
+                    )
+                    _migration_log(f"Deployed {app_name} (building...)")
+                except Exception as e:
+                    _migration_log(f"Failed to deploy {app_name}: {e}")
+
+                pct = 15 + int(20 * (i + 1) / len(apps_to_deploy))
+                migration_status = {
+                    "phase": "deploying_apps",
+                    "progress": pct,
+                    "current_app": app_name,
+                }
+
+        # 4. Wait for deployed apps to be ready
+        if apps_to_deploy:
+            _migration_log("Waiting for newly deployed apps to build and start...")
+            migration_status = {"phase": "waiting_for_apps", "progress": 40}
+            max_wait = 300  # 5 minutes
+            waited = 0
+            while waited < max_wait:
+                await asyncio.sleep(10)
+                waited += 10
+                try:
+                    current = await _router_get(
+                        "/api/apps", token=target_token, base_url=target_url
+                    )
+                    all_ready = True
+                    for a in apps_to_deploy:
+                        status = current.get(a["name"], {}).get("status", "")
+                        if status in ("building", "starting"):
+                            all_ready = False
+                            break
+                    if all_ready:
+                        break
+                except Exception:
+                    pass
+            _migration_log(f"Apps ready after ~{waited}s")
+
+        # 5. Stop all target apps that we're importing data for
+        _migration_log("Stopping apps on target before data restore...")
+        migration_status = {"phase": "stopping_apps", "progress": 45}
+
+        for app_name in app_names:
+            try:
+                await _router_post(
+                    f"/stop_app/{app_name}", token=target_token, base_url=target_url
+                )
+                _migration_log(f"Stopped {app_name}")
+            except Exception as e:
+                _migration_log(f"Could not stop {app_name}: {e}")
+
+        # Give containers a moment to fully stop
+        await asyncio.sleep(3)
+
+        # 6. Download app data from bundle and push to target's app_data
+        _migration_log("Restoring app data from migration bundle...")
+        migration_status = {"phase": "restoring_data", "progress": 50}
+
+        bundle_base = f"{remote_name}:{remote_path}/migrations/{bundle_name}"
+
+        for i, app_name in enumerate(app_names):
+            src = f"{bundle_base}/app_data/{app_name}"
+            dst = str(ALL_APP_DATA / app_name)
+            _migration_log(f"Restoring data for: {app_name}")
+
+            proc = await asyncio.create_subprocess_exec(
+                "rclone",
+                "copy",
+                src,
+                dst,
+                "--config",
+                str(RCLONE_CONF),
+                "-v",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                _migration_log(
+                    f"Warning: data restore may have partial errors for {app_name}"
+                )
+            else:
+                _migration_log(f"Data restored for {app_name}")
+
+            pct = 50 + int(35 * (i + 1) / len(app_names))
+            migration_status = {
+                "phase": "restoring_data",
+                "progress": pct,
+                "current_app": app_name,
+            }
+
+        # 7. Restart all apps on target
+        _migration_log("Restarting apps on target...")
+        migration_status = {"phase": "restarting_apps", "progress": 90}
+
+        for app_name in app_names:
+            try:
+                await _router_post(
+                    f"/reload_app/{app_name}", token=target_token, base_url=target_url
+                )
+                _migration_log(f"Restarted {app_name}")
+            except Exception as e:
+                _migration_log(f"Could not restart {app_name}: {e}")
+
+        # 8. Verify apps are running
+        _migration_log("Verifying apps on target...")
+        migration_status = {"phase": "verifying", "progress": 95}
+        await asyncio.sleep(10)
+
+        try:
+            final_status = await _router_get(
+                "/api/apps", token=target_token, base_url=target_url
+            )
+            for app_name in app_names:
+                status = final_status.get(app_name, {}).get("status", "unknown")
+                error = final_status.get(app_name, {}).get("error_message", "")
+                if status == "running":
+                    _migration_log(f"{app_name}: running")
+                else:
+                    _migration_log(
+                        f"{app_name}: {status}" + (f" ({error})" if error else "")
+                    )
+        except Exception as e:
+            _migration_log(f"Could not verify final status: {e}")
+
+        _migration_log("Migration import complete!")
+        migration_status = {"phase": "done", "progress": 100, "bundle": bundle_name}
+        return True
+
+    except Exception as e:
+        _migration_log(f"Import failed: {e}")
+        migration_status = {"phase": "error", "progress": 0, "error": str(e)}
+        return False
+    finally:
+        migration_running = False
+
+
+async def delete_migration_bundle(bundle_name: str) -> bool:
+    """Delete a migration bundle from remote storage."""
+    conf = load_config()
+    remote_name = conf["remote_name"]
+    remote_path = conf["remote_path"]
+
+    if not RCLONE_CONF.exists():
+        return False
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "rclone",
+            "purge",
+            f"{remote_name}:{remote_path}/migrations/{bundle_name}",
+            "--config",
+            str(RCLONE_CONF),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode == 0:
+            _migration_log(f"Deleted migration bundle: {bundle_name}")
+            return True
+        else:
+            err = stderr.decode().strip()
+            _migration_log(f"Failed to delete bundle: {err}")
+            return False
+    except Exception as e:
+        _migration_log(f"Delete failed: {e}")
+        return False
+
+
 async def scheduler_loop():
     # On first iteration, account for time already elapsed since last backup
     first_run = True
@@ -791,6 +1417,134 @@ async def rename_backup():
     finally:
         conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Migration API routes
+# ---------------------------------------------------------------------------
+
+
+@route("/api/migration/apps")
+async def migration_apps():
+    """List apps available for migration export."""
+    try:
+        apps = await _get_apps_metadata()
+        # Exclude the backup app itself
+        apps = [a for a in apps if a["name"] != "backup"]
+        return jsonify(
+            ok=True,
+            apps=[
+                {
+                    "name": a["name"],
+                    "repo_url": a.get("repo_url"),
+                    "version": a.get("version"),
+                    "status": a.get("status"),
+                    "description": a.get("description"),
+                }
+                for a in apps
+            ],
+        )
+    except Exception as e:
+        logger.exception("Failed to list apps")
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/migration/export", methods=["POST"])
+async def trigger_migration_export():
+    """Start a migration export."""
+    if migration_running:
+        return jsonify(ok=False, error="Migration already in progress"), 409
+    if backup_running:
+        return jsonify(ok=False, error="Backup in progress"), 409
+
+    data = await request.get_json(silent=True) or {}
+    app_filter = data.get("app")  # optional: single app name
+    name = data.get("name")  # optional: custom bundle label
+
+    asyncio.create_task(run_migration_export(app_filter=app_filter, name=name))
+    return jsonify(ok=True, message="Migration export started")
+
+
+@route("/api/migration/status")
+async def migration_status_endpoint():
+    """Poll migration progress."""
+    return jsonify(
+        running=migration_running,
+        status=migration_status,
+        log=migration_log[-50:],  # last 50 lines
+    )
+
+
+@route("/api/migration/bundles")
+async def migration_bundles():
+    """List available migration bundles."""
+    bundles, remote_ok = await list_migration_bundles()
+    result = []
+    for b in bundles:
+        entry = {"name": b}
+        # Try to classify
+        if "-app-" in b:
+            entry["type"] = "app"
+        else:
+            entry["type"] = "full"
+        result.append(entry)
+    return jsonify(ok=True, bundles=result, remote_ok=remote_ok)
+
+
+@route("/api/migration/bundle/manifest")
+async def bundle_manifest():
+    """Get the manifest of a specific migration bundle."""
+    name = request.args.get("bundle", "")
+    if not name:
+        return jsonify(ok=False, error="Missing bundle name"), 400
+    manifest = await get_migration_manifest(name)
+    if manifest is None:
+        return jsonify(ok=False, error="Could not load manifest"), 404
+    return jsonify(ok=True, manifest=manifest)
+
+
+@route("/api/migration/import", methods=["POST"])
+async def trigger_migration_import():
+    """Start a migration import."""
+    if migration_running:
+        return jsonify(ok=False, error="Migration already in progress"), 409
+
+    data = await request.get_json(silent=True) or {}
+    bundle = data.get("bundle")
+    target_url = data.get("target_url", "").rstrip("/")
+    target_token = data.get("target_token", "")
+    selected_apps = data.get("apps")  # optional list of app names
+
+    if not bundle:
+        return jsonify(ok=False, error="Missing bundle name"), 400
+
+    # If importing to the same instance, use local router URL
+    if not target_url:
+        target_url = ROUTER_URL
+    if not target_token:
+        # Try to use the same token used for this request
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            target_token = auth[7:]
+
+    if not target_token:
+        return jsonify(ok=False, error="Missing target_token"), 400
+
+    asyncio.create_task(
+        run_migration_import(bundle, target_url, target_token, selected_apps)
+    )
+    return jsonify(ok=True, message="Migration import started")
+
+
+@route("/api/migration/bundle/delete", methods=["POST"])
+async def trigger_bundle_delete():
+    """Delete a migration bundle from remote storage."""
+    data = await request.get_json(silent=True) or {}
+    name = data.get("bundle", "")
+    if not name:
+        return jsonify(ok=False, error="Missing bundle name"), 400
+    ok = await delete_migration_bundle(name)
+    return jsonify(ok=ok)
 
 
 @route("/health")
