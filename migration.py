@@ -1477,6 +1477,61 @@ async def receive_finalize(
             _log(f"Receive: {app_name} data received but no repo_url to deploy from")
             results.append({"name": app_name, "action": "data_only"})
 
+    # Stop apps that were not running on the source but were deployed/reloaded.
+    # Newly deployed apps need time to build first — wait for them, then stop.
+    apps_to_stop = [
+        r["name"]
+        for r in results
+        if r["name"] not in apps_to_start
+        and r.get("action") in ("deployed", "reloaded")
+    ]
+
+    if apps_to_stop:
+        # Wait for deployed apps to finish building before stopping
+        deployed_to_stop = [
+            r["name"]
+            for r in results
+            if r["name"] in apps_to_stop and r.get("action") == "deployed"
+        ]
+        if deployed_to_stop:
+            _log(
+                f"Waiting for apps to build before stopping: {', '.join(deployed_to_stop)}"
+            )
+            max_wait, waited = 300, 0
+            while waited < max_wait:
+                await asyncio.sleep(10)
+                waited += 10
+                try:
+                    current = await _router_get(
+                        "/api/apps", token=router_token, base_url=router_url
+                    )
+                    all_done = True
+                    for name in deployed_to_stop:
+                        info = (
+                            current.get(name, {}) if isinstance(current, dict) else {}
+                        )
+                        s = info.get("status", "")
+                        if s in ("building", "starting"):
+                            all_done = False
+                            break
+                    if all_done:
+                        break
+                except Exception:
+                    pass
+            if waited >= max_wait:
+                _log(f"Timed out waiting for apps to build after {waited}s")
+
+        for app_name in apps_to_stop:
+            try:
+                await _router_post(
+                    f"/stop_app/{app_name}",
+                    token=router_token,
+                    base_url=router_url,
+                )
+                _log(f"Receive: stopped {app_name} (was not running on source)")
+            except Exception as e:
+                _log(f"Receive: could not stop {app_name}: {e}")
+
     return {
         "ok": True,
         "message": f"Finalized {len(results)} apps",
