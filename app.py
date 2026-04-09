@@ -910,6 +910,87 @@ async def trigger_bundle_delete():
     return jsonify(ok=ok)
 
 
+# ---------------------------------------------------------------------------
+# Direct push migration (simplified one-click flow)
+# ---------------------------------------------------------------------------
+
+
+@route("/api/migration/push", methods=["POST"])
+async def trigger_direct_push():
+    """One-click migration: push all apps + data to another instance."""
+    err = op_lock.try_acquire(OpKind.MIGRATION)
+    if err:
+        return jsonify(ok=False, error=err), 409
+
+    data = await request.get_json(silent=True) or {}
+    target_url = (data.get("target_url") or "").rstrip("/")
+    target_token = data.get("target_token") or ""
+
+    if not target_url:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="Missing target_url"), 400
+    if not target_token:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="Missing target_token"), 400
+
+    selected_apps = data.get("apps")  # optional list
+    if selected_apps is not None and not isinstance(selected_apps, list):
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="'apps' must be a list"), 400
+
+    asyncio.create_task(migration.run_direct_push(
+        target_url=target_url,
+        target_token=target_token,
+        selected_apps=selected_apps,
+        lock=op_lock,
+        all_app_data=ALL_APP_DATA,
+        vm_data_dir=VM_DATA_DIR,
+        router_url=ROUTER_URL,
+        zone_domain=ZONE_DOMAIN,
+    ))
+    return jsonify(ok=True, message="Direct push migration started")
+
+
+# ---------------------------------------------------------------------------
+# Receive endpoints (target side — called by source during direct push)
+# ---------------------------------------------------------------------------
+
+
+@route("/api/migration/receive/start", methods=["POST"])
+async def receive_start():
+    """Accept a migration manifest from a source instance."""
+    data = await request.get_json(silent=True) or {}
+    if not data:
+        return jsonify(ok=False, error="Missing manifest"), 400
+    result = await migration.receive_start(data, ALL_APP_DATA)
+    code = 200 if result.get("ok") else 400
+    return jsonify(**result), code
+
+
+@route("/api/migration/receive/app/<app_name>", methods=["POST"])
+async def receive_app(app_name):
+    """Receive a tar.gz stream of an app's data."""
+    if not migration.validate_name(app_name):
+        return jsonify(ok=False, error="Invalid app name"), 400
+    tar_data = await request.get_data()
+    if not tar_data:
+        return jsonify(ok=False, error="Empty request body"), 400
+    result = await migration.receive_app_data(app_name, tar_data, ALL_APP_DATA)
+    code = 200 if result.get("ok") else 400
+    return jsonify(**result), code
+
+
+@route("/api/migration/receive/finalize", methods=["POST"])
+async def receive_finalize():
+    """Deploy/restart apps after data has been received."""
+    data = await request.get_json(silent=True) or {}
+    manifest = data.get("manifest", {})
+    if not manifest:
+        return jsonify(ok=False, error="Missing manifest"), 400
+    result = await migration.receive_finalize(manifest, ROUTER_URL, None)
+    return jsonify(**result)
+
+
 @route("/health")
 async def health():
     return "ok"

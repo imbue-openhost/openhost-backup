@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import logging
 import re
 import shutil
 import sqlite3
+import tarfile
 import tempfile
 import urllib.parse
 from datetime import datetime, timezone
@@ -900,3 +902,290 @@ async def delete_bundle(
     except Exception as e:
         _log(f"Delete failed: {e}")
         return False
+
+
+# ===================================================================
+# Direct push migration  (no shared storage required)
+# ===================================================================
+#
+# Source (this instance) streams app data directly to the target
+# instance's backup app over HTTP.  The protocol is:
+#
+#   1. POST /api/migration/receive/start   — send manifest
+#   2. POST /api/migration/receive/app/:n  — stream tar.gz per app
+#   3. POST /api/migration/receive/finalize — deploy apps via router
+#
+# The target needs the backup app running.  Both sides authenticate
+# with their respective tokens.
+
+
+def _tar_directory_sync(directory: Path) -> bytes:
+    """Create an in-memory tar.gz of *directory*.  Runs in a thread."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(str(directory), arcname=".")
+    return buf.getvalue()
+
+
+async def run_direct_push(
+    *,
+    target_url: str,
+    target_token: str,
+    selected_apps: list[str] | None,
+    lock: OperationLock,
+    all_app_data: Path,
+    vm_data_dir: Path,
+    router_url: str,
+    zone_domain: str,
+) -> bool:
+    """Push apps + data directly from this instance to a target instance.
+
+    This is the simplified "one-click migrate" flow.  No shared rclone
+    remote is needed — data is streamed over HTTP.
+    """
+    global status
+    log.clear()
+    status = {"phase": "starting", "progress": 0}
+
+    target_backup_url = target_url.rstrip("/") + "/backup"
+
+    try:
+        # 1. Gather local app metadata
+        _log("Gathering local app metadata...")
+        status = {"phase": "gathering_metadata", "progress": 5}
+        apps = await get_apps_metadata(vm_data_dir, router_url)
+        apps = [a for a in apps if a["name"] != "backup"]
+
+        if selected_apps:
+            apps = [a for a in apps if a["name"] in selected_apps]
+
+        if not apps:
+            raise RuntimeError("No apps to migrate")
+
+        app_names = [a["name"] for a in apps]
+        _log(f"Apps to migrate: {', '.join(app_names)}")
+
+        # 2. Build and send manifest to target
+        _log("Sending manifest to target...")
+        status = {"phase": "sending_manifest", "progress": 10}
+
+        manifest = _build_manifest(apps, zone_domain)
+
+        skip_verify = _is_local_url(target_backup_url)
+        async with httpx.AsyncClient(
+            verify=not skip_verify, timeout=60
+        ) as client:
+            r = await client.post(
+                f"{target_backup_url}/api/migration/receive/start",
+                json=manifest,
+                headers={"Authorization": f"Bearer {target_token}"},
+            )
+            if r.status_code != 200:
+                body = r.text[:500]
+                raise RuntimeError(
+                    f"Target rejected manifest (HTTP {r.status_code}): {body}"
+                )
+            start_resp = r.json()
+            if not start_resp.get("ok"):
+                raise RuntimeError(
+                    f"Target rejected manifest: {start_resp.get('error', 'unknown')}"
+                )
+
+        accepted_apps = start_resp.get("accepted_apps", app_names)
+        _log(f"Target accepted {len(accepted_apps)} apps: {', '.join(accepted_apps)}")
+
+        # 3. Stream each app's data as tar.gz
+        status = {"phase": "streaming_data", "progress": 15}
+        total = len(accepted_apps)
+
+        for i, app_name in enumerate(accepted_apps):
+            app_dir = all_app_data / app_name
+            if not app_dir.exists():
+                _log(f"Skipping {app_name}: no local data directory")
+                continue
+
+            _log(f"Compressing and sending {app_name}...")
+            status = {
+                "phase": "streaming_data",
+                "progress": 15 + int(65 * i / total),
+                "current_app": app_name,
+            }
+
+            tar_bytes = await asyncio.to_thread(_tar_directory_sync, app_dir)
+            size_mb = len(tar_bytes) / (1024 * 1024)
+            _log(f"  {app_name}: {size_mb:.1f} MB compressed, uploading...")
+
+            async with httpx.AsyncClient(
+                verify=not skip_verify, timeout=600
+            ) as client:
+                r = await client.post(
+                    f"{target_backup_url}/api/migration/receive/app/{app_name}",
+                    content=tar_bytes,
+                    headers={
+                        "Authorization": f"Bearer {target_token}",
+                        "Content-Type": "application/gzip",
+                    },
+                )
+                if r.status_code != 200:
+                    body = r.text[:500]
+                    _log(f"  WARNING: target rejected {app_name} "
+                         f"(HTTP {r.status_code}): {body}")
+                else:
+                    resp = r.json()
+                    if resp.get("ok"):
+                        _log(f"  {app_name}: received by target")
+                    else:
+                        _log(f"  WARNING: {app_name}: {resp.get('error', 'unknown')}")
+
+            status = {
+                "phase": "streaming_data",
+                "progress": 15 + int(65 * (i + 1) / total),
+                "current_app": app_name,
+            }
+
+        # 4. Tell target to finalize (deploy/restart apps)
+        _log("Finalizing migration on target...")
+        status = {"phase": "finalizing", "progress": 85}
+
+        async with httpx.AsyncClient(
+            verify=not skip_verify, timeout=120
+        ) as client:
+            r = await client.post(
+                f"{target_backup_url}/api/migration/receive/finalize",
+                json={"manifest": manifest},
+                headers={"Authorization": f"Bearer {target_token}"},
+            )
+            if r.status_code == 200:
+                resp = r.json()
+                _log(f"Target finalize: {resp.get('message', 'ok')}")
+            else:
+                _log(f"Target finalize returned HTTP {r.status_code}")
+
+        _log("Migration complete!")
+        status = {"phase": "done", "progress": 100}
+        return True
+
+    except Exception as e:
+        _log(f"Direct push failed: {e}")
+        status = {"phase": "error", "progress": 0, "error": str(e)}
+        return False
+    finally:
+        lock.release(OpKind.MIGRATION)
+
+
+# ---------------------------------------------------------------------------
+# Receive endpoints (target side)
+# ---------------------------------------------------------------------------
+# These are called by the *source* instance during a direct push.
+# They are thin enough to live here; the route wiring is in app.py.
+
+
+async def receive_start(
+    manifest: dict,
+    all_app_data: Path,
+) -> dict:
+    """Validate an incoming manifest and return which apps we can accept."""
+    apps = manifest.get("apps", [])
+    if not apps:
+        return {"ok": False, "error": "No apps in manifest"}
+
+    accepted = []
+    for app_info in apps:
+        name = app_info.get("name", "")
+        if not validate_name(name):
+            continue
+        accepted.append(name)
+
+    if not accepted:
+        return {"ok": False, "error": "No valid app names in manifest"}
+
+    source = manifest.get("source_instance", "unknown")
+    _log(f"Receive: accepted manifest from {source} with {len(accepted)} apps")
+    return {"ok": True, "accepted_apps": accepted}
+
+
+async def receive_app_data(
+    app_name: str,
+    tar_data: bytes,
+    all_app_data: Path,
+) -> dict:
+    """Receive and extract a tar.gz of an app's data directory."""
+    if not validate_name(app_name):
+        return {"ok": False, "error": "Invalid app name"}
+
+    target_dir = all_app_data / app_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    def _extract():
+        buf = io.BytesIO(tar_data)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            # Security: check for path traversal in tar entries
+            for member in tar.getmembers():
+                member_path = Path(member.name)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise RuntimeError(
+                        f"Refusing tar entry with path traversal: {member.name}"
+                    )
+            tar.extractall(path=str(target_dir))
+
+    try:
+        await asyncio.to_thread(_extract)
+        size_mb = len(tar_data) / (1024 * 1024)
+        _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB compressed)")
+        return {"ok": True}
+    except Exception as e:
+        _log(f"Receive: failed to extract {app_name}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+async def receive_finalize(
+    manifest: dict,
+    router_url: str,
+    router_token: str | None,
+) -> dict:
+    """After all app data is received, deploy/restart apps via the router."""
+    apps = manifest.get("apps", [])
+    results = []
+
+    for app_info in apps:
+        app_name = app_info.get("name", "")
+        if not app_name or app_name == "backup":
+            continue
+
+        # Try to reload the app (if it already exists on this instance)
+        try:
+            await _router_post(
+                f"/reload_app/{app_name}",
+                token=router_token,
+                base_url=router_url,
+            )
+            _log(f"Receive: reloaded {app_name}")
+            results.append({"name": app_name, "action": "reloaded"})
+            continue
+        except Exception:
+            pass  # app may not exist yet
+
+        # Try to deploy the app from its repo URL
+        repo_url = app_info.get("repo_url")
+        if repo_url:
+            try:
+                await _router_post(
+                    "/api/add_app",
+                    data={"repo_url": repo_url, "app_name": app_name},
+                    token=router_token,
+                    base_url=router_url,
+                )
+                _log(f"Receive: deployed {app_name} from {_strip_url_credentials(repo_url)}")
+                results.append({"name": app_name, "action": "deployed"})
+            except Exception as e:
+                _log(f"Receive: could not deploy {app_name}: {e}")
+                results.append({"name": app_name, "action": "failed", "error": str(e)})
+        else:
+            _log(f"Receive: {app_name} data received but no repo_url to deploy from")
+            results.append({"name": app_name, "action": "data_only"})
+
+    return {
+        "ok": True,
+        "message": f"Finalized {len(results)} apps",
+        "results": results,
+    }

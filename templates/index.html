@@ -146,34 +146,27 @@
 
     <!-- Migration -->
     <section>
-        <h2>Migration</h2>
+        <h2>Migrate to another instance</h2>
         <p class="info">
-            Export your apps and data as a portable migration bundle, or import a bundle from another system.
-            Bundles are stored on your configured rclone remote and can be used to move between platforms without lock-in.
+            Move your apps and data to another instance. Enter the target URL and its auth token,
+            then click Migrate. Data is streamed directly &mdash; no shared storage needed.
         </p>
 
-        <!-- Export panel -->
-        <div style="margin-bottom:16px;">
-            <h3 style="font-size:0.95rem;margin-bottom:8px;color:#333;">Export</h3>
-            <div class="grid-2" style="margin-bottom:8px;">
-                <div>
-                    <label>Bundle name (optional)</label>
-                    <input type="text" id="mig-export-name" placeholder="e.g. pre-platform-switch">
-                </div>
-                <div>
-                    <label>Single app (leave blank for all)</label>
-                    <input type="text" id="mig-export-app" placeholder="e.g. my-app">
-                </div>
-            </div>
-            <div class="btn-row">
-                <button class="btn-primary" id="btn-mig-export" onclick="startExport()">Export migration bundle</button>
-                <button class="btn-secondary" onclick="loadMigApps()">List exportable apps</button>
-            </div>
-            <div id="mig-apps-list" style="display:none;margin-top:8px;font-size:0.85rem;"></div>
-            <div id="mig-export-msg"></div>
+        <div style="margin-bottom:12px;">
+            <label>Target instance URL</label>
+            <input type="text" id="push-target-url" placeholder="https://other-instance.selfhost.imbue.com">
         </div>
+        <div style="margin-bottom:12px;">
+            <label>Target auth token</label>
+            <input type="password" id="push-target-token" placeholder="Paste the target instance's token">
+        </div>
+        <div class="btn-row" style="margin-bottom:12px;">
+            <button class="btn-primary" id="btn-push" onclick="startPush()">Migrate</button>
+            <button class="btn-secondary" onclick="loadMigApps()">Preview apps</button>
+        </div>
+        <div id="mig-apps-list" style="display:none;margin-top:8px;font-size:0.85rem;"></div>
 
-        <!-- Progress panel -->
+        <!-- Progress panel (shared by push + advanced operations) -->
         <div id="mig-progress" style="display:none;margin-bottom:16px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
                 <span id="mig-phase" class="status-badge status-running">starting</span>
@@ -185,53 +178,83 @@
             <div id="mig-log" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.78rem;color:#555;white-space:pre-wrap;"></div>
         </div>
 
-        <!-- Bundles panel -->
-        <div style="margin-bottom:16px;">
-            <h3 style="font-size:0.95rem;margin-bottom:8px;color:#333;">Available Bundles</h3>
-            <div class="btn-row" style="margin-bottom:8px;">
-                <button class="btn-secondary" id="btn-mig-refresh" onclick="loadBundles()">Load bundles</button>
-            </div>
-            <div id="mig-bundles-list" style="display:none;">
-                <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
-                    <thead>
-                        <tr style="border-bottom:2px solid #ddd;text-align:left;">
-                            <th style="padding:6px 8px;">Bundle</th>
-                            <th style="padding:6px 8px;">Type</th>
-                            <th style="padding:6px 8px;">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="mig-bundles-body"></tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- Import panel -->
-        <div id="mig-import-panel" style="display:none;padding:12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:12px;">
-            <h3 style="font-size:0.95rem;margin-bottom:8px;color:#166534;">Import Bundle</h3>
-            <p class="info" style="margin-bottom:8px;">
-                Import to the local filesystem (no target URL needed) or to a remote instance.
-            </p>
-            <div style="margin-bottom:8px;">
-                <label>Bundle: <strong id="mig-import-bundle-name"></strong></label>
-            </div>
-            <div id="mig-import-manifest" style="margin-bottom:8px;font-size:0.85rem;"></div>
-            <div class="grid-2" style="margin-bottom:8px;">
-                <div>
-                    <label>Target URL (blank = local import)</label>
-                    <input type="text" id="mig-target-url" placeholder="https://my-instance.example.com">
-                </div>
-                <div>
-                    <label>Target API token (for remote import)</label>
-                    <input type="password" id="mig-target-token" placeholder="Bearer token">
-                </div>
-            </div>
-            <div class="btn-row">
-                <button class="btn-primary" id="btn-mig-import" onclick="startImport()">Start import</button>
-                <button class="btn-secondary" onclick="closeMigImport()">Cancel</button>
-            </div>
-        </div>
-
         <div id="mig-msg"></div>
+
+        <!-- Advanced: bundle-based export/import (collapsible) -->
+        <details style="margin-top:16px;">
+            <summary style="cursor:pointer;font-size:0.9rem;color:#555;font-weight:600;">Advanced: bundle-based export/import</summary>
+            <div style="margin-top:12px;">
+                <p class="info">
+                    Export to a portable bundle on your rclone remote, or import a bundle.
+                    Useful for offline transfers or when direct push is not possible.
+                </p>
+
+                <!-- Export panel -->
+                <div style="margin-bottom:16px;">
+                    <h3 style="font-size:0.95rem;margin-bottom:8px;color:#333;">Export</h3>
+                    <div class="grid-2" style="margin-bottom:8px;">
+                        <div>
+                            <label>Bundle name (optional)</label>
+                            <input type="text" id="mig-export-name" placeholder="e.g. pre-platform-switch">
+                        </div>
+                        <div>
+                            <label>Single app (leave blank for all)</label>
+                            <input type="text" id="mig-export-app" placeholder="e.g. my-app">
+                        </div>
+                    </div>
+                    <div class="btn-row">
+                        <button class="btn-primary" id="btn-mig-export" onclick="startExport()">Export bundle</button>
+                    </div>
+                    <div id="mig-export-msg"></div>
+                </div>
+
+                <!-- Bundles panel -->
+                <div style="margin-bottom:16px;">
+                    <h3 style="font-size:0.95rem;margin-bottom:8px;color:#333;">Available Bundles</h3>
+                    <div class="btn-row" style="margin-bottom:8px;">
+                        <button class="btn-secondary" id="btn-mig-refresh" onclick="loadBundles()">Load bundles</button>
+                    </div>
+                    <div id="mig-bundles-list" style="display:none;">
+                        <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                            <thead>
+                                <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                                    <th style="padding:6px 8px;">Bundle</th>
+                                    <th style="padding:6px 8px;">Type</th>
+                                    <th style="padding:6px 8px;">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mig-bundles-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Import panel -->
+                <div id="mig-import-panel" style="display:none;padding:12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;margin-bottom:12px;">
+                    <h3 style="font-size:0.95rem;margin-bottom:8px;color:#166534;">Import Bundle</h3>
+                    <p class="info" style="margin-bottom:8px;">
+                        Import to the local filesystem (no target URL needed) or to a remote instance.
+                    </p>
+                    <div style="margin-bottom:8px;">
+                        <label>Bundle: <strong id="mig-import-bundle-name"></strong></label>
+                    </div>
+                    <div id="mig-import-manifest" style="margin-bottom:8px;font-size:0.85rem;"></div>
+                    <div class="grid-2" style="margin-bottom:8px;">
+                        <div>
+                            <label>Target URL (blank = local import)</label>
+                            <input type="text" id="mig-target-url" placeholder="https://my-instance.example.com">
+                        </div>
+                        <div>
+                            <label>Target API token (for remote import)</label>
+                            <input type="password" id="mig-target-token" placeholder="Bearer token">
+                        </div>
+                    </div>
+                    <div class="btn-row">
+                        <button class="btn-primary" id="btn-mig-import" onclick="startImport()">Start import</button>
+                        <button class="btn-secondary" onclick="closeMigImport()">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </details>
     </section>
 
     <!-- Quick Setup: S3 -->
@@ -687,6 +710,31 @@
         let migSelectedBundle = null;
         let migPolling = false;
 
+        /* --- Direct push (simplified) --- */
+        async function startPush() {
+            const targetUrl = document.getElementById("push-target-url").value.trim();
+            const targetToken = document.getElementById("push-target-token").value.trim();
+            if (!targetUrl) { showMsg("mig-msg", "Enter the target instance URL", false); return; }
+            if (!targetToken) { showMsg("mig-msg", "Enter the target auth token", false); return; }
+            if (!confirm("Migrate all apps and data to " + targetUrl + "?\n\nThe target instance must have the backup app installed.")) return;
+
+            const btn = document.getElementById("btn-push");
+            btn.disabled = true;
+            btn.textContent = "Starting...";
+            const res = await api("/api/migration/push", {
+                method: "POST",
+                body: { target_url: targetUrl, target_token: targetToken }
+            });
+            if (res.ok) {
+                showMsg("mig-msg", "Migration started", true);
+                pollMigration();
+            } else {
+                showMsg("mig-msg", res.error || "Failed", false);
+                btn.disabled = false;
+                btn.textContent = "Migrate";
+            }
+        }
+
         async function loadMigApps() {
             const el = document.getElementById("mig-apps-list");
             el.style.display = "block";
@@ -760,10 +808,11 @@
                     setTimeout(poll, 2000);
                 } else {
                     migPolling = false;
-                    // Re-enable export button
-                    const btn = document.getElementById("btn-mig-export");
-                    btn.disabled = false;
-                    btn.textContent = "Export migration bundle";
+                    // Re-enable buttons
+                    const exportBtn = document.getElementById("btn-mig-export");
+                    if (exportBtn) { exportBtn.disabled = false; exportBtn.textContent = "Export bundle"; }
+                    const pushBtn = document.getElementById("btn-push");
+                    if (pushBtn) { pushBtn.disabled = false; pushBtn.textContent = "Migrate"; }
 
                     if (phase === "done") {
                         showMsg("mig-msg", "Migration complete: " + (status.bundle || ""), true);
