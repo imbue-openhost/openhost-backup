@@ -167,6 +167,24 @@ async def _router_post(
 # ---------------------------------------------------------------------------
 
 
+def _parse_git_remote_url(git_config_path: Path) -> str | None:
+    """Extract the origin remote URL from a .git/config file."""
+    try:
+        text = git_config_path.read_text()
+    except OSError:
+        return None
+    in_origin = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == '[remote "origin"]':
+            in_origin = True
+        elif stripped.startswith("["):
+            in_origin = False
+        elif in_origin and stripped.startswith("url ="):
+            return stripped.split("=", 1)[1].strip()
+    return None
+
+
 async def get_apps_metadata(
     vm_data_dir: Path,
     router_url: str,
@@ -221,6 +239,26 @@ async def get_apps_metadata(
                     "manifest_raw": None,
                 }
             )
+
+    # Enrich apps with repo_url from git repos in temp data if available.
+    # The router API doesn't expose repo_url, but each app's cloned repo
+    # is at /data/app_temp_data/{name}/repo/.git/config.
+    if apps:
+        app_temp_base = Path("/data/app_temp_data")
+        for app_info in apps:
+            if app_info.get("repo_url"):
+                continue
+            name = app_info["name"]
+            git_config = app_temp_base / name / "repo" / ".git" / "config"
+            if git_config.exists():
+                try:
+                    repo_url = await asyncio.to_thread(
+                        _parse_git_remote_url, git_config
+                    )
+                    if repo_url:
+                        app_info["repo_url"] = repo_url
+                except Exception:
+                    pass
 
     return apps
 
