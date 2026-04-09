@@ -29,6 +29,11 @@ VM_DATA_DIR = Path("/data/vm_data")
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 APP_TOKEN = os.environ.get("OPENHOST_APP_TOKEN", "")
+# Router API token — the backup app needs this to call the local router API.
+# The OPENHOST_APP_TOKEN is for cross-app service communication and does NOT
+# grant access to router management endpoints (/api/apps, /reload_app, etc.).
+# This can be set in config.json as "router_api_token" or via environment.
+ROUTER_API_TOKEN = os.environ.get("OPENHOST_ROUTER_API_TOKEN", "")
 
 CONFIG_DIR = APP_DATA_DIR
 RCLONE_CONF = CONFIG_DIR / "rclone.conf"
@@ -136,6 +141,18 @@ def save_config(conf):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(conf, f, indent=2)
+
+
+def get_router_api_token():
+    """Get the router API token from config or environment.
+
+    Priority: config.json > OPENHOST_ROUTER_API_TOKEN env var.
+    """
+    conf = load_config()
+    token = conf.get("router_api_token", "")
+    if token:
+        return token
+    return ROUTER_API_TOKEN
 
 
 def load_rclone_conf():
@@ -622,7 +639,7 @@ async def post_config():
     if "rclone_conf" in data:
         save_rclone_conf(data["rclone_conf"])
     conf = load_config()
-    for key in ("interval_seconds", "remote_name", "remote_path"):
+    for key in ("interval_seconds", "remote_name", "remote_path", "router_api_token"):
         if key in data:
             conf[key] = data[key]
     if "interval_seconds" in data:
@@ -818,7 +835,7 @@ async def rename_backup():
 async def migration_apps():
     try:
         apps = await migration.get_apps_metadata(
-            VM_DATA_DIR, ROUTER_URL, token=APP_TOKEN
+            VM_DATA_DIR, ROUTER_URL, token=get_router_api_token()
         )
         apps = [a for a in apps if a["name"] != "backup"]
         return jsonify(
@@ -867,7 +884,7 @@ async def trigger_migration_export():
             router_url=ROUTER_URL,
             zone_domain=ZONE_DOMAIN,
             load_config=load_config,
-            router_token=APP_TOKEN,
+            router_token=get_router_api_token(),
         )
     )
     return jsonify(ok=True, message="Migration export started")
@@ -1002,7 +1019,7 @@ async def trigger_direct_push():
             vm_data_dir=VM_DATA_DIR,
             router_url=ROUTER_URL,
             zone_domain=ZONE_DOMAIN,
-            router_token=APP_TOKEN,
+            router_token=get_router_api_token(),
         )
     )
     return jsonify(ok=True, message="Direct push migration started")
@@ -1044,7 +1061,9 @@ async def receive_finalize():
     manifest = data.get("manifest", {})
     if not manifest:
         return jsonify(ok=False, error="Missing manifest"), 400
-    result = await migration.receive_finalize(manifest, ROUTER_URL, APP_TOKEN)
+    result = await migration.receive_finalize(
+        manifest, ROUTER_URL, get_router_api_token()
+    )
     return jsonify(**result)
 
 
