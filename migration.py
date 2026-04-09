@@ -1292,10 +1292,18 @@ async def run_direct_push(
         _log("Finalizing migration on target...")
         status = {"phase": "finalizing", "progress": 85}
 
+        # Build a repo_url map with credentials for the target to deploy from.
+        # The manifest contains stripped URLs; we need the originals for private repos.
+        repo_urls = {}
+        for a in apps:
+            url = a.get("repo_url")
+            if url and a["name"] in accepted_apps:
+                repo_urls[a["name"]] = url
+
         async with httpx.AsyncClient(verify=not skip_verify, timeout=120) as client:
             r = await client.post(
                 f"{target_backup_url}/api/migration/receive/finalize",
-                json={"manifest": manifest},
+                json={"manifest": manifest, "repo_urls": repo_urls},
                 headers={"Authorization": f"Bearer {target_token}"},
             )
             if r.status_code == 200:
@@ -1387,12 +1395,17 @@ async def receive_finalize(
     manifest: dict,
     router_url: str,
     router_token: str | None,
+    repo_urls: dict[str, str] | None = None,
 ) -> dict:
     """After all app data is received, deploy/restart apps via the router.
 
     Apps that were running on the source instance (status == "running") will
     be started on the target.  Apps that were stopped will be deployed but
     left stopped.
+
+    ``repo_urls`` is an optional mapping of app_name -> repo_url with
+    credentials intact, provided by the source during direct push.  This
+    is used instead of the manifest's stripped URLs for deploying apps.
     """
     apps = manifest.get("apps", [])
     results = []
@@ -1435,8 +1448,10 @@ async def receive_finalize(
         except Exception:
             pass  # app may not exist yet
 
-        # Try to deploy the app from its repo URL
-        repo_url = app_info.get("repo_url")
+        # Try to deploy the app from its repo URL.
+        # Prefer the authenticated URL from repo_urls (direct push) over
+        # the stripped URL in the manifest.
+        repo_url = (repo_urls or {}).get(app_name) or app_info.get("repo_url")
         if repo_url:
             try:
                 await _router_post(

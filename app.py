@@ -1061,8 +1061,9 @@ async def receive_finalize():
     manifest = data.get("manifest", {})
     if not manifest:
         return jsonify(ok=False, error="Missing manifest"), 400
+    repo_urls = data.get("repo_urls")
     result = await migration.receive_finalize(
-        manifest, ROUTER_URL, get_router_api_token()
+        manifest, ROUTER_URL, get_router_api_token(), repo_urls=repo_urls
     )
     return jsonify(**result)
 
