@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
+import os
+import subprocess
 
 from operations import OpKind, OperationLock
 
@@ -41,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MIGRATION_BUNDLE_VERSION = 2
+MIGRATION_BUNDLE_VERSION = 3
 MIGRATION_DIR_PREFIX = "migration-"
 # Allow alphanumerics, hyphens, dots, underscores, and colons (for timestamps)
 MIGRATION_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:T-]*$")
@@ -129,9 +131,7 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _router_get(
-    path: str, token: str | None = None, base_url: str = ""
-) -> dict:
+async def _router_get(path: str, token: str | None = None, base_url: str = "") -> dict:
     url = base_url.rstrip("/") + path
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
@@ -251,6 +251,93 @@ async def _compute_file_checksums(directory: Path) -> dict[str, str]:
     return await asyncio.to_thread(_compute_file_checksums_sync, directory)
 
 
+# ---------------------------------------------------------------------------
+# Permission-fixing helpers
+# ---------------------------------------------------------------------------
+# After restoring data via rclone or tar extraction, files may be owned by
+# root or a different uid than the host user that runs the OpenHost router.
+# The router's _fix_ownership() uses Docker to chown, but only during
+# provision_data().  We replicate that pattern here so restored data has
+# correct ownership and mode for the router to manage.
+
+
+def _fix_dir_permissions_sync(directory: Path) -> None:
+    """Fix ownership and mode of *directory* so the host user can manage it.
+
+    1. chmod 0o777 on the directory itself (matching OpenHost's _ensure_dir).
+    2. Use Docker alpine to chown -R to the current uid:gid, matching how
+       the OpenHost router fixes ownership in core/data.py.
+    """
+    if not directory.exists():
+        return
+
+    uid, gid = os.getuid(), os.getgid()
+
+    # Try simple chmod first — works if we already own the dir
+    try:
+        os.chmod(directory, 0o777)
+    except PermissionError:
+        pass
+
+    # Use Docker to chown recursively (same pattern as OpenHost router)
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{directory}:/d",
+                "alpine",
+                "chown",
+                "-R",
+                f"{uid}:{gid}",
+                "/d",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Docker chown failed for %s (exit %d): %s",
+                directory,
+                result.returncode,
+                result.stderr.decode().strip()[:200],
+            )
+    except FileNotFoundError:
+        # Docker not available (shouldn't happen in an OpenHost container)
+        logger.warning("Docker not available for chown; trying chmod fallback")
+        try:
+            subprocess.run(
+                ["chmod", "-R", "a+rwX", str(directory)],
+                capture_output=True,
+                timeout=120,
+            )
+        except Exception as e:
+            logger.warning("chmod fallback also failed: %s", e)
+    except subprocess.TimeoutExpired:
+        logger.warning("Docker chown timed out for %s", directory)
+
+    # Ensure the top-level dir has 0o777
+    try:
+        os.chmod(directory, 0o777)
+    except PermissionError:
+        pass
+
+
+async def _fix_app_data_permissions(
+    app_names: list[str],
+    all_app_data: Path,
+) -> None:
+    """Fix permissions on all restored app data directories."""
+    for app_name in app_names:
+        app_dir = all_app_data / app_name
+        if app_dir.exists():
+            _log(f"Fixing permissions for: {app_name}")
+            await asyncio.to_thread(_fix_dir_permissions_sync, app_dir)
+    _log("Permissions fixed for restored app data")
+
+
 def _build_manifest(
     apps: list[dict],
     zone_domain: str,
@@ -271,6 +358,7 @@ def _build_manifest(
                 "memory_mb": a.get("memory_mb"),
                 "cpu_millicores": a.get("cpu_millicores"),
                 "runtime_type": a.get("runtime_type"),
+                "status": a.get("status"),
             }
             for a in apps
         ],
@@ -299,21 +387,31 @@ async def _restore_app_data(
         _log(f"Restoring data for: {app_name}")
 
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "copy", src, dst,
-            "--config", str(rclone_conf), "-v",
+            "rclone",
+            "copy",
+            src,
+            dst,
+            "--config",
+            str(rclone_conf),
+            "-v",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
         if proc.returncode != 0:
             detail = stdout.decode().strip()[-200:] if stdout else ""
-            _log(f"Warning: data restore may have partial errors for {app_name}"
-                 + (f": {detail}" if detail else ""))
+            _log(
+                f"Warning: data restore may have partial errors for {app_name}"
+                + (f": {detail}" if detail else "")
+            )
         else:
             _log(f"Data restored for {app_name}")
 
         pct = progress_base + int(progress_span * (i + 1) / len(app_names))
         status = {"phase": "restoring_data", "progress": pct, "current_app": app_name}
+
+    # Fix permissions so the host router can manage restored data
+    await _fix_app_data_permissions(app_names, all_app_data)
 
 
 async def _verify_checksums(
@@ -355,7 +453,9 @@ async def _verify_checksums(
             mismatches += 1
 
     if mismatches:
-        _log(f"Checksum verification: {mismatches} issue(s) out of {total_checked} files checked")
+        _log(
+            f"Checksum verification: {mismatches} issue(s) out of {total_checked} files checked"
+        )
     else:
         _log(f"Checksum verification passed ({total_checked} files OK)")
     return mismatches
@@ -465,16 +565,23 @@ async def run_export(
                     _log(f"Copying data for app: {app_name}")
                     dst = app_data_staging / app_name
                     proc = await asyncio.create_subprocess_exec(
-                        "rclone", "copy", str(src), str(dst),
-                        "--config", str(rclone_conf), "-v",
+                        "rclone",
+                        "copy",
+                        str(src),
+                        str(dst),
+                        "--config",
+                        str(rclone_conf),
+                        "-v",
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.STDOUT,
                     )
                     stdout, _ = await proc.communicate()
                     if proc.returncode != 0:
                         detail = stdout.decode().strip()[-200:] if stdout else ""
-                        _log(f"Warning: failed to copy data for {app_name}"
-                             + (f": {detail}" if detail else ""))
+                        _log(
+                            f"Warning: failed to copy data for {app_name}"
+                            + (f": {detail}" if detail else "")
+                        )
                 else:
                     _log(f"No data directory for app: {app_name}")
 
@@ -502,8 +609,13 @@ async def run_export(
 
             dest = f"{remote_name}:{remote_path}/migrations/{bundle_name}"
             proc = await asyncio.create_subprocess_exec(
-                "rclone", "copy", str(staging), dest,
-                "--config", str(rclone_conf), "-v",
+                "rclone",
+                "copy",
+                str(staging),
+                dest,
+                "--config",
+                str(rclone_conf),
+                "-v",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -584,13 +696,23 @@ async def run_import(
 
         if is_remote:
             await _import_to_remote_instance(
-                bundle_base, manifest, apps_in_bundle, app_names,
-                target_url, target_token or "", all_app_data, rclone_conf,
+                bundle_base,
+                manifest,
+                apps_in_bundle,
+                app_names,
+                target_url,
+                target_token or "",
+                all_app_data,
+                rclone_conf,
             )
         else:
             await _import_to_local_filesystem(
-                bundle_base, manifest, app_names,
-                all_app_data, rclone_conf, config_dir,
+                bundle_base,
+                manifest,
+                app_names,
+                all_app_data,
+                rclone_conf,
+                config_dir,
             )
 
         _log("Migration import complete!")
@@ -624,14 +746,32 @@ async def _import_to_local_filesystem(
     status = {"phase": "restoring_data", "progress": 15}
 
     await _restore_app_data(
-        bundle_base, app_names, all_app_data, rclone_conf,
-        progress_base=15, progress_span=65,
+        bundle_base,
+        app_names,
+        all_app_data,
+        rclone_conf,
+        progress_base=15,
+        progress_span=65,
     )
 
     bundle_checksums: dict[str, str] = manifest.get("checksums", {})
     errors = await _verify_checksums(bundle_checksums, app_names, all_app_data)
     if errors:
         _log(f"WARNING: {errors} checksum issue(s) detected")
+
+    # Report which apps were running on the source
+    apps_in_bundle = manifest.get("apps", [])
+    running_apps = [
+        a["name"]
+        for a in apps_in_bundle
+        if a.get("status") == "running" and a["name"] in app_names
+    ]
+    if running_apps:
+        _log(f"Apps that were running on source: {', '.join(running_apps)}")
+        _log(
+            "Note: local import restores data only; use remote import or "
+            "direct push to automatically start apps on a target instance"
+        )
 
     # Audit receipt
     try:
@@ -641,6 +781,7 @@ async def _import_to_local_filesystem(
             "source_instance": manifest.get("source_instance"),
             "source_platform": manifest.get("source_platform"),
             "apps": app_names,
+            "running_apps": running_apps,
         }
         receipt_dir = config_dir / "migration_receipts"
         receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -668,7 +809,9 @@ async def _import_to_remote_instance(
     status = {"phase": "checking_target", "progress": 10}
 
     try:
-        existing = await _router_get("/api/apps", token=target_token, base_url=target_url)
+        existing = await _router_get(
+            "/api/apps", token=target_token, base_url=target_url
+        )
     except Exception as e:
         raise RuntimeError(f"Cannot reach target instance: {e}")
 
@@ -677,7 +820,8 @@ async def _import_to_remote_instance(
     # Deploy new apps
     status = {"phase": "deploying_apps", "progress": 15}
     apps_to_deploy = [
-        a for a in apps_in_bundle
+        a
+        for a in apps_in_bundle
         if a["name"] not in existing_names and a.get("repo_url")
     ]
 
@@ -694,14 +838,19 @@ async def _import_to_remote_instance(
                 await _router_post(
                     "/api/add_app",
                     data={"repo_url": repo_url, "app_name": app_name},
-                    token=target_token, base_url=target_url,
+                    token=target_token,
+                    base_url=target_url,
                 )
                 _log(f"Deployed {app_name} (building...)")
             except Exception as e:
                 _log(f"Failed to deploy {app_name}: {e}")
 
             pct = 15 + int(20 * (i + 1) / len(apps_to_deploy))
-            status = {"phase": "deploying_apps", "progress": pct, "current_app": app_name}
+            status = {
+                "phase": "deploying_apps",
+                "progress": pct,
+                "current_app": app_name,
+            }
 
     # Wait for builds
     if apps_to_deploy:
@@ -712,10 +861,14 @@ async def _import_to_remote_instance(
             await asyncio.sleep(10)
             waited += 10
             try:
-                current = await _router_get("/api/apps", token=target_token, base_url=target_url)
+                current = await _router_get(
+                    "/api/apps", token=target_token, base_url=target_url
+                )
                 all_ready, failed_apps = True, []
                 for a in apps_to_deploy:
-                    info = current.get(a["name"], {}) if isinstance(current, dict) else {}
+                    info = (
+                        current.get(a["name"], {}) if isinstance(current, dict) else {}
+                    )
                     s = info.get("status", "")
                     if s in ("building", "starting"):
                         all_ready = False
@@ -739,7 +892,9 @@ async def _import_to_remote_instance(
     status = {"phase": "stopping_apps", "progress": 45}
     for app_name in app_names:
         try:
-            await _router_post(f"/stop_app/{app_name}", token=target_token, base_url=target_url)
+            await _router_post(
+                f"/stop_app/{app_name}", token=target_token, base_url=target_url
+            )
             _log(f"Stopped {app_name}")
         except Exception as e:
             _log(f"Could not stop {app_name}: {e}")
@@ -749,8 +904,12 @@ async def _import_to_remote_instance(
     _log("Restoring app data from migration bundle...")
     status = {"phase": "restoring_data", "progress": 50}
     await _restore_app_data(
-        bundle_base, app_names, all_app_data, rclone_conf,
-        progress_base=50, progress_span=30,
+        bundle_base,
+        app_names,
+        all_app_data,
+        rclone_conf,
+        progress_base=50,
+        progress_span=30,
     )
 
     # Verify
@@ -759,15 +918,36 @@ async def _import_to_remote_instance(
     if errors:
         _log(f"WARNING: {errors} checksum issue(s) detected")
 
-    # Restart
-    _log("Restarting apps on target...")
-    status = {"phase": "restarting_apps", "progress": 90}
-    for app_name in app_names:
-        try:
-            await _router_post(f"/reload_app/{app_name}", token=target_token, base_url=target_url)
-            _log(f"Restarted {app_name}")
-        except Exception as e:
-            _log(f"Could not restart {app_name}: {e}")
+    # Determine which apps should be started (those that were running on source)
+    apps_to_start = [
+        a["name"]
+        for a in apps_in_bundle
+        if a.get("status") == "running" and a["name"] in app_names
+    ]
+    apps_to_leave_stopped = [n for n in app_names if n not in apps_to_start]
+
+    if apps_to_leave_stopped:
+        _log(
+            f"Apps that were not running on source (will remain stopped): "
+            f"{', '.join(apps_to_leave_stopped)}"
+        )
+
+    # Restart only previously-running apps
+    if apps_to_start:
+        _log(
+            f"Restarting previously-running apps on target: {', '.join(apps_to_start)}"
+        )
+        status = {"phase": "restarting_apps", "progress": 90}
+        for app_name in apps_to_start:
+            try:
+                await _router_post(
+                    f"/reload_app/{app_name}", token=target_token, base_url=target_url
+                )
+                _log(f"Restarted {app_name}")
+            except Exception as e:
+                _log(f"Could not restart {app_name}: {e}")
+    else:
+        _log("No apps were running on source; all apps left stopped on target")
 
     # Final verification
     _log("Verifying apps on target...")
@@ -781,7 +961,12 @@ async def _import_to_remote_instance(
         for app_name in app_names:
             s = final.get(app_name, {}).get("status", "unknown")
             err = final.get(app_name, {}).get("error_message", "")
-            _log(f"{app_name}: {s}" + (f" ({err})" if err and s != "running" else ""))
+            expected = "running" if app_name in apps_to_start else "stopped"
+            status_note = f" (expected: {expected})" if s != expected else ""
+            _log(
+                f"{app_name}: {s}{status_note}"
+                + (f" ({err})" if err and s not in ("running", "stopped") else "")
+            )
     except Exception as e:
         _log(f"Could not verify final status: {e}")
 
@@ -803,9 +988,12 @@ async def list_bundles(
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "lsjson",
+            "rclone",
+            "lsjson",
             f"{remote_name}:{remote_path}/migrations",
-            "--config", str(rclone_conf), "--dirs-only",
+            "--config",
+            str(rclone_conf),
+            "--dirs-only",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -845,8 +1033,12 @@ async def get_manifest(
         src = f"{remote_name}:{remote_path}/migrations/{bundle_name}/manifest.json"
         dst = Path(tmpdir) / "manifest.json"
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "copyto", src, str(dst),
-            "--config", str(rclone_conf),
+            "rclone",
+            "copyto",
+            src,
+            str(dst),
+            "--config",
+            str(rclone_conf),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -880,9 +1072,11 @@ async def delete_bundle(
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "purge",
+            "rclone",
+            "purge",
             f"{remote_name}:{remote_path}/migrations/{bundle_name}",
-            "--config", str(rclone_conf),
+            "--config",
+            str(rclone_conf),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -972,9 +1166,7 @@ async def run_direct_push(
         manifest = _build_manifest(apps, zone_domain)
 
         skip_verify = _is_local_url(target_backup_url)
-        async with httpx.AsyncClient(
-            verify=not skip_verify, timeout=60
-        ) as client:
+        async with httpx.AsyncClient(verify=not skip_verify, timeout=60) as client:
             r = await client.post(
                 f"{target_backup_url}/api/migration/receive/start",
                 json=manifest,
@@ -1015,9 +1207,7 @@ async def run_direct_push(
             size_mb = len(tar_bytes) / (1024 * 1024)
             _log(f"  {app_name}: {size_mb:.1f} MB compressed, uploading...")
 
-            async with httpx.AsyncClient(
-                verify=not skip_verify, timeout=600
-            ) as client:
+            async with httpx.AsyncClient(verify=not skip_verify, timeout=600) as client:
                 r = await client.post(
                     f"{target_backup_url}/api/migration/receive/app/{app_name}",
                     content=tar_bytes,
@@ -1028,8 +1218,10 @@ async def run_direct_push(
                 )
                 if r.status_code != 200:
                     body = r.text[:500]
-                    _log(f"  WARNING: target rejected {app_name} "
-                         f"(HTTP {r.status_code}): {body}")
+                    _log(
+                        f"  WARNING: target rejected {app_name} "
+                        f"(HTTP {r.status_code}): {body}"
+                    )
                 else:
                     resp = r.json()
                     if resp.get("ok"):
@@ -1047,9 +1239,7 @@ async def run_direct_push(
         _log("Finalizing migration on target...")
         status = {"phase": "finalizing", "progress": 85}
 
-        async with httpx.AsyncClient(
-            verify=not skip_verify, timeout=120
-        ) as client:
+        async with httpx.AsyncClient(verify=not skip_verify, timeout=120) as client:
             r = await client.post(
                 f"{target_backup_url}/api/migration/receive/finalize",
                 json={"manifest": manifest},
@@ -1130,6 +1320,8 @@ async def receive_app_data(
 
     try:
         await asyncio.to_thread(_extract)
+        # Fix permissions so the host router can manage this data
+        await asyncio.to_thread(_fix_dir_permissions_sync, target_dir)
         size_mb = len(tar_data) / (1024 * 1024)
         _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB compressed)")
         return {"ok": True}
@@ -1143,14 +1335,28 @@ async def receive_finalize(
     router_url: str,
     router_token: str | None,
 ) -> dict:
-    """After all app data is received, deploy/restart apps via the router."""
+    """After all app data is received, deploy/restart apps via the router.
+
+    Apps that were running on the source instance (status == "running") will
+    be started on the target.  Apps that were stopped will be deployed but
+    left stopped.
+    """
     apps = manifest.get("apps", [])
     results = []
+
+    # Determine which apps should be started after migration
+    apps_to_start: set[str] = set()
+    for app_info in apps:
+        src_status = app_info.get("status", "")
+        if src_status == "running":
+            apps_to_start.add(app_info.get("name", ""))
 
     for app_info in apps:
         app_name = app_info.get("name", "")
         if not app_name or app_name == "backup":
             continue
+
+        should_start = app_name in apps_to_start
 
         # Try to reload the app (if it already exists on this instance)
         try:
@@ -1161,6 +1367,17 @@ async def receive_finalize(
             )
             _log(f"Receive: reloaded {app_name}")
             results.append({"name": app_name, "action": "reloaded"})
+            # If it was not running on source, stop it after reload
+            if not should_start:
+                try:
+                    await _router_post(
+                        f"/stop_app/{app_name}",
+                        token=router_token,
+                        base_url=router_url,
+                    )
+                    _log(f"Receive: stopped {app_name} (was not running on source)")
+                except Exception:
+                    pass
             continue
         except Exception:
             pass  # app may not exist yet
@@ -1175,8 +1392,16 @@ async def receive_finalize(
                     token=router_token,
                     base_url=router_url,
                 )
-                _log(f"Receive: deployed {app_name} from {_strip_url_credentials(repo_url)}")
-                results.append({"name": app_name, "action": "deployed"})
+                _log(
+                    f"Receive: deployed {app_name} from {_strip_url_credentials(repo_url)}"
+                )
+                results.append(
+                    {
+                        "name": app_name,
+                        "action": "deployed",
+                        "should_start": should_start,
+                    }
+                )
             except Exception as e:
                 _log(f"Receive: could not deploy {app_name}: {e}")
                 results.append({"name": app_name, "action": "failed", "error": str(e)})
@@ -1188,4 +1413,5 @@ async def receive_finalize(
         "ok": True,
         "message": f"Finalized {len(results)} apps",
         "results": results,
+        "apps_to_start": sorted(apps_to_start),
     }
