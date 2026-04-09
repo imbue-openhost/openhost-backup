@@ -8,7 +8,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync
 
-COPY app.py .
+COPY app.py migration.py operations.py ./
 COPY templates/ templates/
 
 EXPOSE 8080
