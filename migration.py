@@ -173,16 +173,27 @@ async def get_apps_metadata(
     token: str | None = None,
     base_url: str | None = None,
 ) -> list[dict]:
-    """Return app metadata from the local router DB or the router API."""
+    """Return app metadata from the local router DB or the router API.
+
+    Tries the local router.db first (for richer metadata), falling back
+    to the router HTTP API if the DB is missing, empty, or invalid.
+    """
     apps: list[dict] = []
     router_db = vm_data_dir / "router.db"
 
-    if router_db.exists():
+    # Try local DB if it exists and is non-empty
+    if router_db.exists() and router_db.stat().st_size > 0:
 
         def _read():
             conn = sqlite3.connect(str(router_db))
             conn.row_factory = sqlite3.Row
             try:
+                # Check that the apps table exists before querying
+                tables = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='apps'"
+                ).fetchone()
+                if not tables:
+                    return None  # Signal to fall back to API
                 rows = conn.execute(
                     "SELECT name, manifest_name, version, description, repo_url, "
                     "health_check, local_port, container_port, status, memory_mb, "
@@ -193,21 +204,23 @@ async def get_apps_metadata(
             finally:
                 conn.close()
 
-        apps = await asyncio.to_thread(_read)
-    else:
-        data = await _router_get(
-            "/api/apps", token=token, base_url=base_url or router_url
-        )
-        if isinstance(data, dict):
-            for name, info in data.items():
-                apps.append(
-                    {
-                        "name": name,
-                        "status": info.get("status"),
-                        "repo_url": None,
-                        "manifest_raw": None,
-                    }
-                )
+        result = await asyncio.to_thread(_read)
+        if result is not None:
+            apps = result
+            return apps
+
+    # Fall back to the router HTTP API
+    data = await _router_get("/api/apps", token=token, base_url=base_url or router_url)
+    if isinstance(data, dict):
+        for name, info in data.items():
+            apps.append(
+                {
+                    "name": name,
+                    "status": info.get("status"),
+                    "repo_url": None,
+                    "manifest_raw": None,
+                }
+            )
 
     return apps
 
