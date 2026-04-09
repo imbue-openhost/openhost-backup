@@ -477,6 +477,7 @@ async def run_export(
     router_url: str,
     zone_domain: str,
     load_config: callable,
+    router_token: str | None = None,
 ) -> bool:
     """Export a portable migration bundle to the configured rclone remote."""
     global status
@@ -495,7 +496,7 @@ async def run_export(
         # 1. Gather app metadata
         _log("Gathering app metadata...")
         status = {"phase": "gathering_metadata", "progress": 5}
-        apps = await get_apps_metadata(vm_data_dir, router_url)
+        apps = await get_apps_metadata(vm_data_dir, router_url, token=router_token)
 
         if app_filter:
             apps = [a for a in apps if a["name"] == app_filter]
@@ -1131,6 +1132,7 @@ async def run_direct_push(
     vm_data_dir: Path,
     router_url: str,
     zone_domain: str,
+    router_token: str | None = None,
 ) -> bool:
     """Push apps + data directly from this instance to a target instance.
 
@@ -1147,7 +1149,7 @@ async def run_direct_push(
         # 1. Gather local app metadata
         _log("Gathering local app metadata...")
         status = {"phase": "gathering_metadata", "progress": 5}
-        apps = await get_apps_metadata(vm_data_dir, router_url)
+        apps = await get_apps_metadata(vm_data_dir, router_url, token=router_token)
         apps = [a for a in apps if a["name"] != "backup"]
 
         if selected_apps:

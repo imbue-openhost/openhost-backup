@@ -28,6 +28,7 @@ ALL_APP_DATA = Path("/data/app_data")
 VM_DATA_DIR = Path("/data/vm_data")
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
+APP_TOKEN = os.environ.get("OPENHOST_APP_TOKEN", "")
 
 CONFIG_DIR = APP_DATA_DIR
 RCLONE_CONF = CONFIG_DIR / "rclone.conf"
@@ -190,9 +191,15 @@ async def run_backup(name=None):
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "copy", str(ALL_APP_DATA), dest,
-            "--config", str(RCLONE_CONF),
-            "--exclude", "backup/**", "-v",
+            "rclone",
+            "copy",
+            str(ALL_APP_DATA),
+            dest,
+            "--config",
+            str(RCLONE_CONF),
+            "--exclude",
+            "backup/**",
+            "-v",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -209,8 +216,13 @@ async def run_backup(name=None):
                 file_count = size_info["count"]
             except Exception:
                 logger.warning("Could not get backup size, recording without it")
-            record_backup(timestamp, "success", size_bytes=size_bytes,
-                          file_count=file_count, name=name)
+            record_backup(
+                timestamp,
+                "success",
+                size_bytes=size_bytes,
+                file_count=file_count,
+                name=name,
+            )
             logger.info("Backup completed successfully")
             return True
         else:
@@ -243,8 +255,12 @@ async def list_snapshots():
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "lsjson", f"{remote_name}:{remote_path}",
-            "--config", str(RCLONE_CONF), "--dirs-only",
+            "rclone",
+            "lsjson",
+            f"{remote_name}:{remote_path}",
+            "--config",
+            str(RCLONE_CONF),
+            "--dirs-only",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -255,8 +271,11 @@ async def list_snapshots():
 
         entries = json.loads(stdout.decode())
         names = sorted(
-            [e["Path"] for e in entries
-             if e.get("IsDir") and e["Path"] != "migrations"],
+            [
+                e["Path"]
+                for e in entries
+                if e.get("IsDir") and e["Path"] != "migrations"
+            ],
             reverse=True,
         )
         return names, True
@@ -282,9 +301,12 @@ async def get_snapshot_size(snapshot):
     remote_path = conf["remote_path"]
 
     proc = await asyncio.create_subprocess_exec(
-        "rclone", "size", "--json",
+        "rclone",
+        "size",
+        "--json",
         f"{remote_name}:{remote_path}/{snapshot}",
-        "--config", str(RCLONE_CONF),
+        "--config",
+        str(RCLONE_CONF),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -305,8 +327,11 @@ async def list_snapshot_files(snapshot, subpath=""):
         target += f"/{subpath}"
 
     proc = await asyncio.create_subprocess_exec(
-        "rclone", "lsjson", target,
-        "--config", str(RCLONE_CONF),
+        "rclone",
+        "lsjson",
+        target,
+        "--config",
+        str(RCLONE_CONF),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -338,10 +363,15 @@ async def delete_snapshot(snapshot):
     if RCLONE_CONF.exists() and remote_name and remote_path:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "rclone", "purge",
+                "rclone",
+                "purge",
                 f"{remote_name}:{remote_path}/{snapshot}",
-                "--config", str(RCLONE_CONF),
-                "--contimeout", "10s", "--timeout", "30s",
+                "--config",
+                str(RCLONE_CONF),
+                "--contimeout",
+                "10s",
+                "--timeout",
+                "30s",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -380,9 +410,14 @@ def get_backup_history(limit=20, offset=0):
         ).fetchall()
         history = [
             {
-                "id": r[0], "timestamp": r[1], "status": r[2],
-                "error_message": r[3], "created_at": r[4],
-                "size_bytes": r[5], "file_count": r[6], "name": r[7],
+                "id": r[0],
+                "timestamp": r[1],
+                "status": r[2],
+                "error_message": r[3],
+                "created_at": r[4],
+                "size_bytes": r[5],
+                "file_count": r[6],
+                "name": r[7],
             }
             for r in rows
         ]
@@ -440,9 +475,15 @@ async def run_restore(snapshot):
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "rclone", "copy", src, str(ALL_APP_DATA),
-            "--config", str(RCLONE_CONF),
-            "--exclude", "backup/**", "-v",
+            "rclone",
+            "copy",
+            src,
+            str(ALL_APP_DATA),
+            "--config",
+            str(RCLONE_CONF),
+            "--exclude",
+            "backup/**",
+            "-v",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -504,7 +545,9 @@ def ensure_default_config():
     if not RCLONE_CONF.exists():
         LOCAL_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         save_rclone_conf(f"[{DEFAULT_REMOTE_NAME}]\ntype = local\n")
-        logger.info("Created default rclone.conf with local backup to %s", LOCAL_SNAPSHOTS_DIR)
+        logger.info(
+            "Created default rclone.conf with local backup to %s", LOCAL_SNAPSHOTS_DIR
+        )
     if not CONFIG_FILE.exists():
         save_config(dict(DEFAULT_CONFIG))
         logger.info("Created default config.json")
@@ -532,12 +575,14 @@ async def shutdown():
 
 def route(path, **kwargs):
     """Register a route at both /path and BASE_PATH/path to handle proxies."""
+
     def decorator(func):
         app.route(path, **kwargs)(func)
         if BASE_PATH and BASE_PATH != "/":
             prefixed = BASE_PATH.rstrip("/") + path
             app.route(prefixed, **kwargs)(func)
         return func
+
     return decorator
 
 
@@ -730,14 +775,16 @@ async def local_files():
             if str(rel).startswith("backup"):
                 continue
             stat = entry.stat()
-            files.append({
-                "path": entry.name,
-                "size": stat.st_size if entry.is_file() else 0,
-                "is_dir": entry.is_dir(),
-                "mod_time": datetime.fromtimestamp(
-                    stat.st_mtime, tz=timezone.utc
-                ).strftime("%Y-%m-%dT%H:%M:%S"),
-            })
+            files.append(
+                {
+                    "path": entry.name,
+                    "size": stat.st_size if entry.is_file() else 0,
+                    "is_dir": entry.is_dir(),
+                    "mod_time": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+            )
     except PermissionError:
         return jsonify(ok=False, error="Permission denied"), 403
 
@@ -770,7 +817,9 @@ async def rename_backup():
 @route("/api/migration/apps")
 async def migration_apps():
     try:
-        apps = await migration.get_apps_metadata(VM_DATA_DIR, ROUTER_URL)
+        apps = await migration.get_apps_metadata(
+            VM_DATA_DIR, ROUTER_URL, token=APP_TOKEN
+        )
         apps = [a for a in apps if a["name"] != "backup"]
         return jsonify(
             ok=True,
@@ -807,17 +856,20 @@ async def trigger_migration_export():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Invalid app name"), 400
 
-    asyncio.create_task(migration.run_export(
-        app_filter=app_filter,
-        name=name,
-        lock=op_lock,
-        rclone_conf=RCLONE_CONF,
-        all_app_data=ALL_APP_DATA,
-        vm_data_dir=VM_DATA_DIR,
-        router_url=ROUTER_URL,
-        zone_domain=ZONE_DOMAIN,
-        load_config=load_config,
-    ))
+    asyncio.create_task(
+        migration.run_export(
+            app_filter=app_filter,
+            name=name,
+            lock=op_lock,
+            rclone_conf=RCLONE_CONF,
+            all_app_data=ALL_APP_DATA,
+            vm_data_dir=VM_DATA_DIR,
+            router_url=ROUTER_URL,
+            zone_domain=ZONE_DOMAIN,
+            load_config=load_config,
+            router_token=APP_TOKEN,
+        )
+    )
     return jsonify(ok=True, message="Migration export started")
 
 
@@ -884,17 +936,19 @@ async def trigger_migration_import():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing target_token for remote import"), 400
 
-    asyncio.create_task(migration.run_import(
-        bundle_name=bundle,
-        target_url=target_url,
-        target_token=target_token,
-        selected_apps=selected_apps,
-        lock=op_lock,
-        rclone_conf=RCLONE_CONF,
-        all_app_data=ALL_APP_DATA,
-        config_dir=CONFIG_DIR,
-        load_config=load_config,
-    ))
+    asyncio.create_task(
+        migration.run_import(
+            bundle_name=bundle,
+            target_url=target_url,
+            target_token=target_token,
+            selected_apps=selected_apps,
+            lock=op_lock,
+            rclone_conf=RCLONE_CONF,
+            all_app_data=ALL_APP_DATA,
+            config_dir=CONFIG_DIR,
+            load_config=load_config,
+        )
+    )
     return jsonify(ok=True, message="Migration import started")
 
 
@@ -938,16 +992,19 @@ async def trigger_direct_push():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="'apps' must be a list"), 400
 
-    asyncio.create_task(migration.run_direct_push(
-        target_url=target_url,
-        target_token=target_token,
-        selected_apps=selected_apps,
-        lock=op_lock,
-        all_app_data=ALL_APP_DATA,
-        vm_data_dir=VM_DATA_DIR,
-        router_url=ROUTER_URL,
-        zone_domain=ZONE_DOMAIN,
-    ))
+    asyncio.create_task(
+        migration.run_direct_push(
+            target_url=target_url,
+            target_token=target_token,
+            selected_apps=selected_apps,
+            lock=op_lock,
+            all_app_data=ALL_APP_DATA,
+            vm_data_dir=VM_DATA_DIR,
+            router_url=ROUTER_URL,
+            zone_domain=ZONE_DOMAIN,
+            router_token=APP_TOKEN,
+        )
+    )
     return jsonify(ok=True, message="Direct push migration started")
 
 
@@ -987,7 +1044,7 @@ async def receive_finalize():
     manifest = data.get("manifest", {})
     if not manifest:
         return jsonify(ok=False, error="Missing manifest"), 400
-    result = await migration.receive_finalize(manifest, ROUTER_URL, None)
+    result = await migration.receive_finalize(manifest, ROUTER_URL, APP_TOKEN)
     return jsonify(**result)
 
 
