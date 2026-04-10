@@ -155,6 +155,14 @@ def get_router_api_token():
     return ROUTER_API_TOKEN
 
 
+def _extract_bearer_token() -> str | None:
+    """Extract the Bearer token from the current request's Authorization header."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return None
+
+
 def load_rclone_conf():
     if RCLONE_CONF.exists():
         return RCLONE_CONF.read_text()
@@ -1062,8 +1070,12 @@ async def receive_finalize():
     if not manifest:
         return jsonify(ok=False, error="Missing manifest"), 400
     repo_urls = data.get("repo_urls")
+    # Use the incoming request's auth token for router API calls.
+    # This token was already validated by the OpenHost router on the way in,
+    # so it's valid for calling back to the router to deploy/reload apps.
+    router_token = _extract_bearer_token() or get_router_api_token()
     result = await migration.receive_finalize(
-        manifest, ROUTER_URL, get_router_api_token(), repo_urls=repo_urls
+        manifest, ROUTER_URL, router_token, repo_urls=repo_urls
     )
     return jsonify(**result)
 

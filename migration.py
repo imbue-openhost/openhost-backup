@@ -1442,11 +1442,12 @@ async def receive_finalize(
                         base_url=router_url,
                     )
                     _log(f"Receive: stopped {app_name} (was not running on source)")
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log(f"Receive: could not stop {app_name}: {e}")
             continue
-        except Exception:
-            pass  # app may not exist yet
+        except Exception as e:
+            _log(f"Receive: {app_name} not found on target, will deploy ({e})")
+            pass  # app doesn't exist yet, try deploying
 
         # Try to deploy the app from its repo URL.
         # Prefer the authenticated URL from repo_urls (direct push) over
@@ -1516,8 +1517,8 @@ async def receive_finalize(
                             break
                     if all_done:
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log(f"Receive: poll error while waiting for builds: {e}")
             if waited >= max_wait:
                 _log(f"Timed out waiting for apps to build after {waited}s")
 
