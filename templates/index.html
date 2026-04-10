@@ -153,21 +153,24 @@
             on the destination. Your data will be transferred and your applications
             will be restarted on the other side.
         </p>
-        <p class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;">
-            <strong>What happens on the destination:</strong> All running apps on
-            the destination will be stopped, and existing app data for migrated apps
-            will be deleted before new data is written. Apps not included in the
-            migration will be stopped during the transfer and restarted afterward.
-            <br><br>
-            <strong>Tip:</strong> It is a good idea to stop applications on this
-            instance before migrating, especially databases or apps that might not
-            transfer correctly if they are actively writing data. Stopping is not
-            required, but it reduces the risk of inconsistent data.
-            <br><br>
-            <strong>Not migrated:</strong> API tokens, owner password, and other
-            system-level settings are not transferred. You will need to set these
-            up separately on the destination instance.
-        </p>
+        <details style="margin-bottom:12px;">
+            <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Important details before migrating</summary>
+            <div class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;margin-top:6px;">
+                <strong>What happens on the destination:</strong> All running apps on
+                the destination will be stopped, and existing app data for migrated apps
+                will be deleted before new data is written. Apps not included in the
+                migration will be stopped during the transfer and restarted afterward.
+                <br><br>
+                <strong>Tip:</strong> It is a good idea to stop applications on this
+                instance before migrating, especially databases or apps that might not
+                transfer correctly if they are actively writing data. Stopping is not
+                required, but it reduces the risk of inconsistent data.
+                <br><br>
+                <strong>Not migrated:</strong> API tokens, owner password, and other
+                system-level settings are not transferred. You will need to set these
+                up separately on the destination instance.
+            </div>
+        </details>
 
         <div style="margin-bottom:12px;">
             <label>Destination instance URL</label>
