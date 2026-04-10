@@ -1411,8 +1411,8 @@ async def receive_start(
                             await asyncio.to_thread(shutil.rmtree, child)
                         else:
                             child.unlink()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _log(f"Receive: fallback cleanup also failed for {app_name}: {e2}")
 
     # Store stopped apps so receive_finalize can restart non-migrated ones
     global _receive_stopped_apps
