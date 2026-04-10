@@ -57,6 +57,9 @@ MIGRATION_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:T-]*$")
 
 status: dict | None = None  # {"phase": ..., "progress": ..., ...}
 log: list[str] = []
+# Apps that were stopped on the destination during receive_start.
+# Used by receive_finalize to restart non-migrated apps afterward.
+_receive_stopped_apps: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -1334,8 +1337,17 @@ async def run_direct_push(
 async def receive_start(
     manifest: dict,
     all_app_data: Path,
+    router_url: str = "",
+    router_token: str | None = None,
 ) -> dict:
-    """Validate an incoming manifest and return which apps we can accept."""
+    """Validate an incoming manifest, stop destination apps, and clean data.
+
+    1. Validate the manifest and determine accepted apps
+    2. Stop ALL non-backup apps on this instance (so nothing holds
+       file handles during the data wipe/restore)
+    3. Delete app data directories for apps that will be migrated
+       (clean slate — no leftover hybrid state)
+    """
     apps = manifest.get("apps", [])
     if not apps:
         return {"ok": False, "error": "No apps in manifest"}
@@ -1352,7 +1364,66 @@ async def receive_start(
 
     source = manifest.get("source_instance", "unknown")
     _log(f"Receive: accepted manifest from {source} with {len(accepted)} apps")
-    return {"ok": True, "accepted_apps": accepted}
+
+    # --- Stop all non-backup apps on this instance ---
+    stopped_apps: list[str] = []
+    if router_url and router_token:
+        _log("Receive: stopping all apps on destination before data transfer...")
+        try:
+            existing = await _router_get(
+                "/api/apps", token=router_token, base_url=router_url
+            )
+            if isinstance(existing, dict):
+                for app_name, info in existing.items():
+                    if app_name == "backup":
+                        continue
+                    if info.get("status") in ("running", "building", "starting"):
+                        try:
+                            await _router_post(
+                                f"/stop_app/{app_name}",
+                                token=router_token,
+                                base_url=router_url,
+                            )
+                            stopped_apps.append(app_name)
+                            _log(f"Receive: stopped {app_name}")
+                        except Exception as e:
+                            _log(f"Receive: could not stop {app_name}: {e}")
+        except Exception as e:
+            _log(f"Receive: could not list apps to stop: {e}")
+
+        # Give containers a moment to fully stop
+        if stopped_apps:
+            await asyncio.sleep(3)
+
+    # --- Delete app data for migrated apps (clean slate) ---
+    for app_name in accepted:
+        app_dir = all_app_data / app_name
+        if app_dir.exists():
+            _log(f"Receive: deleting existing data for {app_name}")
+            try:
+                await asyncio.to_thread(shutil.rmtree, app_dir)
+            except Exception as e:
+                _log(f"Receive: could not fully delete {app_name} data: {e}")
+                # Try to at least empty it
+                try:
+                    for child in app_dir.iterdir():
+                        if child.is_dir():
+                            await asyncio.to_thread(shutil.rmtree, child)
+                        else:
+                            child.unlink()
+                except Exception:
+                    pass
+
+    # Store stopped apps so receive_finalize can restart non-migrated ones
+    global _receive_stopped_apps
+    _receive_stopped_apps = stopped_apps
+
+    _log(f"Receive: ready for data transfer ({len(accepted)} apps)")
+    return {
+        "ok": True,
+        "accepted_apps": accepted,
+        "stopped_apps": stopped_apps,
+    }
 
 
 async def receive_app_data(
@@ -1532,6 +1603,33 @@ async def receive_finalize(
                 _log(f"Receive: stopped {app_name} (was not running on source)")
             except Exception as e:
                 _log(f"Receive: could not stop {app_name}: {e}")
+
+    # --- Restart non-migrated apps that were stopped during receive_start ---
+    global _receive_stopped_apps
+    migrated_names = {a.get("name", "") for a in apps if a.get("name")}
+    non_migrated_stopped = [
+        name
+        for name in _receive_stopped_apps
+        if name not in migrated_names and name != "backup"
+    ]
+    if non_migrated_stopped:
+        _log(
+            f"Receive: restarting non-migrated apps that were stopped: "
+            f"{', '.join(non_migrated_stopped)}"
+        )
+        for app_name in non_migrated_stopped:
+            try:
+                await _router_post(
+                    f"/reload_app/{app_name}",
+                    token=router_token,
+                    base_url=router_url,
+                )
+                _log(f"Receive: restarted {app_name}")
+            except Exception as e:
+                _log(f"Receive: could not restart {app_name}: {e}")
+
+    # Clear the receive state
+    _receive_stopped_apps = []
 
     return {
         "ok": True,

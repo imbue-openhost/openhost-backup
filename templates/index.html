@@ -150,8 +150,19 @@
         <p class="info">
             Move all your apps and data to another OpenHost instance.
             Install the backup app on both instances, then generate an API token
-            on the destination (Settings &rarr; API Tokens). Your data will be
-            transferred and your applications will be restarted on the other side.
+            on the destination. Your data will be transferred and your applications
+            will be restarted on the other side.
+        </p>
+        <p class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;">
+            <strong>What happens on the destination:</strong> All running apps on
+            the destination will be stopped, and existing app data for migrated apps
+            will be deleted before new data is written. Apps not included in the
+            migration will be stopped during the transfer and restarted afterward.
+            <br><br>
+            <strong>Tip:</strong> It is a good idea to stop applications on this
+            instance before migrating, especially databases or apps that might not
+            transfer correctly if they are actively writing data. Stopping is not
+            required, but it reduces the risk of inconsistent data.
         </p>
 
         <div style="margin-bottom:12px;">

@@ -1043,11 +1043,16 @@ async def trigger_direct_push():
 
 @route("/api/migration/receive/start", methods=["POST"])
 async def receive_start():
-    """Accept a migration manifest from a source instance."""
+    """Accept a migration manifest from a source instance.
+
+    Stops all non-backup apps on this instance and deletes app data
+    for migrated apps so the incoming data lands on a clean slate.
+    """
     data = await request.get_json(silent=True) or {}
     if not data:
         return jsonify(ok=False, error="Missing manifest"), 400
-    result = await migration.receive_start(data, ALL_APP_DATA)
+    router_token = _extract_bearer_token() or get_router_api_token()
+    result = await migration.receive_start(data, ALL_APP_DATA, ROUTER_URL, router_token)
     code = 200 if result.get("ok") else 400
     return jsonify(**result), code
 
