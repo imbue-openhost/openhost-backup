@@ -835,69 +835,8 @@ async def rename_backup():
 
 
 # ---------------------------------------------------------------------------
-# Migration routes  (thin wrappers around the migration module)
+# Migration routes
 # ---------------------------------------------------------------------------
-
-
-@route("/api/migration/apps")
-async def migration_apps():
-    try:
-        router_token = _extract_bearer_token() or get_router_api_token()
-        apps = await migration.get_apps_metadata(
-            VM_DATA_DIR, ROUTER_URL, token=router_token
-        )
-        apps = [a for a in apps if a["name"] != "backup"]
-        return jsonify(
-            ok=True,
-            apps=[
-                {
-                    "name": a["name"],
-                    "repo_url": migration._strip_url_credentials(a.get("repo_url")),
-                    "version": a.get("version"),
-                    "status": a.get("status"),
-                    "description": a.get("description"),
-                }
-                for a in apps
-            ],
-        )
-    except Exception as e:
-        logger.exception("Failed to list apps")
-        return jsonify(ok=False, error=str(e)), 500
-
-
-@route("/api/migration/export", methods=["POST"])
-async def trigger_migration_export():
-    err = op_lock.try_acquire(OpKind.MIGRATION)
-    if err:
-        return jsonify(ok=False, error=err), 409
-
-    data = await request.get_json(silent=True) or {}
-    app_filter = data.get("app")
-    name = data.get("name")
-
-    if name and not migration.validate_name(name):
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Invalid bundle name"), 400
-    if app_filter and not migration.validate_name(app_filter):
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Invalid app name"), 400
-
-    router_token = _extract_bearer_token() or get_router_api_token()
-    asyncio.create_task(
-        migration.run_export(
-            app_filter=app_filter,
-            name=name,
-            lock=op_lock,
-            rclone_conf=RCLONE_CONF,
-            all_app_data=ALL_APP_DATA,
-            vm_data_dir=VM_DATA_DIR,
-            router_url=ROUTER_URL,
-            zone_domain=ZONE_DOMAIN,
-            load_config=load_config,
-            router_token=router_token,
-        )
-    )
-    return jsonify(ok=True, message="Migration export started")
 
 
 @route("/api/migration/status")
@@ -909,90 +848,8 @@ async def migration_status_endpoint():
     )
 
 
-@route("/api/migration/bundles")
-async def migration_bundles():
-    bundles, remote_ok = await migration.list_bundles(RCLONE_CONF, load_config)
-    result = []
-    for b in bundles:
-        entry = {"name": b}
-        entry["type"] = "app" if "-app-" in b else "full"
-        result.append(entry)
-    return jsonify(ok=True, bundles=result, remote_ok=remote_ok)
-
-
-@route("/api/migration/bundle/manifest")
-async def bundle_manifest():
-    name = request.args.get("bundle", "")
-    if not name:
-        return jsonify(ok=False, error="Missing bundle name"), 400
-    if not migration.validate_name(name):
-        return jsonify(ok=False, error="Invalid bundle name"), 400
-    manifest = await migration.get_manifest(name, RCLONE_CONF, load_config)
-    if manifest is None:
-        return jsonify(ok=False, error="Could not load manifest"), 404
-    return jsonify(ok=True, manifest=manifest)
-
-
-@route("/api/migration/import", methods=["POST"])
-async def trigger_migration_import():
-    err = op_lock.try_acquire(OpKind.MIGRATION)
-    if err:
-        return jsonify(ok=False, error=err), 409
-
-    data = await request.get_json(silent=True) or {}
-    bundle = data.get("bundle")
-    target_url = (data.get("target_url") or "").rstrip("/") or None
-    target_token = data.get("target_token") or None
-    selected_apps = data.get("apps")
-
-    if selected_apps is not None and not isinstance(selected_apps, list):
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="'apps' must be a list"), 400
-    if not bundle:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Missing bundle name"), 400
-    if not migration.validate_name(bundle):
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Invalid bundle name"), 400
-
-    if target_url and not target_token:
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            target_token = auth[7:]
-    if target_url and not target_token:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Missing target_token for remote import"), 400
-
-    asyncio.create_task(
-        migration.run_import(
-            bundle_name=bundle,
-            target_url=target_url,
-            target_token=target_token,
-            selected_apps=selected_apps,
-            lock=op_lock,
-            rclone_conf=RCLONE_CONF,
-            all_app_data=ALL_APP_DATA,
-            config_dir=CONFIG_DIR,
-            load_config=load_config,
-        )
-    )
-    return jsonify(ok=True, message="Migration import started")
-
-
-@route("/api/migration/bundle/delete", methods=["POST"])
-async def trigger_bundle_delete():
-    data = await request.get_json(silent=True) or {}
-    name = data.get("bundle", "")
-    if not name:
-        return jsonify(ok=False, error="Missing bundle name"), 400
-    if not migration.validate_name(name):
-        return jsonify(ok=False, error="Invalid bundle name"), 400
-    ok = await migration.delete_bundle(name, RCLONE_CONF, load_config)
-    return jsonify(ok=ok)
-
-
 # ---------------------------------------------------------------------------
-# Direct push migration (simplified one-click flow)
+# Direct push migration
 # ---------------------------------------------------------------------------
 
 
