@@ -93,12 +93,14 @@ def init_db():
 
 
 def get_db():
+    """Get a database connection."""
     return sqlite3.connect(str(DB_FILE))
 
 
 def record_backup(
     timestamp, status, error_message=None, size_bytes=None, file_count=None, name=None
 ):
+    """Insert a backup record into the database."""
     conn = get_db()
     try:
         conn.execute(
@@ -111,6 +113,7 @@ def record_backup(
 
 
 def get_last_backup():
+    """Return the most recent backup record, or None."""
     conn = get_db()
     try:
         row = conn.execute(

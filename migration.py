@@ -17,11 +17,9 @@ import asyncio
 import io
 import json
 import logging
-import os
 import re
 import shutil
 import sqlite3
-import subprocess
 import tarfile
 import urllib.parse
 from datetime import datetime, timezone
@@ -267,80 +265,6 @@ async def get_apps_metadata(
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Permission-fixing helpers
-# ---------------------------------------------------------------------------
-# After restoring data via rclone or tar extraction, files may be owned by
-# root or a different uid than the host user that runs the OpenHost router.
-# The router's _fix_ownership() uses Docker to chown, but only during
-# provision_data().  We replicate that pattern here so restored data has
-# correct ownership and mode for the router to manage.
-
-
-def _fix_dir_permissions_sync(directory: Path) -> None:
-    """Fix ownership and mode of *directory* so the host user can manage it.
-
-    1. chmod 0o777 on the directory itself (matching OpenHost's _ensure_dir).
-    2. Use Docker alpine to chown -R to the current uid:gid, matching how
-       the OpenHost router fixes ownership in core/data.py.
-    """
-    if not directory.exists():
-        return
-
-    uid, gid = os.getuid(), os.getgid()
-
-    # Try simple chmod first — works if we already own the dir
-    try:
-        os.chmod(directory, 0o777)
-    except PermissionError:
-        pass
-
-    # Use Docker to chown recursively (same pattern as OpenHost router)
-    try:
-        result = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{directory}:/d",
-                "alpine",
-                "chown",
-                "-R",
-                f"{uid}:{gid}",
-                "/d",
-            ],
-            capture_output=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "Docker chown failed for %s (exit %d): %s",
-                directory,
-                result.returncode,
-                result.stderr.decode().strip()[:200],
-            )
-    except FileNotFoundError:
-        # Docker not available (shouldn't happen in an OpenHost container)
-        logger.warning("Docker not available for chown; trying chmod fallback")
-        try:
-            subprocess.run(
-                ["chmod", "-R", "a+rwX", str(directory)],
-                capture_output=True,
-                timeout=120,
-            )
-        except Exception as e:
-            logger.warning("chmod fallback also failed: %s", e)
-    except subprocess.TimeoutExpired:
-        logger.warning("Docker chown timed out for %s", directory)
-
-    # Ensure the top-level dir has 0o777
-    try:
-        os.chmod(directory, 0o777)
-    except PermissionError:
-        pass
 
 
 def _build_manifest(
@@ -666,8 +590,6 @@ async def receive_app_data(
 
     try:
         await asyncio.to_thread(_extract)
-        # Fix permissions so the host router can manage this data
-        await asyncio.to_thread(_fix_dir_permissions_sync, target_dir)
         size_mb = len(tar_data) / (1024 * 1024)
         _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB compressed)")
         return {"ok": True}
