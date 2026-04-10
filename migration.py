@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-MIGRATION_BUNDLE_VERSION = 3
+MIGRATION_PROTOCOL_VERSION = 3
 # Allow alphanumerics, hyphens, dots, underscores, and colons (for timestamps)
 MIGRATION_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:T-]*$")
 
@@ -59,7 +59,7 @@ _receive_stopped_apps: list[str] = []
 
 
 def validate_name(name: str) -> bool:
-    """Validate a migration bundle name or label to prevent path traversal."""
+    """Validate a name (app name or label) to prevent path traversal."""
     if not name or len(name) > 200:
         return False
     if ".." in name or "/" in name or "\\" in name:
@@ -273,7 +273,7 @@ def _build_manifest(
     checksums: dict[str, str] | None = None,
 ) -> dict:
     return {
-        "version": MIGRATION_BUNDLE_VERSION,
+        "version": MIGRATION_PROTOCOL_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_instance": zone_domain or "unknown",
         "source_platform": "openhost",
@@ -767,9 +767,12 @@ async def receive_finalize(
     # Clear the receive state
     _receive_stopped_apps = []
 
+    failed = [r for r in results if r.get("action") == "failed"]
+    all_failed = len(failed) == len(results) and results
     return {
-        "ok": True,
-        "message": f"Finalized {len(results)} apps",
+        "ok": not all_failed,
+        "message": f"Finalized {len(results)} apps"
+        + (f" ({len(failed)} failed)" if failed else ""),
         "results": results,
         "apps_to_start": sorted(apps_to_start),
     }
