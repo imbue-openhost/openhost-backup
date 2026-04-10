@@ -28,7 +28,6 @@ ALL_APP_DATA = Path("/data/app_data")
 VM_DATA_DIR = Path("/data/vm_data")
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
-APP_TOKEN = os.environ.get("OPENHOST_APP_TOKEN", "")
 # Router API token — the backup app needs this to call the local router API.
 # The OPENHOST_APP_TOKEN is for cross-app service communication and does NOT
 # grant access to router management endpoints (/api/apps, /reload_app, etc.).
@@ -902,14 +901,22 @@ async def trigger_direct_push():
 async def receive_start():
     """Accept a migration manifest from a source instance.
 
-    Stops all non-backup apps on this instance and deletes app data
-    for migrated apps so the incoming data lands on a clean slate.
+    Acquires the operation lock to prevent concurrent backup/restore,
+    stops all non-backup apps, and deletes app data for migrated apps.
+    The lock is held until receive_finalize completes.
     """
+    err = op_lock.try_acquire(OpKind.MIGRATION)
+    if err:
+        return jsonify(ok=False, error=err), 409
     data = await request.get_json(silent=True) or {}
     if not data:
+        op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing manifest"), 400
     router_token = _extract_bearer_token() or get_router_api_token()
     result = await migration.receive_start(data, ALL_APP_DATA, ROUTER_URL, router_token)
+    if not result.get("ok"):
+        op_lock.release(OpKind.MIGRATION)
+    # Lock stays held on success — released by receive_finalize
     code = 200 if result.get("ok") else 400
     return jsonify(**result), code
 
@@ -929,20 +936,21 @@ async def receive_app(app_name):
 
 @route("/api/migration/receive/finalize", methods=["POST"])
 async def receive_finalize():
-    """Deploy/restart apps after data has been received."""
+    """Deploy/restart apps after data has been received. Releases the op lock."""
     data = await request.get_json(silent=True) or {}
     manifest = data.get("manifest", {})
     if not manifest:
+        op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing manifest"), 400
     repo_urls = data.get("repo_urls")
-    # Use the incoming request's auth token for router API calls.
-    # This token was already validated by the OpenHost router on the way in,
-    # so it's valid for calling back to the router to deploy/reload apps.
     router_token = _extract_bearer_token() or get_router_api_token()
-    result = await migration.receive_finalize(
-        manifest, ROUTER_URL, router_token, repo_urls=repo_urls
-    )
-    return jsonify(**result)
+    try:
+        result = await migration.receive_finalize(
+            manifest, ROUTER_URL, router_token, repo_urls=repo_urls
+        )
+        return jsonify(**result)
+    finally:
+        op_lock.release(OpKind.MIGRATION)
 
 
 @route("/health")

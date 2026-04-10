@@ -253,8 +253,8 @@ async def get_apps_metadata(
                     )
                     if repo_url:
                         app_info["repo_url"] = repo_url
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Could not read git remote for %s: %s", name, e)
 
     return apps
 
@@ -336,19 +336,6 @@ def _fix_dir_permissions_sync(directory: Path) -> None:
         os.chmod(directory, 0o777)
     except PermissionError:
         pass
-
-
-async def _fix_app_data_permissions(
-    app_names: list[str],
-    all_app_data: Path,
-) -> None:
-    """Fix permissions on all restored app data directories."""
-    for app_name in app_names:
-        app_dir = all_app_data / app_name
-        if app_dir.exists():
-            _log(f"Fixing permissions for: {app_name}")
-            await asyncio.to_thread(_fix_dir_permissions_sync, app_dir)
-    _log("Permissions fixed for restored app data")
 
 
 def _build_manifest(
@@ -539,7 +526,9 @@ async def run_direct_push(
                 resp = r.json()
                 _log(f"Target finalize: {resp.get('message', 'ok')}")
             else:
-                _log(f"Target finalize returned HTTP {r.status_code}")
+                raise RuntimeError(
+                    f"Target finalize failed (HTTP {r.status_code}): {r.text[:200]}"
+                )
 
         _log("Migration complete!")
         status = {"phase": "done", "progress": 100}
@@ -667,14 +656,8 @@ async def receive_app_data(
     def _extract():
         buf = io.BytesIO(tar_data)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-            # Security: check for path traversal in tar entries
-            for member in tar.getmembers():
-                member_path = Path(member.name)
-                if member_path.is_absolute() or ".." in member_path.parts:
-                    raise RuntimeError(
-                        f"Refusing tar entry with path traversal: {member.name}"
-                    )
-            tar.extractall(path=str(target_dir))
+            # filter='data' blocks symlinks, absolute paths, and path traversal
+            tar.extractall(path=str(target_dir), filter="data")
 
     try:
         await asyncio.to_thread(_extract)
