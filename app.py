@@ -842,8 +842,9 @@ async def rename_backup():
 @route("/api/migration/apps")
 async def migration_apps():
     try:
+        router_token = _extract_bearer_token() or get_router_api_token()
         apps = await migration.get_apps_metadata(
-            VM_DATA_DIR, ROUTER_URL, token=get_router_api_token()
+            VM_DATA_DIR, ROUTER_URL, token=router_token
         )
         apps = [a for a in apps if a["name"] != "backup"]
         return jsonify(
@@ -881,6 +882,7 @@ async def trigger_migration_export():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Invalid app name"), 400
 
+    router_token = _extract_bearer_token() or get_router_api_token()
     asyncio.create_task(
         migration.run_export(
             app_filter=app_filter,
@@ -892,7 +894,7 @@ async def trigger_migration_export():
             router_url=ROUTER_URL,
             zone_domain=ZONE_DOMAIN,
             load_config=load_config,
-            router_token=get_router_api_token(),
+            router_token=router_token,
         )
     )
     return jsonify(ok=True, message="Migration export started")
@@ -1017,6 +1019,7 @@ async def trigger_direct_push():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="'apps' must be a list"), 400
 
+    router_token = _extract_bearer_token() or get_router_api_token()
     asyncio.create_task(
         migration.run_direct_push(
             target_url=target_url,
@@ -1027,7 +1030,7 @@ async def trigger_direct_push():
             vm_data_dir=VM_DATA_DIR,
             router_url=ROUTER_URL,
             zone_domain=ZONE_DOMAIN,
-            router_token=get_router_api_token(),
+            router_token=router_token,
         )
     )
     return jsonify(ok=True, message="Direct push migration started")
