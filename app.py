@@ -480,9 +480,14 @@ async def run_restore(snapshot):
         logger.warning("Skipping restore: %s", err)
         return False
 
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
+    try:
+        conf = load_config()
+        remote_name = conf["remote_name"]
+        remote_path = conf["remote_path"]
+    except Exception:
+        logger.exception("Failed to load restore config")
+        op_lock.release(OpKind.RESTORE)
+        return False
 
     if not RCLONE_CONF.exists():
         restore_last_status = "error: no rclone.conf"
@@ -918,7 +923,14 @@ async def receive_start():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing manifest"), 400
     router_token = _extract_bearer_token() or get_router_api_token()
-    result = await migration.receive_start(data, ALL_APP_DATA, ROUTER_URL, router_token)
+    try:
+        result = await migration.receive_start(
+            data, ALL_APP_DATA, ROUTER_URL, router_token
+        )
+    except Exception as e:
+        logger.exception("receive_start failed")
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error=str(e)), 500
     if not result.get("ok"):
         op_lock.release(OpKind.MIGRATION)
     # Lock stays held on success — released by receive_finalize
