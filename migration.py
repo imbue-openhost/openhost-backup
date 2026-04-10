@@ -90,7 +90,8 @@ def _strip_url_credentials(url: str | None) -> str | None:
                 )
             )
     except Exception:
-        logger.warning("Failed to parse URL for credential stripping")
+        logger.warning("Failed to parse URL for credential stripping, omitting URL")
+        return None  # Don't leak credentials on parse failure
     return url
 
 
@@ -218,7 +219,11 @@ async def get_apps_metadata(
             finally:
                 conn.close()
 
-        result = await asyncio.to_thread(_read)
+        try:
+            result = await asyncio.to_thread(_read)
+        except Exception as e:
+            logger.warning("Failed to read router.db, falling back to API: %s", e)
+            result = None
         if result is not None:
             apps = result
             return apps

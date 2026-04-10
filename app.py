@@ -195,9 +195,14 @@ async def run_backup(name=None):
         logger.warning("Skipping backup: %s", err)
         return False
 
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
+    try:
+        conf = load_config()
+        remote_name = conf["remote_name"]
+        remote_path = conf["remote_path"]
+    except Exception:
+        logger.exception("Failed to load backup config")
+        op_lock.release(OpKind.BACKUP)
+        return False
 
     if not RCLONE_CONF.exists():
         logger.error("No rclone.conf configured, skipping backup")
@@ -940,7 +945,8 @@ async def receive_finalize():
     data = await request.get_json(silent=True) or {}
     manifest = data.get("manifest", {})
     if not manifest:
-        op_lock.release(OpKind.MIGRATION)
+        if op_lock.active == OpKind.MIGRATION:
+            op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing manifest"), 400
     repo_urls = data.get("repo_urls")
     router_token = _extract_bearer_token() or get_router_api_token()
@@ -950,7 +956,9 @@ async def receive_finalize():
         )
         return jsonify(**result)
     finally:
-        op_lock.release(OpKind.MIGRATION)
+        # Only release if we actually hold the migration lock
+        if op_lock.active == OpKind.MIGRATION:
+            op_lock.release(OpKind.MIGRATION)
 
 
 @route("/health")
