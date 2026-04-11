@@ -268,40 +268,65 @@ async def get_apps_metadata(
 
 
 def _fix_permissions(directory: Path) -> None:
-    """Make directory and contents world-writable so the host router can manage them.
+    """Fix ownership and permissions so the host router can manage the data.
 
     The backup container runs as root, but the OpenHost router runs as the
     host user. After extracting tar data, files are owned by root and the
     router's provision_data() will fail with PermissionError on chmod.
+
+    We detect the correct uid:gid by looking at the parent directory
+    (which was created by the router), then chown + chmod recursively.
     """
     if not directory.exists():
         return
     import os
     import stat
 
+    # Detect target uid:gid from the parent directory (owned by the host user)
+    parent = directory.parent
+    try:
+        parent_stat = os.stat(str(parent))
+        target_uid = parent_stat.st_uid
+        target_gid = parent_stat.st_gid
+    except OSError:
+        target_uid = -1
+        target_gid = -1
+
     count = 0
     for root, dirs, files in os.walk(str(directory)):
         for d in dirs:
             path = os.path.join(root, d)
             try:
+                if target_uid >= 0:
+                    os.chown(path, target_uid, target_gid)
                 os.chmod(path, 0o777)
                 count += 1
             except OSError as e:
-                logger.warning("chmod failed for dir %s: %s", path, e)
+                logger.warning("fix_permissions failed for dir %s: %s", path, e)
         for f in files:
             path = os.path.join(root, f)
             try:
+                if target_uid >= 0:
+                    os.chown(path, target_uid, target_gid)
                 st = os.stat(path)
                 os.chmod(path, st.st_mode | stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
                 count += 1
             except OSError as e:
-                logger.warning("chmod failed for file %s: %s", path, e)
+                logger.warning("fix_permissions failed for file %s: %s", path, e)
     try:
+        if target_uid >= 0:
+            os.chown(str(directory), target_uid, target_gid)
         os.chmod(str(directory), 0o777)
         count += 1
     except OSError as e:
-        logger.warning("chmod failed for root dir %s: %s", directory, e)
-    logger.info("Fixed permissions on %d items in %s", count, directory)
+        logger.warning("fix_permissions failed for root dir %s: %s", directory, e)
+    logger.info(
+        "Fixed permissions on %d items in %s (uid=%s gid=%s)",
+        count,
+        directory,
+        target_uid,
+        target_gid,
+    )
 
 
 def _build_manifest(
