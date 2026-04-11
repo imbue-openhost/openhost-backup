@@ -279,24 +279,29 @@ def _fix_permissions(directory: Path) -> None:
     import os
     import stat
 
+    count = 0
     for root, dirs, files in os.walk(str(directory)):
         for d in dirs:
             path = os.path.join(root, d)
             try:
                 os.chmod(path, 0o777)
-            except OSError:
-                pass
+                count += 1
+            except OSError as e:
+                logger.warning("chmod failed for dir %s: %s", path, e)
         for f in files:
             path = os.path.join(root, f)
             try:
                 st = os.stat(path)
                 os.chmod(path, st.st_mode | stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
-            except OSError:
-                pass
+                count += 1
+            except OSError as e:
+                logger.warning("chmod failed for file %s: %s", path, e)
     try:
         os.chmod(str(directory), 0o777)
-    except OSError:
-        pass
+        count += 1
+    except OSError as e:
+        logger.warning("chmod failed for root dir %s: %s", directory, e)
+    logger.info("Fixed permissions on %d items in %s", count, directory)
 
 
 def _build_manifest(
