@@ -267,6 +267,38 @@ async def get_apps_metadata(
 # ---------------------------------------------------------------------------
 
 
+def _fix_permissions(directory: Path) -> None:
+    """Make directory and contents world-writable so the host router can manage them.
+
+    The backup container runs as root, but the OpenHost router runs as the
+    host user. After extracting tar data, files are owned by root and the
+    router's provision_data() will fail with PermissionError on chmod.
+    """
+    if not directory.exists():
+        return
+    import os
+    import stat
+
+    for root, dirs, files in os.walk(str(directory)):
+        for d in dirs:
+            path = os.path.join(root, d)
+            try:
+                os.chmod(path, 0o777)
+            except OSError:
+                pass
+        for f in files:
+            path = os.path.join(root, f)
+            try:
+                st = os.stat(path)
+                os.chmod(path, st.st_mode | stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+            except OSError:
+                pass
+    try:
+        os.chmod(str(directory), 0o777)
+    except OSError:
+        pass
+
+
 def _build_manifest(
     apps: list[dict],
     zone_domain: str,
@@ -590,6 +622,7 @@ async def receive_app_data(
 
     try:
         await asyncio.to_thread(_extract)
+        await asyncio.to_thread(_fix_permissions, target_dir)
         size_mb = len(tar_data) / (1024 * 1024)
         _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB compressed)")
         return {"ok": True}
