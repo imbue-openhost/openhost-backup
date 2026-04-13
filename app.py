@@ -9,15 +9,30 @@ from pathlib import Path
 
 from quart import Quart, render_template, request, jsonify
 
+import migration
+from operations import OpKind, OperationLock
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 logger.info("backup app module loaded")
 
 app = Quart(__name__)
 
+# ---------------------------------------------------------------------------
+# Paths & configuration
+# ---------------------------------------------------------------------------
+
 BASE_PATH = os.environ.get("OPENHOST_APP_BASE_PATH", "/backup")
 APP_DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/backup"))
 ALL_APP_DATA = Path("/data/app_data")
+VM_DATA_DIR = Path("/data/vm_data")
+ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
+ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
+# Router API token — the backup app needs this to call the local router API.
+# The OPENHOST_APP_TOKEN is for cross-app service communication and does NOT
+# grant access to router management endpoints (/api/apps, /reload_app, etc.).
+# This can be set in config.json as "router_api_token" or via environment.
+ROUTER_API_TOKEN = os.environ.get("OPENHOST_ROUTER_API_TOKEN", "")
 
 CONFIG_DIR = APP_DATA_DIR
 RCLONE_CONF = CONFIG_DIR / "rclone.conf"
@@ -34,9 +49,22 @@ DEFAULT_CONFIG = {
     "remote_path": DEFAULT_REMOTE_PATH,
 }
 
+# Single lock for mutual exclusion across backup / restore / migration.
+op_lock = OperationLock()
+
+# Restore-specific status (not part of the lock itself).
+restore_last_snapshot = None
+restore_last_status = None
+
+scheduler_task = None
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
 
 def init_db():
-    """Create tables if they don't exist. Call once at startup."""
+    """Create tables if they don't exist.  Call once at startup."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_FILE))
     conn.execute("PRAGMA journal_mode=WAL")
@@ -52,7 +80,6 @@ def init_db():
             name TEXT
         )
     """)
-    # Migrate existing tables that lack the new columns
     cursor = conn.execute("PRAGMA table_info(backups)")
     columns = {row[1] for row in cursor.fetchall()}
     if "size_bytes" not in columns:
@@ -99,21 +126,16 @@ def get_last_backup():
         conn.close()
 
 
-# In-memory flags — not persisted (reset on startup is correct behavior)
-backup_running = False
-restore_running = False
-restore_last_snapshot = None
-restore_last_status = None
-
-scheduler_task = None
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
 
 def load_config():
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
             saved = json.load(f)
-        conf = {**DEFAULT_CONFIG, **saved}
-        return conf
+        return {**DEFAULT_CONFIG, **saved}
     return dict(DEFAULT_CONFIG)
 
 
@@ -121,6 +143,26 @@ def save_config(conf):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(conf, f, indent=2)
+
+
+def get_router_api_token():
+    """Get the router API token from config or environment.
+
+    Priority: config.json > OPENHOST_ROUTER_API_TOKEN env var.
+    """
+    conf = load_config()
+    token = conf.get("router_api_token", "")
+    if token:
+        return token
+    return ROUTER_API_TOKEN
+
+
+def _extract_bearer_token() -> str | None:
+    """Extract the Bearer token from the current request's Authorization header."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return None
 
 
 def load_rclone_conf():
@@ -145,28 +187,38 @@ def generate_s3_conf(remote_name, bucket, access_key, secret_key, region):
     )
 
 
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+
+
 async def run_backup(name=None):
-    global backup_running
-    if backup_running:
-        logger.warning("Backup already in progress, skipping")
+    err = op_lock.try_acquire(OpKind.BACKUP)
+    if err:
+        logger.warning("Skipping backup: %s", err)
         return False
 
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
+    try:
+        conf = load_config()
+        remote_name = conf["remote_name"]
+        remote_path = conf["remote_path"]
+    except Exception:
+        logger.exception("Failed to load backup config")
+        op_lock.release(OpKind.BACKUP)
+        return False
 
     if not RCLONE_CONF.exists():
         logger.error("No rclone.conf configured, skipping backup")
+        op_lock.release(OpKind.BACKUP)
         return False
 
     if not remote_name or not remote_path:
         logger.error("Remote name or path not configured, skipping backup")
+        op_lock.release(OpKind.BACKUP)
         return False
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     dest = f"{remote_name}:{remote_path}/{timestamp}"
-
-    backup_running = True
     logger.info("Starting backup to %s", dest)
 
     try:
@@ -189,9 +241,7 @@ async def run_backup(name=None):
                 logger.info("rclone: %s", line)
 
         if proc.returncode == 0:
-            # Record size from the just-completed backup
-            size_bytes = None
-            file_count = None
+            size_bytes = file_count = None
             try:
                 size_info = await get_snapshot_size(timestamp)
                 size_bytes = size_info["bytes"]
@@ -217,17 +267,17 @@ async def run_backup(name=None):
         logger.exception("Backup failed")
         return False
     finally:
-        backup_running = False
+        op_lock.release(OpKind.BACKUP)
 
+
+# ---------------------------------------------------------------------------
+# Snapshot helpers
+# ---------------------------------------------------------------------------
 
 SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 
 
 async def list_snapshots():
-    """List available backup snapshots from the remote.
-
-    Returns (names, ok) where ok indicates if the remote was reachable.
-    """
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
@@ -253,7 +303,11 @@ async def list_snapshots():
 
         entries = json.loads(stdout.decode())
         names = sorted(
-            [e["Path"] for e in entries if e.get("IsDir")],
+            [
+                e["Path"]
+                for e in entries
+                if e.get("IsDir") and e["Path"] != "migrations"
+            ],
             reverse=True,
         )
         return names, True
@@ -263,12 +317,10 @@ async def list_snapshots():
 
 
 def validate_subpath(path):
-    """Validate a browse subpath to prevent directory traversal."""
     if not path:
         return True
-    segments = path.split("/")
-    for seg in segments:
-        if seg == ".." or seg == "." or not seg:
+    for seg in path.split("/"):
+        if seg in ("..", ".") or not seg:
             return False
         if not re.match(r"^[\w\-:. ]+$", seg):
             return False
@@ -276,7 +328,6 @@ def validate_subpath(path):
 
 
 async def get_snapshot_size(snapshot):
-    """Get total size and file count for a snapshot."""
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
@@ -294,16 +345,11 @@ async def get_snapshot_size(snapshot):
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(f"rclone size failed: {stderr.decode().strip()}")
-
     data = json.loads(stdout.decode())
     return {"bytes": data.get("bytes", 0), "count": data.get("count", 0)}
 
 
 async def list_snapshot_files(snapshot, subpath=""):
-    """List files and directories within a snapshot.
-
-    Returns (files, error) where error is a user-friendly string or None.
-    """
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
@@ -341,7 +387,6 @@ async def list_snapshot_files(snapshot, subpath=""):
 
 
 async def delete_snapshot(snapshot):
-    """Delete a snapshot from remote storage and the local DB record."""
     conf = load_config()
     remote_name = conf["remote_name"]
     remote_path = conf["remote_path"]
@@ -376,7 +421,6 @@ async def delete_snapshot(snapshot):
         except asyncio.TimeoutError:
             logger.warning("rclone purge timed out for %s", snapshot)
 
-    # Always remove the DB record
     conn = get_db()
     try:
         conn.execute("DELETE FROM backups WHERE timestamp = ?", (snapshot,))
@@ -384,17 +428,16 @@ async def delete_snapshot(snapshot):
     finally:
         conn.close()
     logger.info("Deleted DB record for snapshot %s", snapshot)
-
     return remote_deleted
 
 
 def get_backup_history(limit=20, offset=0):
-    """Get paginated backup history from the database."""
     conn = get_db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM backups").fetchone()[0]
         rows = conn.execute(
-            "SELECT id, timestamp, status, error_message, created_at, size_bytes, file_count, name FROM backups ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, timestamp, status, error_message, created_at, size_bytes, file_count, name "
+            "FROM backups ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
         history = [
@@ -416,46 +459,55 @@ def get_backup_history(limit=20, offset=0):
 
 
 def get_backup_sizes():
-    """Get a map of timestamp -> {size_bytes, file_count} for all successful backups."""
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT timestamp, size_bytes, file_count FROM backups WHERE status = 'success' AND size_bytes IS NOT NULL"
+            "SELECT timestamp, size_bytes, file_count FROM backups "
+            "WHERE status = 'success' AND size_bytes IS NOT NULL"
         ).fetchall()
         return {r[0]: {"size_bytes": r[1], "file_count": r[2]} for r in rows}
     finally:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Restore
+# ---------------------------------------------------------------------------
+
+
 async def run_restore(snapshot):
-    """Restore app data from a remote backup snapshot."""
-    global restore_running, restore_last_snapshot, restore_last_status
-    if restore_running:
-        logger.warning("Restore already in progress, skipping")
+    global restore_last_snapshot, restore_last_status
+
+    err = op_lock.try_acquire(OpKind.RESTORE)
+    if err:
+        logger.warning("Skipping restore: %s", err)
         return False
 
-    if backup_running:
-        logger.warning("Backup in progress, cannot restore")
+    try:
+        conf = load_config()
+        remote_name = conf["remote_name"]
+        remote_path = conf["remote_path"]
+    except Exception:
+        logger.exception("Failed to load restore config")
+        op_lock.release(OpKind.RESTORE)
         return False
-
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
 
     if not RCLONE_CONF.exists():
         restore_last_status = "error: no rclone.conf"
+        op_lock.release(OpKind.RESTORE)
         return False
 
     if not remote_name or not remote_path:
         restore_last_status = "error: remote not configured"
+        op_lock.release(OpKind.RESTORE)
         return False
 
     if not SNAPSHOT_RE.match(snapshot):
         restore_last_status = "error: invalid snapshot name"
+        op_lock.release(OpKind.RESTORE)
         return False
 
     src = f"{remote_name}:{remote_path}/{snapshot}"
-    restore_running = True
     logger.info("Starting restore from %s", src)
 
     try:
@@ -488,13 +540,17 @@ async def run_restore(snapshot):
         restore_last_status = f"error: {e}"
         logger.exception("Restore failed")
     finally:
-        restore_running = False
+        op_lock.release(OpKind.RESTORE)
 
     return restore_last_status == "success"
 
 
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+
 async def scheduler_loop():
-    # On first iteration, account for time already elapsed since last backup
     first_run = True
     while True:
         conf = load_config()
@@ -523,7 +579,6 @@ async def scheduler_loop():
 
 
 def ensure_default_config():
-    """Set up local backup config if nothing is configured yet."""
     if not RCLONE_CONF.exists():
         LOCAL_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         save_rclone_conf(f"[{DEFAULT_REMOTE_NAME}]\ntype = local\n")
@@ -550,6 +605,11 @@ async def shutdown():
         scheduler_task.cancel()
 
 
+# ---------------------------------------------------------------------------
+# Route helper
+# ---------------------------------------------------------------------------
+
+
 def route(path, **kwargs):
     """Register a route at both /path and BASE_PATH/path to handle proxies."""
 
@@ -563,13 +623,18 @@ def route(path, **kwargs):
     return decorator
 
 
+# ---------------------------------------------------------------------------
+# Backup / restore routes
+# ---------------------------------------------------------------------------
+
+
 @route("/")
 async def index():
     conf = load_config()
     rclone_conf = load_rclone_conf()
     last = get_last_backup()
     state = {
-        "running": backup_running,
+        "running": op_lock.backup_running,
         "last_backup": last["timestamp"] if last else None,
         "last_status": last["status"] if last else None,
         "last_error": last["error_message"] if last else None,
@@ -591,18 +656,15 @@ async def get_config():
 @route("/api/config", methods=["POST"])
 async def post_config():
     data = await request.get_json()
-
     if "rclone_conf" in data:
         save_rclone_conf(data["rclone_conf"])
-
     conf = load_config()
-    for key in ("interval_seconds", "remote_name", "remote_path"):
+    for key in ("interval_seconds", "remote_name", "remote_path", "router_api_token"):
         if key in data:
             conf[key] = data[key]
     if "interval_seconds" in data:
         conf["interval_seconds"] = max(60, int(conf["interval_seconds"]))
     save_config(conf)
-
     return jsonify(ok=True)
 
 
@@ -622,14 +684,13 @@ async def setup_s3():
     conf["remote_name"] = remote_name
     conf["remote_path"] = bucket
     save_config(conf)
-
     return jsonify(ok=True, rclone_conf=rclone_text)
 
 
 @route("/api/backup", methods=["POST"])
 async def trigger_backup():
-    if backup_running:
-        return jsonify(ok=False, error="Backup already in progress"), 409
+    if op_lock.busy:
+        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
     data = await request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip() or None
     asyncio.create_task(run_backup(name=name))
@@ -641,7 +702,9 @@ async def status():
     conf = load_config()
     last = get_last_backup()
     return jsonify(
-        running=backup_running,
+        running=op_lock.backup_running,
+        migration_running=op_lock.migration_running,
+        restore_running=op_lock.restore_running,
         last_backup=last["timestamp"] if last else None,
         last_status=last["status"] if last else None,
         last_error=last["error_message"] if last else None,
@@ -665,24 +728,20 @@ async def get_backups():
 
 @route("/api/restore", methods=["POST"])
 async def trigger_restore():
-    if restore_running:
-        return jsonify(ok=False, error="Restore already in progress"), 409
-    if backup_running:
-        return jsonify(ok=False, error="Backup in progress, cannot restore"), 409
-
+    if op_lock.busy:
+        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
     data = await request.get_json()
     snapshot = data.get("snapshot", "")
     if not snapshot or not SNAPSHOT_RE.match(snapshot):
         return jsonify(ok=False, error="Invalid snapshot name"), 400
-
     asyncio.create_task(run_restore(snapshot))
     return jsonify(ok=True, message="Restore started")
 
 
 @route("/api/restore/status")
-async def restore_status():
+async def restore_status_endpoint():
     return jsonify(
-        running=restore_running,
+        running=op_lock.restore_running,
         last_restore=restore_last_snapshot,
         last_status=restore_last_status,
     )
@@ -713,10 +772,8 @@ async def snapshot_delete():
     name = data.get("snapshot", "")
     if not name or not SNAPSHOT_RE.match(name):
         return jsonify(ok=False, error="Invalid snapshot name"), 400
-    if backup_running:
-        return jsonify(ok=False, error="Backup in progress"), 409
-    if restore_running:
-        return jsonify(ok=False, error="Restore in progress"), 409
+    if op_lock.busy:
+        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
     try:
         remote_deleted = await delete_snapshot(name)
         return jsonify(ok=True, remote_deleted=remote_deleted)
@@ -735,7 +792,6 @@ async def backup_history():
 
 @route("/api/local/files")
 async def local_files():
-    """Browse the current local app data (the backup source)."""
     subpath = request.args.get("path", "")
     if not validate_subpath(subpath):
         return jsonify(ok=False, error="Invalid path"), 400
@@ -744,7 +800,6 @@ async def local_files():
     if not target.exists() or not target.is_dir():
         return jsonify(ok=False, error="Directory not found"), 404
 
-    # Prevent traversal outside ALL_APP_DATA
     try:
         target.resolve().relative_to(ALL_APP_DATA.resolve())
     except ValueError:
@@ -753,7 +808,6 @@ async def local_files():
     files = []
     try:
         for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name)):
-            # Skip the backup app's own data directory
             rel = entry.relative_to(ALL_APP_DATA)
             if str(rel).startswith("backup"):
                 continue
@@ -776,7 +830,6 @@ async def local_files():
 
 @route("/api/backup/rename", methods=["POST"])
 async def rename_backup():
-    """Set or update the name for a backup entry."""
     data = await request.get_json()
     backup_id = data.get("id")
     new_name = (data.get("name") or "").strip() or None
@@ -791,6 +844,136 @@ async def rename_backup():
     finally:
         conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Migration routes
+# ---------------------------------------------------------------------------
+
+
+@route("/api/migration/status")
+async def migration_status_endpoint():
+    return jsonify(
+        running=op_lock.migration_running,
+        status=migration.status,
+        log=migration.log[-50:],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Direct push migration
+# ---------------------------------------------------------------------------
+
+
+@route("/api/migration/push", methods=["POST"])
+async def trigger_direct_push():
+    """One-click migration: push all apps + data to another instance."""
+    err = op_lock.try_acquire(OpKind.MIGRATION)
+    if err:
+        return jsonify(ok=False, error=err), 409
+
+    data = await request.get_json(silent=True) or {}
+    target_url = (data.get("target_url") or "").rstrip("/")
+    target_token = data.get("target_token") or ""
+
+    if not target_url:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="Missing target_url"), 400
+    if not target_token:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="Missing target_token"), 400
+
+    selected_apps = data.get("apps")  # optional list
+    if selected_apps is not None and not isinstance(selected_apps, list):
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="'apps' must be a list"), 400
+
+    router_token = _extract_bearer_token() or get_router_api_token()
+    asyncio.create_task(
+        migration.run_direct_push(
+            target_url=target_url,
+            target_token=target_token,
+            selected_apps=selected_apps,
+            lock=op_lock,
+            all_app_data=ALL_APP_DATA,
+            vm_data_dir=VM_DATA_DIR,
+            router_url=ROUTER_URL,
+            zone_domain=ZONE_DOMAIN,
+            router_token=router_token,
+        )
+    )
+    return jsonify(ok=True, message="Direct push migration started")
+
+
+# ---------------------------------------------------------------------------
+# Receive endpoints (target side — called by source during direct push)
+# ---------------------------------------------------------------------------
+
+
+@route("/api/migration/receive/start", methods=["POST"])
+async def receive_start():
+    """Accept a migration manifest from a source instance.
+
+    Acquires the operation lock to prevent concurrent backup/restore,
+    stops all non-backup apps, and deletes app data for migrated apps.
+    The lock is held until receive_finalize completes.
+    """
+    err = op_lock.try_acquire(OpKind.MIGRATION)
+    if err:
+        return jsonify(ok=False, error=err), 409
+    data = await request.get_json(silent=True) or {}
+    if not data:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="Missing manifest"), 400
+    router_token = _extract_bearer_token() or get_router_api_token()
+    try:
+        result = await migration.receive_start(
+            data, ALL_APP_DATA, ROUTER_URL, router_token
+        )
+    except Exception as e:
+        logger.exception("receive_start failed")
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error=str(e)), 500
+    if not result.get("ok"):
+        op_lock.release(OpKind.MIGRATION)
+    # Lock stays held on success — released by receive_finalize
+    code = 200 if result.get("ok") else 400
+    return jsonify(**result), code
+
+
+@route("/api/migration/receive/app/<app_name>", methods=["POST"])
+async def receive_app(app_name):
+    """Receive a tar.gz stream of an app's data."""
+    if not migration.validate_name(app_name):
+        return jsonify(ok=False, error="Invalid app name"), 400
+    tar_data = await request.get_data()
+    if not tar_data:
+        return jsonify(ok=False, error="Empty request body"), 400
+    result = await migration.receive_app_data(app_name, tar_data, ALL_APP_DATA)
+    code = 200 if result.get("ok") else 400
+    return jsonify(**result), code
+
+
+@route("/api/migration/receive/finalize", methods=["POST"])
+async def receive_finalize():
+    """Deploy/restart apps after data has been received. Releases the op lock."""
+    data = await request.get_json(silent=True) or {}
+    manifest = data.get("manifest", {})
+    if not manifest:
+        if op_lock.active == OpKind.MIGRATION:
+            op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error="Missing manifest"), 400
+    repo_urls = data.get("repo_urls")
+    router_token = _extract_bearer_token() or get_router_api_token()
+    try:
+        result = await migration.receive_finalize(
+            manifest, ROUTER_URL, router_token, repo_urls=repo_urls
+        )
+        return jsonify(**result)
+    finally:
+        # Only release if we actually hold the migration lock
+        if op_lock.active == OpKind.MIGRATION:
+            op_lock.release(OpKind.MIGRATION)
 
 
 @route("/health")

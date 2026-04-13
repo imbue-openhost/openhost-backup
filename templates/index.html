@@ -7,7 +7,7 @@
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
-        h1 { font-size: 1.5rem; margin-bottom: 24px; }
+        h1 { font-size: 1.5rem; margin-bottom: 0; }
         h2 { font-size: 1.1rem; margin-bottom: 12px; color: #333; }
         section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
         label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; color: #555; }
@@ -55,156 +55,272 @@
         .inline-name { border: 1px solid #ccc; border-radius: 3px; padding: 2px 6px; font-size: 0.8rem; width: 120px; }
         .name-label { font-size: 0.8rem; color: #2563eb; cursor: pointer; }
         .name-label:hover { text-decoration: underline; }
+
+        /* Tab navigation */
+        .tab-bar { display: flex; gap: 0; margin: 16px 0 24px 0; border-bottom: 2px solid #ddd; }
+        .tab-btn {
+            padding: 10px 20px; border: none; background: none; cursor: pointer;
+            font-size: 0.95rem; font-weight: 500; color: #666;
+            border-bottom: 2px solid transparent; margin-bottom: -2px;
+        }
+        .tab-btn:hover { color: #333; }
+        .tab-btn.active { color: #2563eb; border-bottom-color: #2563eb; }
+        .page { display: none; }
+        .page.active { display: block; }
     </style>
 </head>
 <body>
     <h1>Backup</h1>
 
-    <!-- Status -->
-    <section>
-        <h2>Status</h2>
-        <dl>
-            <dt>State</dt>
-            <dd id="status-state">
-                {% if state.running %}
-                    <span class="status-badge status-running">running</span>
-                {% elif state.last_status == "success" %}
-                    <span class="status-badge status-success">ok</span>
-                {% elif state.last_status == "error" %}
-                    <span class="status-badge status-error">error: {{ state.last_error }}</span>
-                {% else %}
-                    <span class="status-badge status-none">no backups yet</span>
-                {% endif %}
-            </dd>
-            <dt>Last backup</dt>
-            <dd id="status-last">{{ state.last_backup or "never" }}</dd>
-            <dt>Interval</dt>
-            <dd>{{ config.interval_seconds }}s</dd>
-        </dl>
-        <div style="margin-top: 12px;">
-            <label>Backup name (optional)</label>
-            <input type="text" id="backup-name" placeholder="e.g. before-deploy, weekly" style="margin-bottom:8px;">
-        </div>
-        <div class="btn-row">
-            <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
-        </div>
-        <div id="backup-msg"></div>
-    </section>
+    <div class="tab-bar">
+        <button class="tab-btn active" onclick="showPage('backup')">Backups</button>
+        <button class="tab-btn" onclick="showPage('migrate')">Migrate</button>
+    </div>
 
-    <!-- Backups -->
-    <section>
-        <h2>Backups</h2>
-        <p class="info">Click a snapshot row to browse, restore, or delete it.</p>
-        <div class="btn-row" style="margin-bottom: 12px;">
-            <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
-        </div>
-        <div id="history-container" style="display:none;">
-            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
-                <thead>
-                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
-                        <th style="padding:6px 8px;">Time</th>
-                        <th style="padding:6px 8px;">Name</th>
-                        <th style="padding:6px 8px;">Status</th>
-                        <th style="padding:6px 8px;text-align:right;">Size</th>
-                        <th style="padding:6px 8px;">Error</th>
-                    </tr>
-                </thead>
-                <tbody id="history-body"></tbody>
-            </table>
-            <div class="btn-row" style="justify-content:space-between;">
-                <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
-                <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
-                <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
-            </div>
-        </div>
-        <div id="action-panel" style="display:none;margin-top:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-                <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
-            </div>
-            <div class="btn-row" style="flex-wrap:wrap;">
-                <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
-                <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
-                <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
-            </div>
-        </div>
-        <div id="browse-container" style="display:none;margin-top:12px;">
-            <div id="browse-breadcrumb" style="font-size:0.85rem;margin-bottom:8px;font-family:monospace;"></div>
-            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
-                <thead>
-                    <tr style="border-bottom:2px solid #ddd;text-align:left;">
-                        <th style="padding:6px 8px;">Name</th>
-                        <th style="padding:6px 8px;text-align:right;">Size</th>
-                        <th style="padding:6px 8px;">Modified</th>
-                    </tr>
-                </thead>
-                <tbody id="browse-body"></tbody>
-            </table>
-        </div>
-        <div id="restore-state" style="margin-top:12px;"></div>
-        <div id="manage-msg"></div>
-    </section>
+    <!-- ============================================================
+         PAGE: Backups
+         ============================================================ -->
+    <div id="page-backup" class="page active">
 
-    <!-- Quick Setup: S3 -->
-    <section>
-        <h2>Quick Setup: S3</h2>
-        <p class="info">Fill in your S3 credentials to generate an rclone config. This overwrites the config below.</p>
-        <div class="grid-2">
-            <div>
-                <label>Remote name</label>
-                <input type="text" id="s3-remote" value="{{ config.remote_name }}">
+        <!-- Status -->
+        <section>
+            <h2>Status</h2>
+            <dl>
+                <dt>State</dt>
+                <dd id="status-state">
+                    {% if state.running %}
+                        <span class="status-badge status-running">running</span>
+                    {% elif state.last_status == "success" %}
+                        <span class="status-badge status-success">ok</span>
+                    {% elif state.last_status == "error" %}
+                        <span class="status-badge status-error">error: {{ state.last_error }}</span>
+                    {% else %}
+                        <span class="status-badge status-none">no backups yet</span>
+                    {% endif %}
+                </dd>
+                <dt>Last backup</dt>
+                <dd id="status-last">{{ state.last_backup or "never" }}</dd>
+                <dt>Interval</dt>
+                <dd>{{ config.interval_seconds }}s</dd>
+            </dl>
+            <div style="margin-top: 12px;">
+                <label>Backup name (optional)</label>
+                <input type="text" id="backup-name" placeholder="e.g. before-deploy, weekly" style="margin-bottom:8px;">
             </div>
-            <div>
-                <label>Bucket</label>
-                <input type="text" id="s3-bucket" value="{{ config.remote_path }}" placeholder="my-backups">
+            <div class="btn-row">
+                <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
             </div>
-        </div>
-        <div class="grid-2">
-            <div>
-                <label>Access key</label>
-                <input type="text" id="s3-access-key" placeholder="AKIA...">
-            </div>
-            <div>
-                <label>Secret key</label>
-                <input type="password" id="s3-secret-key" placeholder="...">
-            </div>
-        </div>
-        <label>Region</label>
-        <input type="text" id="s3-region" value="us-east-1">
-        <button class="btn-primary" onclick="setupS3()">Generate config</button>
-        <div id="s3-msg"></div>
-    </section>
+            <div id="backup-msg"></div>
+        </section>
 
-    <!-- rclone.conf editor -->
-    <section>
-        <h2>rclone.conf</h2>
-        <p class="info">
-            Edit the rclone config directly. For backends other than S3, run
-            <code>rclone config</code> on your local machine and paste the contents of
-            <code>~/.config/rclone/rclone.conf</code> here.
-        </p>
-        <textarea id="rclone-conf">{{ rclone_conf }}</textarea>
-        <div class="grid-2">
-            <div>
-                <label>Remote name (must match a section above)</label>
-                <input type="text" id="conf-remote-name" value="{{ config.remote_name }}">
+        <!-- Backups -->
+        <section>
+            <h2>Backups</h2>
+            <p class="info">Click a snapshot row to browse, restore, or delete it.</p>
+            <div class="btn-row" style="margin-bottom: 12px;">
+                <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
             </div>
-            <div>
-                <label>Remote path (bucket or path)</label>
-                <input type="text" id="conf-remote-path" value="{{ config.remote_path }}">
+            <div id="history-container" style="display:none;">
+                <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
+                    <thead>
+                        <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                            <th style="padding:6px 8px;">Time</th>
+                            <th style="padding:6px 8px;">Name</th>
+                            <th style="padding:6px 8px;">Status</th>
+                            <th style="padding:6px 8px;text-align:right;">Size</th>
+                            <th style="padding:6px 8px;">Error</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-body"></tbody>
+                </table>
+                <div class="btn-row" style="justify-content:space-between;">
+                    <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
+                    <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
+                    <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
+                </div>
             </div>
-        </div>
-        <label>Backup interval (seconds, minimum 60)</label>
-        <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
-        <button class="btn-primary" onclick="saveConfig()">Save</button>
-        <div id="conf-msg"></div>
-    </section>
+            <div id="action-panel" style="display:none;margin-top:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                    <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
+                </div>
+                <div class="btn-row" style="flex-wrap:wrap;">
+                    <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
+                    <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
+                    <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
+                </div>
+            </div>
+            <div id="browse-container" style="display:none;margin-top:12px;">
+                <div id="browse-breadcrumb" style="font-size:0.85rem;margin-bottom:8px;font-family:monospace;"></div>
+                <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                    <thead>
+                        <tr style="border-bottom:2px solid #ddd;text-align:left;">
+                            <th style="padding:6px 8px;">Name</th>
+                            <th style="padding:6px 8px;text-align:right;">Size</th>
+                            <th style="padding:6px 8px;">Modified</th>
+                        </tr>
+                    </thead>
+                    <tbody id="browse-body"></tbody>
+                </table>
+            </div>
+            <div id="restore-state" style="margin-top:12px;"></div>
+            <div id="manage-msg"></div>
+        </section>
+
+        <!-- Quick Setup: S3 -->
+        <section>
+            <h2>Quick Setup: S3</h2>
+            <p class="info">Fill in your S3 credentials to generate an rclone config. This overwrites the config below.</p>
+            <div class="grid-2">
+                <div>
+                    <label>Remote name</label>
+                    <input type="text" id="s3-remote" value="{{ config.remote_name }}">
+                </div>
+                <div>
+                    <label>Bucket</label>
+                    <input type="text" id="s3-bucket" value="{{ config.remote_path }}" placeholder="my-backups">
+                </div>
+            </div>
+            <div class="grid-2">
+                <div>
+                    <label>Access key</label>
+                    <input type="text" id="s3-access-key" placeholder="AKIA...">
+                </div>
+                <div>
+                    <label>Secret key</label>
+                    <input type="password" id="s3-secret-key" placeholder="...">
+                </div>
+            </div>
+            <label>Region</label>
+            <input type="text" id="s3-region" value="us-east-1">
+            <button class="btn-primary" onclick="setupS3()">Generate config</button>
+            <div id="s3-msg"></div>
+        </section>
+
+        <!-- rclone.conf editor -->
+        <section>
+            <h2>rclone.conf</h2>
+            <p class="info">
+                Edit the rclone config directly. For backends other than S3, run
+                <code>rclone config</code> on your local machine and paste the contents of
+                <code>~/.config/rclone/rclone.conf</code> here.
+            </p>
+            <textarea id="rclone-conf">{{ rclone_conf }}</textarea>
+            <div class="grid-2">
+                <div>
+                    <label>Remote name (must match a section above)</label>
+                    <input type="text" id="conf-remote-name" value="{{ config.remote_name }}">
+                </div>
+                <div>
+                    <label>Remote path (bucket or path)</label>
+                    <input type="text" id="conf-remote-path" value="{{ config.remote_path }}">
+                </div>
+            </div>
+            <label>Backup interval (seconds, minimum 60)</label>
+            <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
+            <button class="btn-primary" onclick="saveConfig()">Save</button>
+            <div id="conf-msg"></div>
+        </section>
+
+    </div>
+
+    <!-- ============================================================
+         PAGE: Migrate
+         ============================================================ -->
+    <div id="page-migrate" class="page">
+
+        <section>
+            <h2>Migrate to another instance</h2>
+            <p class="info">
+                Move all your apps and data to another OpenHost instance.
+                Install the backup app on both instances, then generate an API token
+                on the destination. Your data will be transferred and your applications
+                will be restarted on the other side.
+            </p>
+            <details style="margin-bottom:12px;">
+                <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Important details before migrating</summary>
+                <div class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;margin-top:6px;">
+                    <strong>This instance:</strong> Not changed. Migration copies your data
+                    to the destination. Nothing on this instance is modified or deleted.
+                    <br><br>
+                    <strong>Destination:</strong> All running apps will be stopped, and
+                    existing app data for migrated apps will be deleted before new data is
+                    written. Apps not included in the migration will be stopped during the
+                    transfer and restarted afterward.
+                    <br><br>
+                    <strong>Tip:</strong> It is a good idea to stop applications on this
+                    instance before migrating, especially databases or apps that might not
+                    transfer correctly if they are actively writing data. Stopping is not
+                    required, but it reduces the risk of inconsistent data.
+                    <br><br>
+                    <strong>Not migrated:</strong> API tokens, owner password, and other
+                    system-level settings are not transferred.
+                </div>
+            </details>
+
+            <div style="margin-bottom:12px;">
+                <label>Destination instance URL</label>
+                <input type="text" id="push-target-url" placeholder="https://my-other-instance.selfhost.imbue.com">
+            </div>
+            <div style="margin-bottom:12px;">
+                <label>Destination API token</label>
+                <input type="password" id="push-target-token" placeholder="Paste the token you generated on the destination instance">
+            </div>
+            <div class="btn-row" style="margin-bottom:12px;">
+                <button class="btn-primary" id="btn-push" onclick="startPush()">Start migration</button>
+            </div>
+
+            <!-- Progress -->
+            <div id="mig-progress" style="display:none;margin-bottom:16px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                    <span id="mig-phase" class="status-badge status-running">starting</span>
+                    <span id="mig-pct" style="font-size:0.85rem;color:#555;">0%</span>
+                </div>
+                <div style="background:#e5e7eb;border-radius:4px;height:8px;overflow:hidden;margin-bottom:8px;">
+                    <div id="mig-bar" style="background:#2563eb;height:100%;width:0%;transition:width 0.3s;"></div>
+                </div>
+                <div id="mig-log" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.78rem;color:#555;white-space:pre-wrap;"></div>
+            </div>
+
+            <div id="mig-msg"></div>
+        </section>
+
+    </div>
 
     <script>
         const BASE = "{{ base_path }}";
         let historyOffset = 0;
         let selectedSnapshot = null;
         let selectedBackupId = null;
-        let browseMode = null; // "remote" or "local"
+        let browseMode = null;
+
+        /* ================================================================
+           Tab navigation
+           ================================================================ */
+
+        function showPage(name) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('page-' + name).classList.add('active');
+            // Find the matching tab button
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                if (b.textContent.toLowerCase().replace(/\s/g, '') === name ||
+                    (name === 'backup' && b.textContent === 'Backups') ||
+                    (name === 'migrate' && b.textContent === 'Migrate')) {
+                    b.classList.add('active');
+                }
+            });
+            location.hash = name;
+        }
+
+        // Restore tab from URL hash on load
+        (function() {
+            const hash = location.hash.replace('#', '');
+            if (hash === 'migrate') showPage('migrate');
+        })();
+
+        /* ================================================================
+           Shared helpers
+           ================================================================ */
 
         async function api(path, opts = {}) {
             const url = BASE + path;
@@ -239,10 +355,13 @@
         function escapeHtml(str) {
             const d = document.createElement("div");
             d.textContent = str;
-            return d.innerHTML;
+            return d.innerHTML.replace(/'/g, "&#39;");
         }
 
-        /* --- S3 Setup --- */
+        /* ================================================================
+           Backup page
+           ================================================================ */
+
         async function setupS3() {
             const data = {
                 remote_name: document.getElementById("s3-remote").value,
@@ -262,7 +381,6 @@
             }
         }
 
-        /* --- Config --- */
         async function saveConfig() {
             const data = {
                 rclone_conf: document.getElementById("rclone-conf").value,
@@ -274,7 +392,6 @@
             showMsg("conf-msg", res.ok ? "Saved" : "Error", res.ok);
         }
 
-        /* --- Backup trigger & polling --- */
         async function triggerBackup() {
             const btn = document.getElementById("btn-backup");
             btn.disabled = true;
@@ -318,7 +435,6 @@
             poll();
         }
 
-        /* --- Backup History --- */
         async function loadHistory(offset) {
             if (offset < 0) offset = 0;
             historyOffset = offset;
@@ -370,7 +486,6 @@
             container.style.display = "block";
         }
 
-        /* --- Rename backup inline --- */
         async function renameBackup(id, el) {
             const current = el.textContent === "-" ? "" : el.textContent;
             const input = document.createElement("input");
@@ -399,7 +514,6 @@
             };
         }
 
-        /* --- Manage Backups: Load snapshots --- */
         async function loadSnapshots() {
             const btn = document.getElementById("btn-load-snapshots");
             btn.disabled = true;
@@ -420,7 +534,6 @@
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
             document.getElementById("btn-restore").disabled = false;
-            // Highlight selected row
             const rows = document.getElementById("history-body").querySelectorAll("tr");
             rows.forEach(tr => {
                 const cell = tr.querySelector("td");
@@ -432,7 +545,6 @@
             });
         }
 
-        /* --- Generic file browser (shared by remote + local) --- */
         function renderFileBrowser(res, subpath, browseFunc, label) {
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
@@ -443,7 +555,6 @@
                 return;
             }
 
-            // Breadcrumb
             const parts = subpath ? subpath.split("/") : [];
             let bc = '<span style="font-size:0.75rem;background:#e0e7ff;color:#3730a3;padding:1px 6px;border-radius:3px;margin-right:6px;">' + escapeHtml(label) + '</span>';
             bc += '<span class="browse-link" onclick="' + browseFunc + '(\'\')">root</span>';
@@ -455,7 +566,6 @@
             });
             breadcrumb.innerHTML = bc;
 
-            // File listing
             body.innerHTML = "";
             if (res.files.length === 0) {
                 body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Empty directory</td></tr>';
@@ -481,7 +591,6 @@
             });
         }
 
-        /* --- Browse Snapshot (remote, falls back to local) --- */
         async function browseSnapshot(subpath) {
             const snapshot = selectedSnapshot;
             if (!snapshot) return;
@@ -497,14 +606,12 @@
             const res = await api(url);
 
             if (!res.ok) {
-                // Remote failed — fall back to local browse automatically
                 browseLocal(subpath, true);
                 return;
             }
             renderFileBrowser(res, subpath, "browseSnapshot", "remote");
         }
 
-        /* --- Browse Local app data (backup source) --- */
         async function browseLocal(subpath, isFallback) {
             if (!selectedSnapshot) return;
             browseMode = "local";
@@ -521,7 +628,6 @@
             renderFileBrowser(res, subpath, "browseLocal", label);
         }
 
-        /* --- Restore --- */
         async function triggerRestore() {
             const snapshot = selectedSnapshot;
             if (!snapshot) return;
@@ -565,7 +671,6 @@
             poll();
         }
 
-        /* --- Delete Snapshot --- */
         async function deleteSnapshot() {
             const snapshot = selectedSnapshot;
             if (!snapshot) return;
@@ -590,7 +695,83 @@
             }
         }
 
-        // Auto-load on page load
+        /* ================================================================
+           Migration page
+           ================================================================ */
+
+        let migPolling = false;
+
+        async function startPush() {
+            const targetUrl = document.getElementById("push-target-url").value.trim();
+            const targetToken = document.getElementById("push-target-token").value.trim();
+            if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
+            if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
+            if (!confirm("Migrate all apps and data to " + targetUrl + "?\n\nMake sure the backup app is installed on the destination.")) return;
+
+            const btn = document.getElementById("btn-push");
+            btn.disabled = true;
+            btn.textContent = "Migrating...";
+            const res = await api("/api/migration/push", {
+                method: "POST",
+                body: { target_url: targetUrl, target_token: targetToken }
+            });
+            if (res.ok) {
+                showMsg("mig-msg", "Migration started", true);
+                pollMigration();
+            } else {
+                showMsg("mig-msg", res.error || "Failed", false);
+                btn.disabled = false;
+                btn.textContent = "Start migration";
+            }
+        }
+
+        function pollMigration() {
+            if (migPolling) return;
+            migPolling = true;
+            const progressEl = document.getElementById("mig-progress");
+            progressEl.style.display = "block";
+
+            const poll = async () => {
+                const res = await api("/api/migration/status");
+                const status = res.status || {};
+                const phase = status.phase || "unknown";
+                const progress = status.progress || 0;
+
+                document.getElementById("mig-phase").textContent = phase;
+                document.getElementById("mig-pct").textContent = progress + "%";
+                document.getElementById("mig-bar").style.width = progress + "%";
+
+                const badge = document.getElementById("mig-phase");
+                badge.className = "status-badge " + (
+                    phase === "done" ? "status-success" :
+                    phase === "error" ? "status-error" :
+                    "status-running"
+                );
+
+                if (res.log && res.log.length > 0) {
+                    const logEl = document.getElementById("mig-log");
+                    logEl.textContent = res.log.join("\n");
+                    logEl.scrollTop = logEl.scrollHeight;
+                }
+
+                if (res.running) {
+                    setTimeout(poll, 2000);
+                } else {
+                    migPolling = false;
+                    const pushBtn = document.getElementById("btn-push");
+                    if (pushBtn) { pushBtn.disabled = false; pushBtn.textContent = "Start migration"; }
+
+                    if (phase === "done") {
+                        showMsg("mig-msg", "Migration complete! Your apps and data have been transferred.", true);
+                    } else if (phase === "error") {
+                        showMsg("mig-msg", "Migration failed: " + (status.error || ""), false);
+                    }
+                }
+            };
+            poll();
+        }
+
+        // Auto-load backup snapshots on page load
         loadSnapshots();
     </script>
 </body>
