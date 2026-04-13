@@ -647,8 +647,20 @@ async def receive_app_data(
     def _extract():
         buf = io.BytesIO(tar_data)
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-            # filter='data' blocks symlinks, absolute paths, and path traversal
-            tar.extractall(path=str(target_dir), filter="data")
+            # Custom filter: block path traversal but allow symlinks.
+            # The built-in filter='data' rejects symlinks to absolute paths,
+            # which breaks apps that use symlinks in their data directories
+            # (e.g. agent-host creates symlinks to shared config locations).
+            def _migration_filter(member, dest_path):
+                # Block path traversal
+                if ".." in member.name.split("/"):
+                    return None
+                # Block absolute paths in member names
+                if member.name.startswith("/"):
+                    return None
+                return member
+
+            tar.extractall(path=str(target_dir), filter=_migration_filter)
 
     try:
         await asyncio.to_thread(_extract)
