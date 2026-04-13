@@ -7,7 +7,7 @@ for migrated apps, receives the new data, then deploys/restarts apps.
 
 The protocol is:
   1. POST /api/migration/receive/start   -- send manifest, target stops apps + wipes data
-  2. POST /api/migration/receive/app/:n  -- stream tar.gz per app
+  2. POST /api/migration/receive/data    -- stream all app data as one tar.gz
   3. POST /api/migration/receive/finalize -- deploy/restart apps via router API
 """
 
@@ -17,6 +17,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -364,20 +365,72 @@ def _build_manifest(
 # Source (this instance) streams app data directly to the target
 # instance's backup app over HTTP.  The protocol is:
 #
-#   1. POST /api/migration/receive/start   — send manifest
-#   2. POST /api/migration/receive/app/:n  — stream tar.gz per app
-#   3. POST /api/migration/receive/finalize — deploy apps via router
+#   1. POST /api/migration/receive/start   -- send manifest
+#   2. POST /api/migration/receive/data    -- stream all app data as one tar.gz
+#   3. POST /api/migration/receive/finalize -- deploy apps via router
 #
 # The target needs the backup app running.  Both sides authenticate
 # with their respective tokens.
 
 
-def _tar_directory_sync(directory: Path) -> bytes:
-    """Create an in-memory tar.gz of *directory*.  Runs in a thread."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add(str(directory), arcname=".")
-    return buf.getvalue()
+def _tar_stream_sync(
+    all_app_data: Path,
+    accepted_apps: list[str],
+    write_fd: int,
+) -> None:
+    """Write a tar.gz stream of accepted app data dirs to *write_fd*.
+
+    Runs in a thread.  Writes directly to the file descriptor so the
+    main thread can stream the output to the HTTP request without
+    buffering the entire archive in memory.
+    """
+    try:
+        with os.fdopen(write_fd, "wb") as f:
+            with tarfile.open(fileobj=f, mode="w:gz") as tar:
+                for app_name in accepted_apps:
+                    app_dir = all_app_data / app_name
+                    if app_dir.exists():
+                        tar.add(str(app_dir), arcname=app_name)
+    except BrokenPipeError:
+        # Reader closed early (e.g. target rejected the stream).
+        pass
+
+
+async def _streaming_tar_generator(
+    all_app_data: Path,
+    accepted_apps: list[str],
+) -> asyncio.Queue[bytes | None]:
+    """Return a queue that yields tar.gz chunks.
+
+    A background thread writes the tar stream into a pipe; the async
+    reader pulls chunks from the read end and pushes them into the
+    queue.  A ``None`` sentinel signals end-of-stream.
+    """
+    read_fd, write_fd = os.pipe()
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=16)
+    loop = asyncio.get_running_loop()
+
+    # Start the tar writer in a thread
+    writer_future = loop.run_in_executor(
+        None, _tar_stream_sync, all_app_data, accepted_apps, write_fd
+    )
+
+    async def _reader() -> None:
+        """Read from the pipe and push chunks into the queue."""
+        read_file = os.fdopen(read_fd, "rb")
+        try:
+            while True:
+                chunk = await loop.run_in_executor(None, read_file.read, 256 * 1024)
+                if not chunk:
+                    break
+                await queue.put(chunk)
+        finally:
+            read_file.close()
+            await writer_future
+            await queue.put(None)  # sentinel
+
+    asyncio.create_task(_reader())
+    return queue
 
 
 async def run_direct_push(
@@ -395,7 +448,8 @@ async def run_direct_push(
     """Push apps + data directly from this instance to a target instance.
 
     This is the simplified "one-click migrate" flow.  No shared rclone
-    remote is needed — data is streamed over HTTP.
+    remote is needed -- data is streamed over HTTP as a single tar.gz
+    archive containing all app data directories.
     """
     global status
     log.clear()
@@ -446,54 +500,44 @@ async def run_direct_push(
         accepted_apps = start_resp.get("accepted_apps", app_names)
         _log(f"Target accepted {len(accepted_apps)} apps: {', '.join(accepted_apps)}")
 
-        # 3. Stream each app's data as tar.gz
+        # 3. Stream all app data as a single tar.gz
+        _log("Streaming app data to target...")
         status = {"phase": "streaming_data", "progress": 15}
-        total = len(accepted_apps)
 
-        for i, app_name in enumerate(accepted_apps):
-            app_dir = all_app_data / app_name
-            if not app_dir.exists():
-                _log(f"Skipping {app_name}: no local data directory")
-                continue
+        queue = await _streaming_tar_generator(all_app_data, accepted_apps)
 
-            _log(f"Compressing and sending {app_name}...")
-            status = {
-                "phase": "streaming_data",
-                "progress": 15 + int(65 * i / total),
-                "current_app": app_name,
-            }
+        async def _body_stream():
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
 
-            tar_bytes = await asyncio.to_thread(_tar_directory_sync, app_dir)
-            size_mb = len(tar_bytes) / (1024 * 1024)
-            _log(f"  {app_name}: {size_mb:.1f} MB compressed, uploading...")
-
-            async with httpx.AsyncClient(verify=not skip_verify, timeout=600) as client:
-                r = await client.post(
-                    f"{target_backup_url}/api/migration/receive/app/{app_name}",
-                    content=tar_bytes,
-                    headers={
-                        "Authorization": f"Bearer {target_token}",
-                        "Content-Type": "application/gzip",
-                    },
+        async with httpx.AsyncClient(
+            verify=not skip_verify,
+            timeout=httpx.Timeout(connect=30, read=600, write=600, pool=60),
+        ) as client:
+            r = await client.post(
+                f"{target_backup_url}/api/migration/receive/data",
+                content=_body_stream(),
+                headers={
+                    "Authorization": f"Bearer {target_token}",
+                    "Content-Type": "application/gzip",
+                },
+            )
+            if r.status_code != 200:
+                body = r.text[:500]
+                raise RuntimeError(
+                    f"Target rejected data stream (HTTP {r.status_code}): {body}"
                 )
-                if r.status_code != 200:
-                    body = r.text[:500]
-                    _log(
-                        f"  WARNING: target rejected {app_name} "
-                        f"(HTTP {r.status_code}): {body}"
-                    )
-                else:
-                    resp = r.json()
-                    if resp.get("ok"):
-                        _log(f"  {app_name}: received by target")
-                    else:
-                        _log(f"  WARNING: {app_name}: {resp.get('error', 'unknown')}")
+            data_resp = r.json()
+            if not data_resp.get("ok"):
+                raise RuntimeError(
+                    f"Target rejected data: {data_resp.get('error', 'unknown')}"
+                )
+            _log(f"Data transfer complete: {data_resp.get('message', 'ok')}")
 
-            status = {
-                "phase": "streaming_data",
-                "progress": 15 + int(65 * (i + 1) / total),
-                "current_app": app_name,
-            }
+        status = {"phase": "streaming_data", "progress": 80}
 
         # 4. Tell target to finalize (deploy/restart apps)
         _log("Finalizing migration on target...")
@@ -632,25 +676,22 @@ async def receive_start(
     }
 
 
-async def receive_app_data(
-    app_name: str,
-    tar_data: bytes,
+async def receive_all_data(
+    tar_stream: asyncio.StreamReader | io.BytesIO,
     all_app_data: Path,
 ) -> dict:
-    """Receive and extract a tar.gz of an app's data directory."""
-    if not validate_name(app_name):
-        return {"ok": False, "error": "Invalid app name"}
+    """Receive and extract a tar.gz of the entire app_data directory.
 
-    target_dir = all_app_data / app_name
-    target_dir.mkdir(parents=True, exist_ok=True)
+    The archive is expected to contain top-level directories named after
+    each app (e.g. ``secrets/``, ``agent-host/``).  Each directory is
+    extracted to ``all_app_data/<app_name>/``.
+    """
 
-    def _extract():
-        buf = io.BytesIO(tar_data)
+    def _extract(data: bytes) -> list[str]:
+        buf = io.BytesIO(data)
+        extracted_apps: set[str] = set()
         with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-            # Custom filter: block path traversal but allow symlinks.
-            # The built-in filter='data' rejects symlinks to absolute paths,
-            # which breaks apps that use symlinks in their data directories
-            # (e.g. agent-host creates symlinks to shared config locations).
+
             def _migration_filter(member, dest_path):
                 # Block path traversal
                 if ".." in member.name.split("/"):
@@ -658,48 +699,47 @@ async def receive_app_data(
                 # Block absolute paths in member names
                 if member.name.startswith("/"):
                     return None
+                # Validate top-level directory (the app name)
+                top = member.name.split("/")[0]
+                if not validate_name(top):
+                    return None
+                extracted_apps.add(top)
                 return member
 
-            tar.extractall(path=str(target_dir), filter=_migration_filter)
+            tar.extractall(path=str(all_app_data), filter=_migration_filter)
+        return sorted(extracted_apps)
 
     try:
-        await asyncio.to_thread(_extract)
-        await asyncio.to_thread(_fix_permissions, target_dir)
-        size_mb = len(tar_data) / (1024 * 1024)
-        _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB compressed)")
-        return {"ok": True}
+        # Read the full stream into memory for tarfile extraction.
+        # We stream over the network to avoid holding the full archive
+        # on the *source* side; the destination must buffer it for
+        # tarfile which requires seekable or full data anyway.
+        if isinstance(tar_stream, io.BytesIO):
+            data = tar_stream.getvalue()
+        else:
+            data = await tar_stream.read()
+
+        extracted = await asyncio.to_thread(_extract, data)
+        size_mb = len(data) / (1024 * 1024)
+
+        # Fix permissions for each extracted app directory
+        for app_name in extracted:
+            app_dir = all_app_data / app_name
+            if app_dir.exists():
+                await asyncio.to_thread(_fix_permissions, app_dir)
+
+        _log(
+            f"Receive: extracted {len(extracted)} apps "
+            f"({size_mb:.1f} MB compressed): {', '.join(extracted)}"
+        )
+        return {
+            "ok": True,
+            "message": f"Extracted {len(extracted)} apps",
+            "apps": extracted,
+        }
     except Exception as e:
-        _log(f"Receive: failed to extract {app_name}: {e}")
+        _log(f"Receive: failed to extract data: {e}")
         return {"ok": False, "error": str(e)}
-
-
-async def _wait_for_apps_ready(
-    app_names: list[str],
-    router_url: str,
-    router_token: str | None,
-    max_wait: int = 300,
-) -> None:
-    """Poll the router until none of *app_names* are building/starting."""
-    waited = 0
-    while waited < max_wait:
-        await asyncio.sleep(10)
-        waited += 10
-        try:
-            current = await _router_get(
-                "/api/apps", token=router_token, base_url=router_url
-            )
-            all_done = True
-            for name in app_names:
-                info = current.get(name, {}) if isinstance(current, dict) else {}
-                s = info.get("status", "")
-                if s in ("building", "starting"):
-                    all_done = False
-                    break
-            if all_done:
-                return
-        except Exception as e:
-            _log(f"Receive: poll error while waiting for builds: {e}")
-    _log(f"Timed out waiting for apps to build after {waited}s")
 
 
 async def receive_finalize(
@@ -710,9 +750,12 @@ async def receive_finalize(
 ) -> dict:
     """After all app data is received, deploy/restart apps via the router.
 
-    Apps that were running on the source instance (status == "running") will
-    be started on the target.  Apps that were stopped will be deployed but
-    left stopped.
+    Sends reload/deploy commands fire-and-forget -- does not wait for
+    apps to finish building or starting.  Apps that already exist on the
+    target are reloaded and stopped if they were not running on the
+    source.  Newly deployed apps (via ``add_app``) will start building
+    immediately; since we do not wait for builds, these cannot be
+    stopped inline and will end up running once their build completes.
 
     ``repo_urls`` is an optional mapping of app_name -> repo_url with
     credentials intact, provided by the source during direct push.  This
@@ -773,7 +816,8 @@ async def receive_finalize(
                     base_url=router_url,
                 )
                 _log(
-                    f"Receive: deployed {app_name} from {_strip_url_credentials(repo_url)}"
+                    f"Receive: deployed {app_name} from "
+                    f"{_strip_url_credentials(repo_url)}"
                 )
                 results.append(
                     {
@@ -788,39 +832,6 @@ async def receive_finalize(
         else:
             _log(f"Receive: {app_name} data received but no repo_url to deploy from")
             results.append({"name": app_name, "action": "data_only"})
-
-    # Stop apps that were not running on the source but were deployed/reloaded.
-    # Newly deployed apps need time to build first — wait for them, then stop.
-    apps_to_stop = [
-        r["name"]
-        for r in results
-        if r["name"] not in apps_to_start
-        and r.get("action") in ("deployed", "reloaded")
-    ]
-
-    if apps_to_stop:
-        # Wait for deployed apps to finish building before stopping
-        deployed_to_stop = [
-            r["name"]
-            for r in results
-            if r["name"] in apps_to_stop and r.get("action") == "deployed"
-        ]
-        if deployed_to_stop:
-            _log(
-                f"Waiting for apps to build before stopping: {', '.join(deployed_to_stop)}"
-            )
-            await _wait_for_apps_ready(deployed_to_stop, router_url, router_token)
-
-        for app_name in apps_to_stop:
-            try:
-                await _router_post(
-                    f"/stop_app/{app_name}",
-                    token=router_token,
-                    base_url=router_url,
-                )
-                _log(f"Receive: stopped {app_name} (was not running on source)")
-            except Exception as e:
-                _log(f"Receive: could not stop {app_name}: {e}")
 
     # --- Restart non-migrated apps that were stopped during receive_start ---
     global _receive_stopped_apps
@@ -845,50 +856,6 @@ async def receive_finalize(
                 _log(f"Receive: restarted {app_name}")
             except Exception as e:
                 _log(f"Receive: could not restart {app_name}: {e}")
-
-    # --- Verify migrated apps that should be running are actually running ---
-    # receive_start stops all apps before data transfer. reload_app may only
-    # reload config without starting a stopped container, and newly deployed
-    # apps may still be building. Poll until builds finish, then start any
-    # app in apps_to_start that isn't running.
-    migrated_to_start = [
-        r["name"]
-        for r in results
-        if r["name"] in apps_to_start and r.get("action") in ("deployed", "reloaded")
-    ]
-    if migrated_to_start:
-        # Wait for any builds to complete first
-        _log(
-            f"Receive: waiting for migrated apps to be ready: "
-            f"{', '.join(migrated_to_start)}"
-        )
-        await _wait_for_apps_ready(migrated_to_start, router_url, router_token)
-
-        # Now check each app and start it if it's not running
-        try:
-            current = await _router_get(
-                "/api/apps", token=router_token, base_url=router_url
-            )
-        except Exception as e:
-            _log(f"Receive: could not fetch app statuses: {e}")
-            current = {}
-
-        for app_name in migrated_to_start:
-            info = current.get(app_name, {}) if isinstance(current, dict) else {}
-            app_status = info.get("status", "")
-            if app_status == "running":
-                _log(f"Receive: {app_name} is already running")
-                continue
-            _log(f"Receive: {app_name} is '{app_status}', starting via reload_app")
-            try:
-                await _router_post(
-                    f"/reload_app/{app_name}",
-                    token=router_token,
-                    base_url=router_url,
-                )
-                _log(f"Receive: started {app_name}")
-            except Exception as e:
-                _log(f"Receive: could not start {app_name}: {e}")
 
     # Clear the receive state
     _receive_stopped_apps = []
