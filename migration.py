@@ -673,6 +673,35 @@ async def receive_app_data(
         return {"ok": False, "error": str(e)}
 
 
+async def _wait_for_apps_ready(
+    app_names: list[str],
+    router_url: str,
+    router_token: str | None,
+    max_wait: int = 300,
+) -> None:
+    """Poll the router until none of *app_names* are building/starting."""
+    waited = 0
+    while waited < max_wait:
+        await asyncio.sleep(10)
+        waited += 10
+        try:
+            current = await _router_get(
+                "/api/apps", token=router_token, base_url=router_url
+            )
+            all_done = True
+            for name in app_names:
+                info = current.get(name, {}) if isinstance(current, dict) else {}
+                s = info.get("status", "")
+                if s in ("building", "starting"):
+                    all_done = False
+                    break
+            if all_done:
+                return
+        except Exception as e:
+            _log(f"Receive: poll error while waiting for builds: {e}")
+    _log(f"Timed out waiting for apps to build after {waited}s")
+
+
 async def receive_finalize(
     manifest: dict,
     router_url: str,
@@ -780,29 +809,7 @@ async def receive_finalize(
             _log(
                 f"Waiting for apps to build before stopping: {', '.join(deployed_to_stop)}"
             )
-            max_wait, waited = 300, 0
-            while waited < max_wait:
-                await asyncio.sleep(10)
-                waited += 10
-                try:
-                    current = await _router_get(
-                        "/api/apps", token=router_token, base_url=router_url
-                    )
-                    all_done = True
-                    for name in deployed_to_stop:
-                        info = (
-                            current.get(name, {}) if isinstance(current, dict) else {}
-                        )
-                        s = info.get("status", "")
-                        if s in ("building", "starting"):
-                            all_done = False
-                            break
-                    if all_done:
-                        break
-                except Exception as e:
-                    _log(f"Receive: poll error while waiting for builds: {e}")
-            if waited >= max_wait:
-                _log(f"Timed out waiting for apps to build after {waited}s")
+            await _wait_for_apps_ready(deployed_to_stop, router_url, router_token)
 
         for app_name in apps_to_stop:
             try:
@@ -838,6 +845,50 @@ async def receive_finalize(
                 _log(f"Receive: restarted {app_name}")
             except Exception as e:
                 _log(f"Receive: could not restart {app_name}: {e}")
+
+    # --- Verify migrated apps that should be running are actually running ---
+    # receive_start stops all apps before data transfer. reload_app may only
+    # reload config without starting a stopped container, and newly deployed
+    # apps may still be building. Poll until builds finish, then start any
+    # app in apps_to_start that isn't running.
+    migrated_to_start = [
+        r["name"]
+        for r in results
+        if r["name"] in apps_to_start and r.get("action") in ("deployed", "reloaded")
+    ]
+    if migrated_to_start:
+        # Wait for any builds to complete first
+        _log(
+            f"Receive: waiting for migrated apps to be ready: "
+            f"{', '.join(migrated_to_start)}"
+        )
+        await _wait_for_apps_ready(migrated_to_start, router_url, router_token)
+
+        # Now check each app and start it if it's not running
+        try:
+            current = await _router_get(
+                "/api/apps", token=router_token, base_url=router_url
+            )
+        except Exception as e:
+            _log(f"Receive: could not fetch app statuses: {e}")
+            current = {}
+
+        for app_name in migrated_to_start:
+            info = current.get(app_name, {}) if isinstance(current, dict) else {}
+            app_status = info.get("status", "")
+            if app_status == "running":
+                _log(f"Receive: {app_name} is already running")
+                continue
+            _log(f"Receive: {app_name} is '{app_status}', starting via reload_app")
+            try:
+                await _router_post(
+                    f"/reload_app/{app_name}",
+                    token=router_token,
+                    base_url=router_url,
+                )
+                _log(f"Receive: started {app_name}")
+            except Exception as e:
+                _log(f"Receive: could not start {app_name}: {e}")
 
     # Clear the receive state
     _receive_stopped_apps = []
