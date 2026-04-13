@@ -891,6 +891,46 @@ async def trigger_direct_push():
         return jsonify(ok=False, error="'apps' must be a list"), 400
 
     router_token = _extract_bearer_token() or get_router_api_token()
+
+    # Pre-flight check: verify the router token works before starting.
+    # Without a valid token the migration will fail when it tries to
+    # list apps on this instance.
+    if router_token:
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+                r = await client.get(
+                    f"{ROUTER_URL}/api/apps",
+                    headers={"Authorization": f"Bearer {router_token}"},
+                )
+                if (
+                    r.status_code != 200
+                    or r.headers.get("content-type", "").find("json") == -1
+                ):
+                    op_lock.release(OpKind.MIGRATION)
+                    return jsonify(
+                        ok=False,
+                        error="Router API token is invalid or expired. "
+                        "Go to the Backups tab, scroll to the rclone.conf section, "
+                        "and set a valid router_api_token in the backup config "
+                        '(POST /api/config with {"router_api_token": "..."}). '
+                        "You can generate a token from the OpenHost dashboard "
+                        "under Settings > API Tokens.",
+                    ), 400
+        except Exception:
+            pass  # Network issue; let the migration try anyway
+    else:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error="No router API token configured. The backup app needs a "
+            "token to access the local router API during migration. "
+            "Set one via the backup config: POST /api/config with "
+            '{"router_api_token": "YOUR_TOKEN"}. You can generate '
+            "a token from the OpenHost dashboard under Settings > API Tokens.",
+        ), 400
+
     asyncio.create_task(
         migration.run_direct_push(
             target_url=target_url,

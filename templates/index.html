@@ -228,6 +228,27 @@
          ============================================================ -->
     <div id="page-migrate" class="page">
 
+        {% if not config.get("router_api_token") %}
+        <section style="background:#fef3c7;border-color:#f59e0b;">
+            <h2 style="color:#92400e;">Router API Token Required</h2>
+            <p class="info" style="color:#92400e;">
+                The backup app needs a <strong>router API token</strong> to access the
+                local router during migration. Without it, migration will fail.
+            </p>
+            <p class="info" style="color:#92400e;">
+                <strong>To set it up:</strong> Go to the OpenHost dashboard &rarr;
+                Settings &rarr; API Tokens, generate a new token, then paste it below
+                and click Save.
+            </p>
+            <label>Router API Token</label>
+            <input type="password" id="router-token-input" placeholder="Paste your router API token here">
+            <div class="btn-row" style="margin-top:8px;">
+                <button class="btn-primary" onclick="saveRouterToken()">Save</button>
+            </div>
+            <div id="router-token-msg"></div>
+        </section>
+        {% endif %}
+
         <section>
             <h2>Migrate to another instance</h2>
             <p class="info">
@@ -292,6 +313,21 @@
         let selectedSnapshot = null;
         let selectedBackupId = null;
         let browseMode = null;
+
+        /* ================================================================
+           Router token setup
+           ================================================================ */
+
+        async function saveRouterToken() {
+            const token = document.getElementById("router-token-input").value.trim();
+            if (!token) { showMsg("router-token-msg", "Enter a token", false); return; }
+            const res = await api("/api/config", { method: "POST", body: { router_api_token: token } });
+            if (res.ok) {
+                showMsg("router-token-msg", "Saved! Reload the page to continue.", true);
+            } else {
+                showMsg("router-token-msg", "Error: " + (res.error || "unknown"), false);
+            }
+        }
 
         /* ================================================================
            Tab navigation
