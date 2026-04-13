@@ -983,15 +983,15 @@ async def receive_start():
     return jsonify(**result), code
 
 
-@route("/api/migration/receive/app/<app_name>", methods=["POST"])
-async def receive_app(app_name):
-    """Receive a tar.gz stream of an app's data."""
-    if not migration.validate_name(app_name):
-        return jsonify(ok=False, error="Invalid app name"), 400
+@route("/api/migration/receive/data", methods=["POST"])
+async def receive_data():
+    """Receive a tar.gz stream of all app data."""
+    import io as _io
+
     tar_data = await request.get_data()
     if not tar_data:
         return jsonify(ok=False, error="Empty request body"), 400
-    result = await migration.receive_app_data(app_name, tar_data, ALL_APP_DATA)
+    result = await migration.receive_all_data(_io.BytesIO(tar_data), ALL_APP_DATA)
     code = 200 if result.get("ok") else 400
     return jsonify(**result), code
 
