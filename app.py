@@ -17,8 +17,9 @@ logger = logging.getLogger(__name__)
 logger.info("backup app module loaded")
 
 app = Quart(__name__)
-# Allow large request bodies for migration data transfers (default is 16MB)
-app.config["MAX_CONTENT_LENGTH"] = None
+# Allow large request bodies for migration data transfers.
+# Set to 10GB to effectively disable the limit.
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10 GB
 
 # ---------------------------------------------------------------------------
 # Paths & configuration
