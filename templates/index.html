@@ -250,6 +250,21 @@
         {% endif %}
 
         <section>
+            <h2>Pre-migration tools</h2>
+            <p class="info">
+                Before migrating, stop all apps and fix file ownership so the
+                destination instance can read the data correctly.
+            </p>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <button class="btn-primary" id="btn-stop-all" onclick="stopAllApps()">Stop all apps</button>
+                <button class="btn-primary" id="btn-chown" onclick="chownAppData()" disabled>Fix file ownership (chown)</button>
+            </div>
+            <div id="apps-status-list" style="font-size:0.85rem;color:#555;margin-bottom:8px;"></div>
+            <div id="premig-msg"></div>
+        </section>
+
+        <section>
             <h2>Migrate to another instance</h2>
             <p class="info">
                 Move all your apps and data to another OpenHost instance.
@@ -330,6 +345,76 @@
         }
 
         /* ================================================================
+           Pre-migration: stop apps & chown
+           ================================================================ */
+
+        async function refreshAppsStatus() {
+            const res = await api("/api/apps-status");
+            const listEl = document.getElementById("apps-status-list");
+            const chownBtn = document.getElementById("btn-chown");
+            if (!res.ok) {
+                listEl.textContent = "Could not load app status: " + (res.error || "unknown");
+                chownBtn.disabled = true;
+                return;
+            }
+            const apps = res.apps || {};
+            const names = Object.keys(apps).filter(n => n !== "backup");
+            if (names.length === 0) {
+                listEl.textContent = "No apps deployed (besides backup).";
+                chownBtn.disabled = false;
+                return;
+            }
+            const lines = names.map(n => {
+                const s = apps[n].status || "unknown";
+                const color = s === "running" ? "#16a34a" : s === "stopped" ? "#6b7280" : "#d97706";
+                return `<span style="color:${color};font-weight:600;">${n}</span>: ${s}`;
+            });
+            listEl.innerHTML = lines.join(" &nbsp;&middot;&nbsp; ");
+            const allStopped = names.every(n => apps[n].status === "stopped" || apps[n].status === "error");
+            chownBtn.disabled = !allStopped;
+        }
+
+        async function stopAllApps() {
+            const btn = document.getElementById("btn-stop-all");
+            btn.disabled = true;
+            btn.textContent = "Stopping...";
+            const res = await api("/api/stop-all-apps", { method: "POST" });
+            btn.disabled = false;
+            btn.textContent = "Stop all apps";
+            if (res.ok) {
+                const stopped = res.stopped || [];
+                showMsg("premig-msg", stopped.length > 0
+                    ? "Stopped: " + stopped.join(", ")
+                    : "No apps were running.", true);
+            } else {
+                showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
+            }
+            await refreshAppsStatus();
+        }
+
+        async function chownAppData() {
+            const btn = document.getElementById("btn-chown");
+            btn.disabled = true;
+            btn.textContent = "Fixing ownership...";
+            const res = await api("/api/chown-app-data", { method: "POST" });
+            btn.disabled = false;
+            btn.textContent = "Fix file ownership (chown)";
+            if (res.ok) {
+                showMsg("premig-msg", res.message || "Ownership fixed.", true);
+            } else {
+                showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
+            }
+        }
+
+        // Refresh app status when migrate tab is shown
+        (function() {
+            const origShowPage = window.showPage;
+            window.addEventListener("hashchange", () => {
+                if (location.hash === "#migrate") refreshAppsStatus();
+            });
+        })();
+
+        /* ================================================================
            Tab navigation
            ================================================================ */
 
@@ -346,12 +431,16 @@
                 }
             });
             location.hash = name;
+            if (name === 'migrate') refreshAppsStatus();
         }
 
         // Restore tab from URL hash on load
         (function() {
             const hash = location.hash.replace('#', '');
-            if (hash === 'migrate') showPage('migrate');
+            if (hash === 'migrate') {
+                showPage('migrate');
+                refreshAppsStatus();
+            }
         })();
 
         /* ================================================================

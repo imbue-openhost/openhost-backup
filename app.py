@@ -850,6 +850,143 @@ async def rename_backup():
 
 
 # ---------------------------------------------------------------------------
+# App management & chown routes (pre-migration helpers)
+# ---------------------------------------------------------------------------
+
+
+async def _get_router_apps(router_token: str) -> dict:
+    """Fetch app list from the local router.  Raises on failure."""
+    import httpx
+
+    async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        r = await client.get(
+            f"{ROUTER_URL}/api/apps",
+            headers={"Authorization": f"Bearer {router_token}"},
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Router returned {r.status_code}")
+        return r.json()
+
+
+@route("/api/apps-status")
+async def apps_status():
+    """Return the status of all apps from the local router."""
+    router_token = _extract_bearer_token() or get_router_api_token()
+    if not router_token:
+        return jsonify(ok=False, error="No router API token configured"), 400
+    try:
+        apps = await _get_router_apps(router_token)
+        return jsonify(ok=True, apps=apps)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/stop-all-apps", methods=["POST"])
+async def stop_all_apps():
+    """Stop all running apps except the backup app."""
+    router_token = _extract_bearer_token() or get_router_api_token()
+    if not router_token:
+        return jsonify(ok=False, error="No router API token configured"), 400
+    try:
+        import httpx
+
+        apps = await _get_router_apps(router_token)
+        stopped = []
+        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+            for app_name, info in apps.items():
+                if app_name == "backup":
+                    continue
+                if info.get("status") in ("running", "building", "starting"):
+                    try:
+                        sr = await client.post(
+                            f"{ROUTER_URL}/stop_app/{app_name}",
+                            headers={"Authorization": f"Bearer {router_token}"},
+                        )
+                        if sr.status_code == 200:
+                            stopped.append(app_name)
+                        else:
+                            logger.warning(
+                                "Failed to stop %s: HTTP %s", app_name, sr.status_code
+                            )
+                    except Exception as e:
+                        logger.warning("Failed to stop %s: %s", app_name, e)
+        return jsonify(ok=True, stopped=stopped)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/chown-app-data", methods=["POST"])
+async def chown_app_data():
+    """Recursively chown all app_data to match the host user.
+
+    Only allowed when all non-backup apps are stopped, to prevent
+    ownership changes on files being actively written.
+    """
+    router_token = _extract_bearer_token() or get_router_api_token()
+    if not router_token:
+        return jsonify(ok=False, error="No router API token configured"), 400
+
+    # Check that all non-backup apps are stopped
+    try:
+        apps = await _get_router_apps(router_token)
+        running = [
+            name
+            for name, info in apps.items()
+            if name != "backup"
+            and info.get("status") in ("running", "building", "starting")
+        ]
+        if running:
+            return jsonify(
+                ok=False,
+                error=f"Apps still running: {', '.join(running)}. "
+                "Stop all apps before fixing ownership.",
+            ), 400
+    except Exception as e:
+        return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
+
+    # Run chown on the entire app_data directory.
+    # We hardcode uid/gid 1000 (the default host user) because inside the
+    # Docker container the parent directory is owned by root, so the
+    # auto-detect logic in _fix_permissions would chown to root.
+    if not ALL_APP_DATA.is_dir():
+        return jsonify(
+            ok=False, error=f"app_data directory not found: {ALL_APP_DATA}"
+        ), 404
+
+    import stat
+
+    target_uid = 1000
+    target_gid = 1000
+    app_data = str(ALL_APP_DATA)
+    logger.info("chown -R %s:%s %s", target_uid, target_gid, app_data)
+
+    count = 0
+    errors = 0
+    for root, dirs, files in os.walk(app_data):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            try:
+                os.chown(path, target_uid, target_gid)
+                count += 1
+            except OSError as e:
+                errors += 1
+                logger.warning("chown failed for %s: %s", path, e)
+    try:
+        os.chown(app_data, target_uid, target_gid)
+        count += 1
+    except OSError:
+        errors += 1
+
+    logger.info("chown complete: %d items fixed, %d errors", count, errors)
+    return jsonify(
+        ok=True,
+        message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid})",
+        count=count,
+        errors=errors,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Migration routes
 # ---------------------------------------------------------------------------
 

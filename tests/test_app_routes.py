@@ -192,6 +192,103 @@ class TestReceiveFinalizeEndpoint:
         assert backup_app.op_lock.active is None
 
 
+class TestAppsStatusEndpoint:
+    """Tests for GET /api/apps-status."""
+
+    @patch("app._get_router_apps")
+    async def test_returns_apps(self, mock_get, client):
+        mock_get.return_value = {
+            "secrets": {"status": "running"},
+            "backup": {"status": "running"},
+        }
+        # Need a router token
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        response = await client.get("/api/apps-status")
+        data = await response.get_json()
+        assert data["ok"] is True
+        assert "secrets" in data["apps"]
+        backup_app.ROUTER_API_TOKEN = ""
+
+    async def test_no_token_returns_400(self, client):
+        backup_app.ROUTER_API_TOKEN = ""
+        response = await client.get("/api/apps-status")
+        assert response.status_code == 400
+
+
+class TestStopAllAppsEndpoint:
+    """Tests for POST /api/stop-all-apps."""
+
+    @patch("app._get_router_apps")
+    async def test_stops_running_apps(self, mock_get, client):
+        mock_get.return_value = {
+            "secrets": {"status": "running"},
+            "backup": {"status": "running"},
+            "agent": {"status": "stopped"},
+        }
+
+        # Mock the httpx module used inside the function
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post("/api/stop-all-apps")
+        data = await response.get_json()
+        assert data["ok"] is True
+        assert "secrets" in data["stopped"]
+        assert "backup" not in data["stopped"]  # backup is never stopped
+        assert "agent" not in data["stopped"]  # already stopped
+        backup_app.ROUTER_API_TOKEN = ""
+
+
+class TestChownAppDataEndpoint:
+    """Tests for POST /api/chown-app-data."""
+
+    @patch("os.chown")
+    @patch("app._get_router_apps")
+    async def test_chown_when_all_stopped(self, mock_get, mock_chown, client):
+        mock_get.return_value = {
+            "secrets": {"status": "stopped"},
+            "backup": {"status": "running"},
+        }
+        # Create a test file so os.walk has something to iterate
+        (backup_app.ALL_APP_DATA / "testapp").mkdir(exist_ok=True)
+        (backup_app.ALL_APP_DATA / "testapp" / "data.db").touch()
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        response = await client.post("/api/chown-app-data")
+        data = await response.get_json()
+        assert data["ok"] is True
+        assert data["count"] > 0
+        # Verify chown was called with uid=1000, gid=1000
+        for call_args in mock_chown.call_args_list:
+            assert call_args[0][1] == 1000  # uid
+            assert call_args[0][2] == 1000  # gid
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("app._get_router_apps")
+    async def test_chown_rejected_when_apps_running(self, mock_get, client):
+        mock_get.return_value = {
+            "secrets": {"status": "running"},
+            "backup": {"status": "running"},
+        }
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        response = await client.post("/api/chown-app-data")
+        assert response.status_code == 400
+        data = await response.get_json()
+        assert "still running" in data["error"]
+        backup_app.ROUTER_API_TOKEN = ""
+
+    async def test_chown_no_token_returns_400(self, client):
+        backup_app.ROUTER_API_TOKEN = ""
+        response = await client.post("/api/chown-app-data")
+        assert response.status_code == 400
+
+
 class TestHealthEndpoint:
     async def test_health(self, client):
         response = await client.get("/health")
