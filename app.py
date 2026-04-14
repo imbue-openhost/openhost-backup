@@ -850,6 +850,113 @@ async def rename_backup():
 
 
 # ---------------------------------------------------------------------------
+# App management & chown routes (pre-migration helpers)
+# ---------------------------------------------------------------------------
+
+
+async def _get_router_apps(router_token: str) -> dict:
+    """Fetch app list from the local router.  Raises on failure."""
+    import httpx
+
+    async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        r = await client.get(
+            f"{ROUTER_URL}/api/apps",
+            headers={"Authorization": f"Bearer {router_token}"},
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Router returned {r.status_code}")
+        return r.json()
+
+
+@route("/api/apps-status")
+async def apps_status():
+    """Return the status of all apps from the local router."""
+    router_token = _extract_bearer_token() or get_router_api_token()
+    if not router_token:
+        return jsonify(ok=False, error="No router API token configured"), 400
+    try:
+        apps = await _get_router_apps(router_token)
+        return jsonify(ok=True, apps=apps)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/stop-all-apps", methods=["POST"])
+async def stop_all_apps():
+    """Stop all running apps except the backup app."""
+    router_token = _extract_bearer_token() or get_router_api_token()
+    if not router_token:
+        return jsonify(ok=False, error="No router API token configured"), 400
+    try:
+        import httpx
+
+        apps = await _get_router_apps(router_token)
+        stopped = []
+        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+            for app_name, info in apps.items():
+                if app_name == "backup":
+                    continue
+                if info.get("status") in ("running", "building", "starting"):
+                    try:
+                        sr = await client.post(
+                            f"{ROUTER_URL}/stop_app/{app_name}",
+                            headers={"Authorization": f"Bearer {router_token}"},
+                        )
+                        if sr.status_code == 200:
+                            stopped.append(app_name)
+                        else:
+                            logger.warning(
+                                "Failed to stop %s: HTTP %s", app_name, sr.status_code
+                            )
+                    except Exception as e:
+                        logger.warning("Failed to stop %s: %s", app_name, e)
+        return jsonify(ok=True, stopped=stopped)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/chown-app-data", methods=["POST"])
+async def chown_app_data():
+    """Recursively chown all app_data to match the host user.
+
+    Only allowed when all non-backup apps are stopped, to prevent
+    ownership changes on files being actively written.
+    """
+    router_token = _extract_bearer_token() or get_router_api_token()
+    if not router_token:
+        return jsonify(ok=False, error="No router API token configured"), 400
+
+    # Check that all non-backup apps are stopped
+    try:
+        apps = await _get_router_apps(router_token)
+        running = [
+            name
+            for name, info in apps.items()
+            if name != "backup"
+            and info.get("status") in ("running", "building", "starting")
+        ]
+        if running:
+            return jsonify(
+                ok=False,
+                error=f"Apps still running: {', '.join(running)}. "
+                "Stop all apps before fixing ownership.",
+            ), 400
+    except Exception as e:
+        return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
+
+    # Run chown on the entire app_data directory using the existing helper
+    if not ALL_APP_DATA.is_dir():
+        return jsonify(
+            ok=False, error=f"app_data directory not found: {ALL_APP_DATA}"
+        ), 404
+
+    logger.info("Fixing ownership on %s", ALL_APP_DATA)
+    migration._fix_permissions(ALL_APP_DATA)
+
+    return jsonify(ok=True, message=f"Ownership fixed on {ALL_APP_DATA}")
+
+
+# ---------------------------------------------------------------------------
 # Migration routes
 # ---------------------------------------------------------------------------
 
