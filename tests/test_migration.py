@@ -31,6 +31,7 @@ from migration import (
     _streaming_tar_generator,
     _tar_stream_sync,
     receive_all_data,
+    receive_all_data_from_file,
     receive_finalize,
     receive_start,
     run_direct_push,
@@ -1318,3 +1319,59 @@ class TestReceiveStart:
         }
         await receive_start(manifest, tmp_app_data)
         assert any("test-source.example.com" in entry for entry in migration.log)
+
+
+# ---------------------------------------------------------------------------
+# receive_all_data_from_file tests
+# ---------------------------------------------------------------------------
+
+
+class TestReceiveAllDataFromFile:
+    """Tests for file-based tar extraction (avoids loading into memory)."""
+
+    def _make_tar_file(self, tmp_path: Path, contents: dict[str, bytes]) -> str:
+        """Create a tar.gz file on disk and return its path."""
+        tar_path = str(tmp_path / "test.tar.gz")
+        with tarfile.open(tar_path, mode="w:gz") as tar:
+            for name, data in contents.items():
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return tar_path
+
+    async def test_extracts_apps_from_file(self, tmp_path):
+        dest = tmp_path / "app_data"
+        dest.mkdir()
+        tar_path = self._make_tar_file(
+            tmp_path,
+            {
+                "myapp/data.db": b"db content",
+                "secrets/sqlite/main.db": b"secret",
+            },
+        )
+        result = await receive_all_data_from_file(tar_path, dest)
+        assert result["ok"] is True
+        assert "myapp" in result["apps"]
+        assert "secrets" in result["apps"]
+        assert (dest / "myapp" / "data.db").exists()
+        assert (dest / "secrets" / "sqlite" / "main.db").exists()
+
+    async def test_blocks_path_traversal(self, tmp_path):
+        dest = tmp_path / "app_data"
+        dest.mkdir()
+        tar_path = self._make_tar_file(
+            tmp_path,
+            {"../evil/hack.txt": b"bad"},
+        )
+        result = await receive_all_data_from_file(tar_path, dest)
+        assert result["ok"] is True
+        # The evil path should have been filtered out
+        assert not (tmp_path / "evil").exists()
+
+    async def test_corrupt_file_returns_error(self, tmp_path):
+        dest = tmp_path / "app_data"
+        dest.mkdir()
+        bad_path = str(tmp_path / "bad.tar.gz")
+        Path(bad_path).write_bytes(b"not a tar file")
+        result = await receive_all_data_from_file(bad_path, dest)
+        assert result["ok"] is False
