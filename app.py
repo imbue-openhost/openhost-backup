@@ -997,6 +997,23 @@ async def receive_app(app_name):
     return jsonify(**result), code
 
 
+@route("/api/migration/receive/chunk/<app_name>", methods=["POST"])
+async def receive_chunk(app_name):
+    """Receive one chunk of a large app's tar.gz data."""
+    if not migration.validate_name(app_name):
+        return jsonify(ok=False, error="Invalid app name"), 400
+    chunk_data = await request.get_data()
+    if not chunk_data:
+        return jsonify(ok=False, error="Empty chunk"), 400
+    chunk_index = int(request.headers.get("X-Chunk-Index", "0"))
+    is_final = request.headers.get("X-Chunk-Final", "0") == "1"
+    result = await migration.receive_chunk(
+        app_name, chunk_data, chunk_index, is_final, ALL_APP_DATA
+    )
+    code = 200 if result.get("ok") else 400
+    return jsonify(**result), code
+
+
 @route("/api/migration/receive/data", methods=["POST"])
 async def receive_data():
     """Receive a tar.gz stream of all app data.

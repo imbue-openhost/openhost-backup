@@ -956,14 +956,14 @@ class TestRunDirectPush:
 
         assert result is True
 
-        # Verify all three endpoints were called
+        # Verify per-app endpoints were called (start, per-app uploads, finalize)
         assert any("/receive/start" in u for u in posted_urls)
-        assert any("/receive/data" in u for u in posted_urls)
+        assert any("/receive/app/" in u for u in posted_urls)
         assert any("/receive/finalize" in u for u in posted_urls)
 
-        # Verify order: start < data < finalize
+        # Verify order: start < app uploads < finalize
         start_idx = next(i for i, u in enumerate(posted_urls) if "/receive/start" in u)
-        data_idx = next(i for i, u in enumerate(posted_urls) if "/receive/data" in u)
+        data_idx = next(i for i, u in enumerate(posted_urls) if "/receive/app/" in u)
         finalize_idx = next(
             i for i, u in enumerate(posted_urls) if "/receive/finalize" in u
         )

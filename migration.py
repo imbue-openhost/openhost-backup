@@ -504,78 +504,167 @@ async def run_direct_push(
         accepted_apps = start_resp.get("accepted_apps", app_names)
         _log(f"Target accepted {len(accepted_apps)} apps: {', '.join(accepted_apps)}")
 
-        # 3. Stream all app data as a single tar.gz
-        _log("Streaming app data to target...")
-        status = {"phase": "streaming_data", "progress": 15}
-
-        # Write tar to a temp file on disk, then upload.
-        # We avoid both in-memory buffering (OOM) and chunked transfer
-        # encoding (which some reverse proxies don't handle well).
+        # 3. Send each app's data as a tar.gz via per-app endpoint.
+        # Each app is tarred to a temp file on disk (avoids OOM), then
+        # uploaded.  The OpenHost reverse proxy has a 16 MB body limit,
+        # so large apps are split into multiple chunks.
         import tempfile
 
-        _log("Creating tar archive on disk...")
-        tmp = tempfile.NamedTemporaryFile(
-            dir=str(all_app_data.parent), suffix=".tar.gz", delete=False
-        )
-        tmp.close()
-        try:
+        CHUNK_LIMIT = 14 * 1024 * 1024  # 14 MB (under 16 MB proxy limit)
+        status = {"phase": "streaming_data", "progress": 15}
+        total = len(accepted_apps)
 
-            def _write_tar():
-                with tarfile.open(tmp.name, mode="w:gz") as tar:
-                    for app_name in accepted_apps:
-                        app_dir = all_app_data / app_name
-                        if app_dir.exists():
-                            logger.info("tar: adding %s", app_name)
-                            tar.add(str(app_dir), arcname=app_name)
-                            logger.info("tar: finished %s", app_name)
-                return os.path.getsize(tmp.name)
+        for i, app_name in enumerate(accepted_apps):
+            app_dir = all_app_data / app_name
+            if not app_dir.exists():
+                _log(f"Skipping {app_name}: no local data directory")
+                continue
 
-            tar_size = await asyncio.to_thread(_write_tar)
-            size_mb = tar_size / (1024 * 1024)
-            _log(f"Tar archive created: {size_mb:.1f} MB")
+            _log(f"Compressing {app_name}...")
+            status = {
+                "phase": "streaming_data",
+                "progress": 15 + int(65 * i / total),
+                "current_app": app_name,
+            }
 
-            _log("Uploading to target...")
+            tmp = tempfile.NamedTemporaryFile(
+                dir=str(all_app_data.parent), suffix=".tar.gz", delete=False
+            )
+            tmp.close()
+            try:
 
-            # Stream the file to the target with Content-Length set,
-            # avoiding chunked transfer encoding.
-            async def _file_stream():
-                loop = asyncio.get_running_loop()
-                with open(tmp.name, "rb") as f:
-                    while True:
-                        chunk = await loop.run_in_executor(None, f.read, 256 * 1024)
-                        if not chunk:
-                            break
-                        yield chunk
+                def _write_app_tar(adir=app_dir, tpath=tmp.name):
+                    with tarfile.open(tpath, mode="w:gz") as tar:
+                        tar.add(str(adir), arcname=".")
+                    return os.path.getsize(tpath)
 
-            async with httpx.AsyncClient(
-                verify=not skip_verify,
-                timeout=httpx.Timeout(connect=30, read=600, write=600, pool=60),
-            ) as client:
-                r = await client.post(
-                    f"{target_backup_url}/api/migration/receive/data",
-                    content=_file_stream(),
-                    headers={
-                        "Authorization": f"Bearer {target_token}",
-                        "Content-Type": "application/gzip",
-                        "Content-Length": str(tar_size),
-                    },
-                )
+                tar_size = await asyncio.to_thread(_write_app_tar)
+                size_mb = tar_size / (1024 * 1024)
+                _log(f"  {app_name}: {size_mb:.1f} MB compressed")
+
+                if tar_size <= CHUNK_LIMIT:
+                    # Small enough to send in one request
+                    with open(tmp.name, "rb") as f:
+                        tar_bytes = f.read()
+                    async with httpx.AsyncClient(
+                        verify=not skip_verify, timeout=120
+                    ) as client:
+                        r = await client.post(
+                            f"{target_backup_url}/api/migration/receive/app/{app_name}",
+                            content=tar_bytes,
+                            headers={
+                                "Authorization": f"Bearer {target_token}",
+                                "Content-Type": "application/gzip",
+                            },
+                        )
+                else:
+                    # Too large -- send in chunks via the chunked endpoint
+                    num_chunks = (tar_size + CHUNK_LIMIT - 1) // CHUNK_LIMIT
+                    _log(f"  {app_name}: splitting into {num_chunks} chunks")
+                    with open(tmp.name, "rb") as f:
+                        chunk_idx = 0
+                        while True:
+                            chunk_data = f.read(CHUNK_LIMIT)
+                            if not chunk_data:
+                                break
+                            is_last = f.read(1) == b""
+                            if not is_last:
+                                f.seek(-1, 1)
+                            async with httpx.AsyncClient(
+                                verify=not skip_verify, timeout=120
+                            ) as client:
+                                r = await client.post(
+                                    f"{target_backup_url}/api/migration/receive/chunk/{app_name}",
+                                    content=chunk_data,
+                                    headers={
+                                        "Authorization": f"Bearer {target_token}",
+                                        "Content-Type": "application/octet-stream",
+                                        "X-Chunk-Index": str(chunk_idx),
+                                        "X-Chunk-Final": "1" if is_last else "0",
+                                    },
+                                )
+                                if r.status_code != 200:
+                                    break
+                            chunk_idx += 1
+
                 if r.status_code != 200:
                     body = r.text[:500]
-                    raise RuntimeError(
-                        f"Target rejected data (HTTP {r.status_code}): {body}"
+                    _log(
+                        f"  WARNING: target rejected {app_name} "
+                        f"(HTTP {r.status_code}): {body}"
                     )
-                data_resp = r.json()
-                if not data_resp.get("ok"):
-                    raise RuntimeError(
-                        f"Target rejected data: {data_resp.get('error', 'unknown')}"
-                    )
-                _log(f"Data transfer complete: {data_resp.get('message', 'ok')}")
-        finally:
+                else:
+                    resp = r.json()
+                    if resp.get("ok"):
+                        _log(f"  {app_name}: received by target")
+                    else:
+                        _log(f"  WARNING: {app_name}: {resp.get('error', 'unknown')}")
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+            status = {
+                "phase": "streaming_data",
+                "progress": 15 + int(65 * (i + 1) / total),
+                "current_app": app_name,
+            }
+
+            tmp = tempfile.NamedTemporaryFile(
+                dir=str(all_app_data.parent), suffix=".tar.gz", delete=False
+            )
+            tmp.close()
             try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
+
+                def _write_app_tar(adir=app_dir, tpath=tmp.name):
+                    with tarfile.open(tpath, mode="w:gz") as tar:
+                        tar.add(str(adir), arcname=".")
+                    return os.path.getsize(tpath)
+
+                tar_size = await asyncio.to_thread(_write_app_tar)
+                size_mb = tar_size / (1024 * 1024)
+                _log(f"  {app_name}: {size_mb:.1f} MB, uploading...")
+
+                with open(tmp.name, "rb") as f:
+                    tar_bytes = f.read()
+
+                async with httpx.AsyncClient(
+                    verify=not skip_verify, timeout=600
+                ) as client:
+                    r = await client.post(
+                        f"{target_backup_url}/api/migration/receive/app/{app_name}",
+                        content=tar_bytes,
+                        headers={
+                            "Authorization": f"Bearer {target_token}",
+                            "Content-Type": "application/gzip",
+                        },
+                    )
+                    if r.status_code != 200:
+                        body = r.text[:500]
+                        _log(
+                            f"  WARNING: target rejected {app_name} "
+                            f"(HTTP {r.status_code}): {body}"
+                        )
+                    else:
+                        resp = r.json()
+                        if resp.get("ok"):
+                            _log(f"  {app_name}: received by target")
+                        else:
+                            _log(
+                                f"  WARNING: {app_name}: {resp.get('error', 'unknown')}"
+                            )
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+            status = {
+                "phase": "streaming_data",
+                "progress": 15 + int(65 * (i + 1) / total),
+                "current_app": app_name,
+            }
 
         status = {"phase": "streaming_data", "progress": 80}
 
@@ -624,6 +713,87 @@ async def run_direct_push(
 # ---------------------------------------------------------------------------
 # These are called by the *source* instance during a direct push.
 # They are thin enough to live here; the route wiring is in app.py.
+
+
+# Per-app chunk reassembly state.  Keys are app names, values are
+# open file objects that accumulate chunks until the final chunk arrives.
+_chunk_files: dict[str, str] = {}
+
+
+async def receive_chunk(
+    app_name: str,
+    chunk_data: bytes,
+    chunk_index: int,
+    is_final: bool,
+    all_app_data: Path,
+) -> dict:
+    """Receive one chunk of a large app's tar.gz and reassemble on disk.
+
+    Chunks are written to a temp file.  When the final chunk arrives,
+    the assembled tar.gz is extracted like a normal per-app upload.
+    """
+    if not validate_name(app_name):
+        return {"ok": False, "error": "Invalid app name"}
+
+    import tempfile
+
+    if chunk_index == 0:
+        # Start a new temp file for this app
+        tmp = tempfile.NamedTemporaryFile(
+            dir=str(all_app_data.parent), suffix=".tar.gz", delete=False
+        )
+        _chunk_files[app_name] = tmp.name
+        tmp.close()
+
+    tmp_path = _chunk_files.get(app_name)
+    if not tmp_path:
+        return {"ok": False, "error": f"No chunked upload in progress for {app_name}"}
+
+    # Append chunk data
+    def _append():
+        with open(tmp_path, "ab") as f:
+            f.write(chunk_data)
+
+    await asyncio.to_thread(_append)
+    _log(
+        f"Receive: chunk {chunk_index} for {app_name} "
+        f"({len(chunk_data) / (1024 * 1024):.1f} MB, final={is_final})"
+    )
+
+    if not is_final:
+        return {"ok": True, "message": f"Chunk {chunk_index} received"}
+
+    # Final chunk -- extract the assembled tar.gz
+    try:
+        target_dir = all_app_data / app_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        def _extract():
+            with tarfile.open(tmp_path, mode="r:gz") as tar:
+
+                def _migration_filter(member, dest_path):
+                    if ".." in member.name.split("/"):
+                        return None
+                    if member.name.startswith("/"):
+                        return None
+                    return member
+
+                tar.extractall(path=str(target_dir), filter=_migration_filter)
+
+        await asyncio.to_thread(_extract)
+        await asyncio.to_thread(_fix_permissions, target_dir)
+        size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB from chunks)")
+        return {"ok": True}
+    except Exception as e:
+        _log(f"Receive: failed to extract {app_name} from chunks: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        _chunk_files.pop(app_name, None)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 async def receive_start(
