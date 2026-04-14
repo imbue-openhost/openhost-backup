@@ -998,15 +998,41 @@ async def receive_app(app_name):
 
 @route("/api/migration/receive/data", methods=["POST"])
 async def receive_data():
-    """Receive a tar.gz stream of all app data."""
-    import io as _io
+    """Receive a tar.gz stream of all app data.
 
-    tar_data = await request.get_data()
-    if not tar_data:
-        return jsonify(ok=False, error="Empty request body"), 400
-    result = await migration.receive_all_data(_io.BytesIO(tar_data), ALL_APP_DATA)
-    code = 200 if result.get("ok") else 400
-    return jsonify(**result), code
+    Streams the request body to a temp file to avoid buffering the
+    entire archive in memory, then extracts from the file.
+    """
+    import tempfile as _tempfile
+
+    # Stream request body to a temp file instead of buffering in memory.
+    # Quart's request.get_data() would load everything into RAM; for
+    # multi-GB archives that OOMs the container.
+    tmp = _tempfile.NamedTemporaryFile(
+        dir=str(APP_DATA_DIR), suffix=".tar.gz", delete=False
+    )
+    try:
+        total = 0
+        async for chunk in request.body:
+            tmp.write(chunk)
+            total += len(chunk)
+        tmp.close()
+
+        if total == 0:
+            os.unlink(tmp.name)
+            return jsonify(ok=False, error="Empty request body"), 400
+
+        result = await migration.receive_all_data_from_file(tmp.name, ALL_APP_DATA)
+        code = 200 if result.get("ok") else 400
+        return jsonify(**result), code
+    except Exception as e:
+        logger.exception("receive_data failed")
+        return jsonify(ok=False, error=str(e)), 500
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 @route("/api/migration/receive/finalize", methods=["POST"])

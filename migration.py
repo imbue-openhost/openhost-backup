@@ -796,6 +796,58 @@ async def receive_all_data(
         return {"ok": False, "error": str(e)}
 
 
+async def receive_all_data_from_file(
+    tar_path: str,
+    all_app_data: Path,
+) -> dict:
+    """Extract a tar.gz file containing all app data directories.
+
+    Like ``receive_all_data`` but reads from a file on disk instead of
+    a memory buffer.  This avoids loading the entire archive into RAM.
+    """
+
+    def _extract() -> list[str]:
+        extracted_apps: set[str] = set()
+        with tarfile.open(tar_path, mode="r:gz") as tar:
+
+            def _migration_filter(member, dest_path):
+                if ".." in member.name.split("/"):
+                    return None
+                if member.name.startswith("/"):
+                    return None
+                top = member.name.split("/")[0]
+                if not validate_name(top):
+                    return None
+                extracted_apps.add(top)
+                return member
+
+            tar.extractall(path=str(all_app_data), filter=_migration_filter)
+        return sorted(extracted_apps)
+
+    try:
+        file_size = os.path.getsize(tar_path)
+        extracted = await asyncio.to_thread(_extract)
+        size_mb = file_size / (1024 * 1024)
+
+        for app_name in extracted:
+            app_dir = all_app_data / app_name
+            if app_dir.exists():
+                await asyncio.to_thread(_fix_permissions, app_dir)
+
+        _log(
+            f"Receive: extracted {len(extracted)} apps "
+            f"({size_mb:.1f} MB compressed): {', '.join(extracted)}"
+        )
+        return {
+            "ok": True,
+            "message": f"Extracted {len(extracted)} apps",
+            "apps": extracted,
+        }
+    except Exception as e:
+        _log(f"Receive: failed to extract data: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 async def receive_finalize(
     manifest: dict,
     router_url: str,
