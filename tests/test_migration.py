@@ -855,6 +855,86 @@ class TestReceiveFinalize:
         assert result["results"][0]["action"] == "deployed"
         assert any("file_browser" in u for u in deployed_urls)
 
+    async def test_falls_back_to_builtin_when_repo_url_deploy_fails(self):
+        """If repo_url deploy fails, should fall back to builtin path.
+
+        Built-in apps from the source may have a repo_url (e.g. a git URL
+        that's no longer accessible). If deploying from that URL fails on the
+        target, the finalize should fall back to deploying from the
+        destination's local builtin apps directory.
+        """
+        manifest = {
+            "apps": [
+                {
+                    "name": "file-browser",
+                    "status": "running",
+                    "repo_url": "https://github.com/org/file-browser.git",
+                },
+            ]
+        }
+
+        deployed_urls = []
+        call_count = {"add_app": 0}
+
+        async def mock_post(path, data=None, token=None, base_url=""):
+            if "/reload_app/" in path:
+                raise Exception("not found")
+            if "/api/add_app" in path and data:
+                call_count["add_app"] += 1
+                url = data.get("repo_url", "")
+                # First attempt: repo_url from source fails
+                if url == "https://github.com/org/file-browser.git":
+                    raise Exception("clone failed")
+                # Builtin fallback with hyphens fails
+                if "file-browser" in url and "file://" in url:
+                    raise Exception("not found")
+                # Builtin fallback with underscores succeeds
+                deployed_urls.append(url)
+                return {"ok": True}
+            return {"ok": True}
+
+        with patch("migration._router_post", side_effect=mock_post):
+            result = await receive_finalize(
+                manifest,
+                "http://localhost:8080",
+                "token",
+                repo_urls={"file-browser": "https://github.com/org/file-browser.git"},
+            )
+
+        assert result["ok"] is True
+        assert result["results"][0]["action"] == "deployed"
+        assert any("file_browser" in u for u in deployed_urls)
+
+    async def test_repo_url_failure_without_builtin_records_data_only(self):
+        """If repo_url deploy fails and builtin also fails, should be data_only."""
+        manifest = {
+            "apps": [
+                {
+                    "name": "custom-app",
+                    "status": "running",
+                    "repo_url": "https://github.com/org/custom-app.git",
+                },
+            ]
+        }
+
+        async def mock_post(path, data=None, token=None, base_url=""):
+            if "/reload_app/" in path:
+                raise Exception("not found")
+            if "/api/add_app" in path:
+                raise Exception("deploy failed")
+            return {"ok": True}
+
+        with patch("migration._router_post", side_effect=mock_post):
+            result = await receive_finalize(
+                manifest,
+                "http://localhost:8080",
+                "token",
+                repo_urls={"custom-app": "https://github.com/org/custom-app.git"},
+            )
+
+        assert result["ok"] is True
+        assert result["results"][0]["action"] == "data_only"
+
     async def test_skips_backup_app(self):
         """The 'backup' app should be skipped."""
         manifest = {
@@ -916,7 +996,12 @@ class TestReceiveFinalize:
         assert migration._receive_stopped_apps == []
 
     async def test_all_failed_returns_not_ok(self):
-        """If all apps fail, result should have ok=False."""
+        """If all apps fail reload and deploy, result should have all data_only.
+
+        When both repo_url deploy and builtin fallback fail, apps are marked
+        as data_only. Since none truly deployed, the result is still ok=True
+        (data_only is not a hard failure -- data was received successfully).
+        """
         manifest = {
             "apps": [
                 {
@@ -938,7 +1023,10 @@ class TestReceiveFinalize:
         with patch("migration._router_post", side_effect=mock_post):
             result = await receive_finalize(manifest, "http://localhost:8080", "token")
 
-        assert result["ok"] is False
+        # All apps ended up as data_only since both repo_url and builtin failed
+        assert all(r["action"] == "data_only" for r in result["results"])
+        # data_only is not a hard failure — data was received
+        assert result["ok"] is True
 
 
 # ---------------------------------------------------------------------------

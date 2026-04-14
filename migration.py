@@ -1058,6 +1058,7 @@ async def receive_finalize(
         # Prefer the authenticated URL from repo_urls (direct push) over
         # the stripped URL in the manifest.
         repo_url = (repo_urls or {}).get(app_name) or app_info.get("repo_url")
+        deployed = False
         if repo_url:
             try:
                 await _router_post(
@@ -1077,15 +1078,16 @@ async def receive_finalize(
                         "should_start": should_start,
                     }
                 )
+                deployed = True
             except Exception as e:
-                _log(f"Receive: could not deploy {app_name}: {e}")
-                results.append({"name": app_name, "action": "failed", "error": str(e)})
-        else:
-            # No repo_url -- try deploying as a builtin app from the
-            # destination's local apps directory.  Builtin app directories
-            # use underscores (e.g. ``file_browser``) while app names use
-            # hyphens (e.g. ``file-browser``), so we try both variants.
-            builtin_deployed = False
+                _log(f"Receive: could not deploy {app_name} from repo_url: {e}")
+
+        if not deployed:
+            # No repo_url or repo_url deploy failed -- try deploying as a
+            # builtin app from the destination's local apps directory.
+            # Builtin app directories use underscores (e.g. ``file_browser``)
+            # while app names use hyphens (e.g. ``file-browser``), so we try
+            # both variants.
             for dir_name in (app_name, app_name.replace("-", "_")):
                 builtin_url = f"file:///home/host/openhost/apps/{dir_name}"
                 try:
@@ -1103,14 +1105,14 @@ async def receive_finalize(
                             "should_start": should_start,
                         }
                     )
-                    builtin_deployed = True
+                    deployed = True
                     break
                 except Exception:
                     continue
-            if not builtin_deployed:
+            if not deployed:
                 _log(
-                    f"Receive: {app_name} data received but no repo_url "
-                    f"and not available as builtin"
+                    f"Receive: {app_name} data received but could not deploy "
+                    f"(no working repo_url and not available as builtin)"
                 )
                 results.append({"name": app_name, "action": "data_only"})
 
