@@ -248,18 +248,26 @@ class TestStopAllAppsEndpoint:
 class TestChownAppDataEndpoint:
     """Tests for POST /api/chown-app-data."""
 
-    @patch("app.migration._fix_permissions")
+    @patch("os.chown")
     @patch("app._get_router_apps")
-    async def test_chown_when_all_stopped(self, mock_get, mock_fix, client):
+    async def test_chown_when_all_stopped(self, mock_get, mock_chown, client):
         mock_get.return_value = {
             "secrets": {"status": "stopped"},
             "backup": {"status": "running"},
         }
+        # Create a test file so os.walk has something to iterate
+        (backup_app.ALL_APP_DATA / "testapp").mkdir(exist_ok=True)
+        (backup_app.ALL_APP_DATA / "testapp" / "data.db").touch()
+
         backup_app.ROUTER_API_TOKEN = "test-token"
         response = await client.post("/api/chown-app-data")
         data = await response.get_json()
         assert data["ok"] is True
-        mock_fix.assert_called_once()
+        assert data["count"] > 0
+        # Verify chown was called with uid=1000, gid=1000
+        for call_args in mock_chown.call_args_list:
+            assert call_args[0][1] == 1000  # uid
+            assert call_args[0][2] == 1000  # gid
         backup_app.ROUTER_API_TOKEN = ""
 
     @patch("app._get_router_apps")

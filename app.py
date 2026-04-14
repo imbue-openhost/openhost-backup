@@ -944,16 +944,46 @@ async def chown_app_data():
     except Exception as e:
         return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
 
-    # Run chown on the entire app_data directory using the existing helper
+    # Run chown on the entire app_data directory.
+    # We hardcode uid/gid 1000 (the default host user) because inside the
+    # Docker container the parent directory is owned by root, so the
+    # auto-detect logic in _fix_permissions would chown to root.
     if not ALL_APP_DATA.is_dir():
         return jsonify(
             ok=False, error=f"app_data directory not found: {ALL_APP_DATA}"
         ), 404
 
-    logger.info("Fixing ownership on %s", ALL_APP_DATA)
-    migration._fix_permissions(ALL_APP_DATA)
+    import stat
 
-    return jsonify(ok=True, message=f"Ownership fixed on {ALL_APP_DATA}")
+    target_uid = 1000
+    target_gid = 1000
+    app_data = str(ALL_APP_DATA)
+    logger.info("chown -R %s:%s %s", target_uid, target_gid, app_data)
+
+    count = 0
+    errors = 0
+    for root, dirs, files in os.walk(app_data):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            try:
+                os.chown(path, target_uid, target_gid)
+                count += 1
+            except OSError as e:
+                errors += 1
+                logger.warning("chown failed for %s: %s", path, e)
+    try:
+        os.chown(app_data, target_uid, target_gid)
+        count += 1
+    except OSError:
+        errors += 1
+
+    logger.info("chown complete: %d items fixed, %d errors", count, errors)
+    return jsonify(
+        ok=True,
+        message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid})",
+        count=count,
+        errors=errors,
+    )
 
 
 # ---------------------------------------------------------------------------
