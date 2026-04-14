@@ -1054,7 +1054,7 @@ async def trigger_direct_push():
                         "and set a valid router_api_token in the backup config "
                         '(POST /api/config with {"router_api_token": "..."}). '
                         "You can generate a token from the OpenHost dashboard "
-                        "under Settings > API Tokens.",
+                        "under API Tokens.",
                     ), 400
         except Exception:
             pass  # Network issue; let the migration try anyway
@@ -1066,7 +1066,7 @@ async def trigger_direct_push():
             "token to access the local router API during migration. "
             "Set one via the backup config: POST /api/config with "
             '{"router_api_token": "YOUR_TOKEN"}. You can generate '
-            "a token from the OpenHost dashboard under Settings > API Tokens.",
+            "a token from the OpenHost dashboard under API Tokens.",
         ), 400
 
     asyncio.create_task(
