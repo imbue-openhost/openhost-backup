@@ -611,61 +611,6 @@ async def run_direct_push(
                 "current_app": app_name,
             }
 
-            tmp = tempfile.NamedTemporaryFile(
-                dir=str(all_app_data.parent), suffix=".tar.gz", delete=False
-            )
-            tmp.close()
-            try:
-
-                def _write_app_tar(adir=app_dir, tpath=tmp.name):
-                    with tarfile.open(tpath, mode="w:gz") as tar:
-                        tar.add(str(adir), arcname=".")
-                    return os.path.getsize(tpath)
-
-                tar_size = await asyncio.to_thread(_write_app_tar)
-                size_mb = tar_size / (1024 * 1024)
-                _log(f"  {app_name}: {size_mb:.1f} MB, uploading...")
-
-                with open(tmp.name, "rb") as f:
-                    tar_bytes = f.read()
-
-                async with httpx.AsyncClient(
-                    verify=not skip_verify, timeout=600
-                ) as client:
-                    r = await client.post(
-                        f"{target_backup_url}/api/migration/receive/app/{app_name}",
-                        content=tar_bytes,
-                        headers={
-                            "Authorization": f"Bearer {target_token}",
-                            "Content-Type": "application/gzip",
-                        },
-                    )
-                    if r.status_code != 200:
-                        body = r.text[:500]
-                        _log(
-                            f"  WARNING: target rejected {app_name} "
-                            f"(HTTP {r.status_code}): {body}"
-                        )
-                    else:
-                        resp = r.json()
-                        if resp.get("ok"):
-                            _log(f"  {app_name}: received by target")
-                        else:
-                            _log(
-                                f"  WARNING: {app_name}: {resp.get('error', 'unknown')}"
-                            )
-            finally:
-                try:
-                    os.unlink(tmp.name)
-                except OSError:
-                    pass
-
-            status = {
-                "phase": "streaming_data",
-                "progress": 15 + int(65 * (i + 1) / total),
-                "current_app": app_name,
-            }
-
         status = {"phase": "streaming_data", "progress": 80}
 
         # 4. Tell target to finalize (deploy/restart apps)
