@@ -390,10 +390,14 @@ def _tar_stream_sync(
                 for app_name in accepted_apps:
                     app_dir = all_app_data / app_name
                     if app_dir.exists():
+                        logger.info("tar: adding %s", app_name)
                         tar.add(str(app_dir), arcname=app_name)
+                        logger.info("tar: finished %s", app_name)
+        logger.info("tar: stream complete")
     except BrokenPipeError:
-        # Reader closed early (e.g. target rejected the stream).
-        pass
+        logger.warning("tar: broken pipe (reader closed early)")
+    except Exception:
+        logger.exception("tar: error writing stream")
 
 
 async def _streaming_tar_generator(
@@ -504,15 +508,21 @@ async def run_direct_push(
         _log("Streaming app data to target...")
         status = {"phase": "streaming_data", "progress": 15}
 
+        _log("Starting tar stream...")
         queue = await _streaming_tar_generator(all_app_data, accepted_apps)
+        bytes_sent = 0
 
         async def _body_stream():
+            nonlocal bytes_sent
             while True:
                 chunk = await queue.get()
                 if chunk is None:
                     break
+                bytes_sent += len(chunk)
                 yield chunk
+            _log(f"Tar stream complete: {bytes_sent / (1024 * 1024):.1f} MB sent")
 
+        _log("Uploading to target...")
         async with httpx.AsyncClient(
             verify=not skip_verify,
             timeout=httpx.Timeout(connect=30, read=600, write=600, pool=60),
