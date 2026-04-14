@@ -1081,8 +1081,38 @@ async def receive_finalize(
                 _log(f"Receive: could not deploy {app_name}: {e}")
                 results.append({"name": app_name, "action": "failed", "error": str(e)})
         else:
-            _log(f"Receive: {app_name} data received but no repo_url to deploy from")
-            results.append({"name": app_name, "action": "data_only"})
+            # No repo_url -- try deploying as a builtin app from the
+            # destination's local apps directory.  Builtin app directories
+            # use underscores (e.g. ``file_browser``) while app names use
+            # hyphens (e.g. ``file-browser``), so we try both variants.
+            builtin_deployed = False
+            for dir_name in (app_name, app_name.replace("-", "_")):
+                builtin_url = f"file:///home/host/openhost/apps/{dir_name}"
+                try:
+                    await _router_post(
+                        "/api/add_app",
+                        data={"repo_url": builtin_url, "app_name": app_name},
+                        token=router_token,
+                        base_url=router_url,
+                    )
+                    _log(f"Receive: deployed {app_name} from builtin ({dir_name})")
+                    results.append(
+                        {
+                            "name": app_name,
+                            "action": "deployed",
+                            "should_start": should_start,
+                        }
+                    )
+                    builtin_deployed = True
+                    break
+                except Exception:
+                    continue
+            if not builtin_deployed:
+                _log(
+                    f"Receive: {app_name} data received but no repo_url "
+                    f"and not available as builtin"
+                )
+                results.append({"name": app_name, "action": "data_only"})
 
     # --- Restart non-migrated apps that were stopped during receive_start ---
     global _receive_stopped_apps

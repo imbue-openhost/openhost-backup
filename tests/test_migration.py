@@ -790,6 +790,9 @@ class TestReceiveFinalize:
         async def mock_post(path, data=None, token=None, base_url=""):
             if "/reload_app/" in path:
                 raise Exception("not found")
+            if "/api/add_app" in path:
+                # Reject both builtin attempts (dataapp is not a real builtin)
+                raise Exception("not found")
             return {"ok": True}
 
         with patch("migration._router_post", side_effect=mock_post):
@@ -797,6 +800,60 @@ class TestReceiveFinalize:
 
         assert result["ok"] is True
         assert result["results"][0]["action"] == "data_only"
+
+    async def test_deploys_builtin_app_when_no_repo_url(self):
+        """Apps without repo_url should be deployed from builtin path."""
+        manifest = {
+            "apps": [
+                {"name": "secrets", "status": "running", "repo_url": None},
+            ]
+        }
+
+        deployed_urls = []
+
+        async def mock_post(path, data=None, token=None, base_url=""):
+            if "/reload_app/" in path:
+                raise Exception("not found")
+            if "/api/add_app" in path and data:
+                deployed_urls.append(data.get("repo_url", ""))
+                return {"ok": True}
+            return {"ok": True}
+
+        with patch("migration._router_post", side_effect=mock_post):
+            result = await receive_finalize(manifest, "http://localhost:8080", "token")
+
+        assert result["ok"] is True
+        assert result["results"][0]["action"] == "deployed"
+        assert any("file://" in u and "secrets" in u for u in deployed_urls)
+
+    async def test_builtin_tries_underscore_variant(self):
+        """file-browser should try file_browser directory name."""
+        manifest = {
+            "apps": [
+                {"name": "file-browser", "status": "running", "repo_url": None},
+            ]
+        }
+
+        deployed_urls = []
+
+        async def mock_post(path, data=None, token=None, base_url=""):
+            if "/reload_app/" in path:
+                raise Exception("not found")
+            if "/api/add_app" in path and data:
+                url = data.get("repo_url", "")
+                # First attempt with hyphens fails, underscore succeeds
+                if "file-browser" in url:
+                    raise Exception("not found")
+                deployed_urls.append(url)
+                return {"ok": True}
+            return {"ok": True}
+
+        with patch("migration._router_post", side_effect=mock_post):
+            result = await receive_finalize(manifest, "http://localhost:8080", "token")
+
+        assert result["ok"] is True
+        assert result["results"][0]["action"] == "deployed"
+        assert any("file_browser" in u for u in deployed_urls)
 
     async def test_skips_backup_app(self):
         """The 'backup' app should be skipped."""
