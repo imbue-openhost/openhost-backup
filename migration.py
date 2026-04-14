@@ -508,44 +508,74 @@ async def run_direct_push(
         _log("Streaming app data to target...")
         status = {"phase": "streaming_data", "progress": 15}
 
-        _log("Starting tar stream...")
-        queue = await _streaming_tar_generator(all_app_data, accepted_apps)
-        bytes_sent = 0
+        # Write tar to a temp file on disk, then upload.
+        # We avoid both in-memory buffering (OOM) and chunked transfer
+        # encoding (which some reverse proxies don't handle well).
+        import tempfile
 
-        async def _body_stream():
-            nonlocal bytes_sent
-            while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
-                bytes_sent += len(chunk)
-                yield chunk
-            _log(f"Tar stream complete: {bytes_sent / (1024 * 1024):.1f} MB sent")
+        _log("Creating tar archive on disk...")
+        tmp = tempfile.NamedTemporaryFile(
+            dir=str(all_app_data.parent), suffix=".tar.gz", delete=False
+        )
+        tmp.close()
+        try:
 
-        _log("Uploading to target...")
-        async with httpx.AsyncClient(
-            verify=not skip_verify,
-            timeout=httpx.Timeout(connect=30, read=600, write=600, pool=60),
-        ) as client:
-            r = await client.post(
-                f"{target_backup_url}/api/migration/receive/data",
-                content=_body_stream(),
-                headers={
-                    "Authorization": f"Bearer {target_token}",
-                    "Content-Type": "application/gzip",
-                },
-            )
-            if r.status_code != 200:
-                body = r.text[:500]
-                raise RuntimeError(
-                    f"Target rejected data stream (HTTP {r.status_code}): {body}"
+            def _write_tar():
+                with tarfile.open(tmp.name, mode="w:gz") as tar:
+                    for app_name in accepted_apps:
+                        app_dir = all_app_data / app_name
+                        if app_dir.exists():
+                            logger.info("tar: adding %s", app_name)
+                            tar.add(str(app_dir), arcname=app_name)
+                            logger.info("tar: finished %s", app_name)
+                return os.path.getsize(tmp.name)
+
+            tar_size = await asyncio.to_thread(_write_tar)
+            size_mb = tar_size / (1024 * 1024)
+            _log(f"Tar archive created: {size_mb:.1f} MB")
+
+            _log("Uploading to target...")
+
+            # Stream the file to the target with Content-Length set,
+            # avoiding chunked transfer encoding.
+            async def _file_stream():
+                loop = asyncio.get_running_loop()
+                with open(tmp.name, "rb") as f:
+                    while True:
+                        chunk = await loop.run_in_executor(None, f.read, 256 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+
+            async with httpx.AsyncClient(
+                verify=not skip_verify,
+                timeout=httpx.Timeout(connect=30, read=600, write=600, pool=60),
+            ) as client:
+                r = await client.post(
+                    f"{target_backup_url}/api/migration/receive/data",
+                    content=_file_stream(),
+                    headers={
+                        "Authorization": f"Bearer {target_token}",
+                        "Content-Type": "application/gzip",
+                        "Content-Length": str(tar_size),
+                    },
                 )
-            data_resp = r.json()
-            if not data_resp.get("ok"):
-                raise RuntimeError(
-                    f"Target rejected data: {data_resp.get('error', 'unknown')}"
-                )
-            _log(f"Data transfer complete: {data_resp.get('message', 'ok')}")
+                if r.status_code != 200:
+                    body = r.text[:500]
+                    raise RuntimeError(
+                        f"Target rejected data (HTTP {r.status_code}): {body}"
+                    )
+                data_resp = r.json()
+                if not data_resp.get("ok"):
+                    raise RuntimeError(
+                        f"Target rejected data: {data_resp.get('error', 'unknown')}"
+                    )
+                _log(f"Data transfer complete: {data_resp.get('message', 'ok')}")
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
         status = {"phase": "streaming_data", "progress": 80}
 
