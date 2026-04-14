@@ -676,6 +676,48 @@ async def receive_start(
     }
 
 
+async def receive_app_data(
+    app_name: str,
+    tar_data: bytes,
+    all_app_data: Path,
+) -> dict:
+    """Receive and extract a tar.gz of a single app's data directory.
+
+    Backward-compatible endpoint for old source instances that send
+    per-app tar archives instead of a single combined archive.
+    """
+    if not validate_name(app_name):
+        return {"ok": False, "error": "Invalid app name"}
+
+    target_dir = all_app_data / app_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    def _extract():
+        buf = io.BytesIO(tar_data)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+
+            def _migration_filter(member, dest_path):
+                # Block path traversal
+                if ".." in member.name.split("/"):
+                    return None
+                # Block absolute paths in member names
+                if member.name.startswith("/"):
+                    return None
+                return member
+
+            tar.extractall(path=str(target_dir), filter=_migration_filter)
+
+    try:
+        await asyncio.to_thread(_extract)
+        await asyncio.to_thread(_fix_permissions, target_dir)
+        size_mb = len(tar_data) / (1024 * 1024)
+        _log(f"Receive: extracted {app_name} ({size_mb:.1f} MB compressed)")
+        return {"ok": True}
+    except Exception as e:
+        _log(f"Receive: failed to extract {app_name}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 async def receive_all_data(
     tar_stream: asyncio.StreamReader | io.BytesIO,
     all_app_data: Path,
