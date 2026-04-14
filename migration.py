@@ -570,8 +570,10 @@ async def run_direct_push(
         return True
 
     except Exception as e:
-        _log(f"Direct push failed: {e}")
-        status = {"phase": "error", "progress": 0, "error": str(e)}
+        error_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        _log(f"Direct push failed: {error_detail}")
+        logger.exception("Direct push migration failed")
+        status = {"phase": "error", "progress": 0, "error": error_detail}
         return False
     finally:
         lock.release(OpKind.MIGRATION)
