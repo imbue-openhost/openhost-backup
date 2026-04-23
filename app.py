@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import secrets as pysecrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,19 +39,22 @@ ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 ROUTER_API_TOKEN = os.environ.get("OPENHOST_ROUTER_API_TOKEN", "")
 
 CONFIG_DIR = APP_DATA_DIR
-RCLONE_CONF = CONFIG_DIR / "rclone.conf"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DB_FILE = CONFIG_DIR / "backups.db"
-LOCAL_SNAPSHOTS_DIR = APP_DATA_DIR / "snapshots"
-
-DEFAULT_REMOTE_NAME = "local-backup"
-DEFAULT_REMOTE_PATH = str(LOCAL_SNAPSHOTS_DIR)
+# Restic repository lives inside the backup app's data dir by default. This
+# path is excluded from backups (see `--exclude` in run_backup).
+RESTIC_REPO_DIR = APP_DATA_DIR / "restic-repo"
 
 DEFAULT_CONFIG = {
     "interval_seconds": 3600,
-    "remote_name": DEFAULT_REMOTE_NAME,
-    "remote_path": DEFAULT_REMOTE_PATH,
+    "repo": str(RESTIC_REPO_DIR),
+    # Password for the restic repo. Generated on first boot if missing.
+    "repo_password": "",
 }
+
+# Snapshot IDs are hex strings; restic emits 8-char short IDs and 64-char long
+# ones. Accept either (plus anything in between) for validation on API input.
+SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 # Single lock for mutual exclusion across backup / restore / migration.
 op_lock = OperationLock()
@@ -59,7 +63,14 @@ op_lock = OperationLock()
 restore_last_snapshot = None
 restore_last_status = None
 
+# Most recent `restic check` result, surfaced via /api/check/status.
+check_last_status = None
+check_last_output = None
+check_last_at = None
+check_running = False
+
 scheduler_task = None
+
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -78,19 +89,25 @@ def init_db():
             status TEXT NOT NULL,
             error_message TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-            size_bytes INTEGER,
+            snapshot_id TEXT,
+            data_added_bytes INTEGER,
+            total_size_bytes INTEGER,
             file_count INTEGER,
             name TEXT
         )
     """)
+    # Incremental schema upgrades (for installs where the old table existed).
     cursor = conn.execute("PRAGMA table_info(backups)")
     columns = {row[1] for row in cursor.fetchall()}
-    if "size_bytes" not in columns:
-        conn.execute("ALTER TABLE backups ADD COLUMN size_bytes INTEGER")
-    if "file_count" not in columns:
-        conn.execute("ALTER TABLE backups ADD COLUMN file_count INTEGER")
-    if "name" not in columns:
-        conn.execute("ALTER TABLE backups ADD COLUMN name TEXT")
+    for col, ddl in [
+        ("snapshot_id", "ALTER TABLE backups ADD COLUMN snapshot_id TEXT"),
+        ("data_added_bytes", "ALTER TABLE backups ADD COLUMN data_added_bytes INTEGER"),
+        ("total_size_bytes", "ALTER TABLE backups ADD COLUMN total_size_bytes INTEGER"),
+        ("file_count", "ALTER TABLE backups ADD COLUMN file_count INTEGER"),
+        ("name", "ALTER TABLE backups ADD COLUMN name TEXT"),
+    ]:
+        if col not in columns:
+            conn.execute(ddl)
     conn.commit()
     conn.close()
 
@@ -101,14 +118,32 @@ def get_db():
 
 
 def record_backup(
-    timestamp, status, error_message=None, size_bytes=None, file_count=None, name=None
+    timestamp,
+    status,
+    error_message=None,
+    snapshot_id=None,
+    data_added_bytes=None,
+    total_size_bytes=None,
+    file_count=None,
+    name=None,
 ):
     """Insert a backup record into the database."""
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO backups (timestamp, status, error_message, size_bytes, file_count, name) VALUES (?, ?, ?, ?, ?, ?)",
-            (timestamp, status, error_message, size_bytes, file_count, name),
+            "INSERT INTO backups (timestamp, status, error_message, snapshot_id, "
+            "data_added_bytes, total_size_bytes, file_count, name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                timestamp,
+                status,
+                error_message,
+                snapshot_id,
+                data_added_bytes,
+                total_size_bytes,
+                file_count,
+                name,
+            ),
         )
         conn.commit()
     finally:
@@ -146,6 +181,11 @@ def save_config(conf):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(conf, f, indent=2)
+    # The password lives in this file so restrict perms.
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def get_router_api_token():
@@ -168,26 +208,73 @@ def _extract_bearer_token() -> str | None:
     return None
 
 
-def load_rclone_conf():
-    if RCLONE_CONF.exists():
-        return RCLONE_CONF.read_text()
-    return ""
+# ---------------------------------------------------------------------------
+# Restic helpers
+# ---------------------------------------------------------------------------
 
 
-def save_rclone_conf(text):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    RCLONE_CONF.write_text(text)
+def _restic_env(conf: dict) -> dict:
+    """Environment for invoking the restic binary with repo + password set."""
+    env = os.environ.copy()
+    env["RESTIC_REPOSITORY"] = conf["repo"]
+    env["RESTIC_PASSWORD"] = conf.get("repo_password", "")
+    # Suppress progress output in unattended runs; JSON flag gives structured
+    # output where we need it.
+    env["RESTIC_PROGRESS_FPS"] = "0"
+    return env
 
 
-def generate_s3_conf(remote_name, bucket, access_key, secret_key, region):
-    return (
-        f"[{remote_name}]\n"
-        f"type = s3\n"
-        f"provider = AWS\n"
-        f"access_key_id = {access_key}\n"
-        f"secret_access_key = {secret_key}\n"
-        f"region = {region}\n"
+async def _run_restic(args: list[str], conf: dict, timeout: float | None = None):
+    """Run `restic <args>` with configured repo, return (returncode, stdout, stderr)."""
+    env = _restic_env(conf)
+    proc = await asyncio.create_subprocess_exec(
+        "restic",
+        *args,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode, stdout, stderr
+
+
+async def ensure_repo_initialized(conf: dict) -> tuple[bool, str | None]:
+    """Ensure the restic repo exists; run `restic init` if not.
+
+    Returns (initialized_now, error_message).
+    """
+    # `cat config` is a cheap way to confirm the repo exists and the password
+    # is correct. It returns non-zero on either missing repo or wrong password.
+    rc, _stdout, stderr = await _run_restic(["cat", "config"], conf, timeout=30)
+    if rc == 0:
+        return False, None
+
+    err = stderr.decode(errors="replace").strip()
+    # If the repo simply doesn't exist, init it. Heuristic on the error text;
+    # restic doesn't expose a clean "not found" exit code.
+    if "does not exist" in err.lower() or "unable to open config" in err.lower() or "no such file" in err.lower():
+        # Local repo path: make sure parent exists.
+        repo = conf["repo"]
+        if not repo.startswith(("s3:", "b2:", "sftp:", "rest:", "gs:", "azure:", "swift:", "rclone:")):
+            Path(repo).parent.mkdir(parents=True, exist_ok=True)
+        rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
+        if rc2 != 0:
+            return False, f"restic init failed: {err2.decode(errors='replace').strip()}"
+        return True, None
+    return False, f"restic repo check failed: {err}"
+
+
+async def _restic_unlock_if_stale(conf: dict) -> None:
+    """Best-effort remove a stale repo lock at startup."""
+    try:
+        await _run_restic(["unlock"], conf, timeout=30)
+    except Exception:
+        logger.warning("restic unlock failed on startup", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +282,7 @@ def generate_s3_conf(remote_name, bucket, access_key, secret_key, region):
 # ---------------------------------------------------------------------------
 
 
-async def run_backup(name=None):
+async def run_backup(name: str | None = None) -> bool:
     err = op_lock.try_acquire(OpKind.BACKUP)
     if err:
         logger.warning("Skipping backup: %s", err)
@@ -203,70 +290,101 @@ async def run_backup(name=None):
 
     try:
         conf = load_config()
-        remote_name = conf["remote_name"]
-        remote_path = conf["remote_path"]
     except Exception:
         logger.exception("Failed to load backup config")
         op_lock.release(OpKind.BACKUP)
         return False
 
-    if not RCLONE_CONF.exists():
-        logger.error("No rclone.conf configured, skipping backup")
-        op_lock.release(OpKind.BACKUP)
-        return False
-
-    if not remote_name or not remote_path:
-        logger.error("Remote name or path not configured, skipping backup")
+    if not conf.get("repo") or not conf.get("repo_password"):
+        logger.error("Restic repo or password not configured, skipping backup")
         op_lock.release(OpKind.BACKUP)
         return False
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    dest = f"{remote_name}:{remote_path}/{timestamp}"
-    logger.info("Starting backup to %s", dest)
+    logger.info("Starting restic backup to %s", conf["repo"])
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "rclone",
-            "copy",
-            str(ALL_APP_DATA),
-            dest,
-            "--config",
-            str(RCLONE_CONF),
-            "--exclude",
-            "backup/**",
-            "-v",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        if stdout:
-            for line in stdout.decode().splitlines():
-                logger.info("rclone: %s", line)
+        init_err = (await ensure_repo_initialized(conf))[1]
+        if init_err:
+            record_backup(timestamp, "error", init_err, name=name)
+            logger.error("Backup failed: %s", init_err)
+            return False
 
-        if proc.returncode == 0:
-            size_bytes = file_count = None
-            try:
-                size_info = await get_snapshot_size(timestamp)
-                size_bytes = size_info["bytes"]
-                file_count = size_info["count"]
-            except Exception:
-                logger.warning("Could not get backup size, recording without it")
+        tags = ["openhost"]
+        if name:
+            tags.append(f"name:{name}")
+
+        args = [
+            "backup",
+            str(ALL_APP_DATA),
+            "--exclude",
+            str(ALL_APP_DATA / "backup"),
+            "--json",
+        ]
+        for t in tags:
+            args += ["--tag", t]
+
+        env = _restic_env(conf)
+        proc = await asyncio.create_subprocess_exec(
+            "restic",
+            *args,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        summary = None
+        if stdout:
+            # Restic emits NDJSON to stdout with --json; the last `summary`
+            # message contains the snapshot ID and byte counts.
+            for raw in stdout.decode(errors="replace").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.info("restic: %s", raw)
+                    continue
+                if msg.get("message_type") == "summary":
+                    summary = msg
+
+        if stderr:
+            for line in stderr.decode(errors="replace").splitlines():
+                if line.strip():
+                    logger.info("restic stderr: %s", line)
+
+        if proc.returncode == 0 and summary is not None:
             record_backup(
                 timestamp,
                 "success",
-                size_bytes=size_bytes,
-                file_count=file_count,
+                snapshot_id=summary.get("snapshot_id"),
+                data_added_bytes=summary.get("data_added"),
+                total_size_bytes=summary.get("total_bytes_processed"),
+                file_count=summary.get("total_files_processed"),
                 name=name,
             )
-            logger.info("Backup completed successfully")
+            logger.info(
+                "Backup completed: snapshot=%s data_added=%s total=%s",
+                summary.get("snapshot_id", "?"),
+                summary.get("data_added", "?"),
+                summary.get("total_bytes_processed", "?"),
+            )
             return True
-        else:
-            error_msg = f"rclone exit code {proc.returncode}"
-            record_backup(timestamp, "error", error_msg)
-            logger.error("Backup failed with exit code %d", proc.returncode)
-            return False
+
+        if proc.returncode == 0:
+            # Succeeded but we somehow missed the summary line.
+            record_backup(timestamp, "success", name=name)
+            logger.info("Backup completed (no summary parsed)")
+            return True
+
+        error_msg = stderr.decode(errors="replace").strip() or f"restic exit code {proc.returncode}"
+        record_backup(timestamp, "error", error_msg, name=name)
+        logger.error("Backup failed: %s", error_msg)
+        return False
     except Exception as e:
-        record_backup(timestamp, "error", str(e))
+        record_backup(timestamp, "error", str(e), name=name)
         logger.exception("Backup failed")
         return False
     finally:
@@ -277,49 +395,44 @@ async def run_backup(name=None):
 # Snapshot helpers
 # ---------------------------------------------------------------------------
 
-SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
 
+async def list_snapshots() -> tuple[list[dict], bool]:
+    """Return (snapshots, repo_ok).
 
-async def list_snapshots():
+    Each snapshot entry has: {id, short_id, time, paths, tags, hostname}.
+    """
     conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
-    if not RCLONE_CONF.exists() or not remote_name or not remote_path:
+    if not conf.get("repo") or not conf.get("repo_password"):
         return [], False
-
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "rclone",
-            "lsjson",
-            f"{remote_name}:{remote_path}",
-            "--config",
-            str(RCLONE_CONF),
-            "--dirs-only",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        rc, stdout, stderr = await _run_restic(
+            ["snapshots", "--json"], conf, timeout=60
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.error("Failed to list snapshots: %s", stderr.decode())
+        if rc != 0:
+            logger.error("restic snapshots failed: %s", stderr.decode(errors="replace").strip())
             return [], False
-
-        entries = json.loads(stdout.decode())
-        names = sorted(
-            [
-                e["Path"]
-                for e in entries
-                if e.get("IsDir") and e["Path"] != "migrations"
-            ],
-            reverse=True,
-        )
-        return names, True
+        entries = json.loads(stdout.decode() or "[]")
+        out = []
+        for e in entries:
+            out.append(
+                {
+                    "id": e.get("id", ""),
+                    "short_id": e.get("short_id", ""),
+                    "time": e.get("time", ""),
+                    "paths": e.get("paths", []),
+                    "tags": e.get("tags", []) or [],
+                    "hostname": e.get("hostname", ""),
+                }
+            )
+        # Newest first
+        out.sort(key=lambda x: x["time"], reverse=True)
+        return out, True
     except Exception:
         logger.exception("Failed to list snapshots")
         return [], False
 
 
-def validate_subpath(path):
+def validate_subpath(path: str) -> bool:
     if not path:
         return True
     for seg in path.split("/"):
@@ -330,108 +443,96 @@ def validate_subpath(path):
     return True
 
 
-async def get_snapshot_size(snapshot):
+async def list_snapshot_files(snapshot_id: str, subpath: str = ""):
+    """List files in a snapshot at the given subpath.
+
+    Returns (files, error). `subpath` is relative to ``ALL_APP_DATA``.
+    """
     conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
+    if not conf.get("repo") or not conf.get("repo_password"):
+        return [], "Restic repo not configured"
 
-    proc = await asyncio.create_subprocess_exec(
-        "rclone",
-        "size",
-        "--json",
-        f"{remote_name}:{remote_path}/{snapshot}",
-        "--config",
-        str(RCLONE_CONF),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"rclone size failed: {stderr.decode().strip()}")
-    data = json.loads(stdout.decode())
-    return {"bytes": data.get("bytes", 0), "count": data.get("count", 0)}
-
-
-async def list_snapshot_files(snapshot, subpath=""):
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
-    target = f"{remote_name}:{remote_path}/{snapshot}"
+    # `restic ls --json <id> <path>` emits NDJSON: one "snapshot" header then
+    # one "node" per entry. We want entries that are direct children of
+    # `target_path`.
+    target_path = str(ALL_APP_DATA)
     if subpath:
-        target += f"/{subpath}"
+        target_path = target_path.rstrip("/") + "/" + subpath
 
-    proc = await asyncio.create_subprocess_exec(
-        "rclone",
-        "lsjson",
-        target,
-        "--config",
-        str(RCLONE_CONF),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        err = stderr.decode().strip()
-        if "directory not found" in err or "not found" in err.lower():
-            return [], "Snapshot not found on remote"
-        return [], f"rclone error: {err}"
+    args = ["ls", "--json", snapshot_id, target_path]
+    try:
+        rc, stdout, stderr = await _run_restic(args, conf, timeout=120)
+    except Exception as e:
+        return [], f"restic error: {e}"
 
-    entries = json.loads(stdout.decode())
-    return [
-        {
-            "path": e["Path"],
-            "size": e.get("Size", 0),
-            "is_dir": e.get("IsDir", False),
-            "mod_time": e.get("ModTime", ""),
-        }
-        for e in entries
-    ], None
+    if rc != 0:
+        err = stderr.decode(errors="replace").strip()
+        if "not found" in err.lower() or "no matching" in err.lower():
+            return [], "Snapshot or path not found"
+        return [], f"restic error: {err}"
 
-
-async def delete_snapshot(snapshot):
-    conf = load_config()
-    remote_name = conf["remote_name"]
-    remote_path = conf["remote_path"]
-
-    remote_deleted = False
-    if RCLONE_CONF.exists() and remote_name and remote_path:
+    files: list[dict] = []
+    target_norm = target_path.rstrip("/")
+    for raw in stdout.decode(errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "rclone",
-                "purge",
-                f"{remote_name}:{remote_path}/{snapshot}",
-                "--config",
-                str(RCLONE_CONF),
-                "--contimeout",
-                "10s",
-                "--timeout",
-                "30s",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if msg.get("struct_type") != "node":
+            continue
+        path = msg.get("path", "")
+        # Only immediate children of target_path.
+        if not path.startswith(target_norm + "/"):
+            # Could also be an exact match of the target (the dir itself) — skip.
+            continue
+        rest = path[len(target_norm) + 1 :]
+        if "/" in rest:
+            continue  # nested deeper, not a direct child
+        files.append(
+            {
+                "path": rest,
+                "size": msg.get("size", 0) or 0,
+                "is_dir": msg.get("type") == "dir",
+                "mod_time": msg.get("mtime", ""),
+            }
+        )
+    return files, None
+
+
+async def delete_snapshot(snapshot_id: str) -> bool:
+    """Remove a snapshot. Runs `forget`; prune happens separately / later."""
+    conf = load_config()
+    if not conf.get("repo") or not conf.get("repo_password"):
+        return False
+    try:
+        rc, _out, stderr = await _run_restic(
+            ["forget", snapshot_id], conf, timeout=120
+        )
+        if rc != 0:
+            logger.warning(
+                "restic forget failed for %s: %s",
+                snapshot_id,
+                stderr.decode(errors="replace").strip(),
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
-            if proc.returncode == 0:
-                remote_deleted = True
-                logger.info("Deleted snapshot %s from remote", snapshot)
-            else:
-                err = stderr.decode().strip()
-                if "not found" in err.lower() or "directory not found" in err:
-                    remote_deleted = True
-                    logger.info("Snapshot %s already gone from remote", snapshot)
-                else:
-                    logger.warning("rclone purge failed for %s: %s", snapshot, err)
-        except asyncio.TimeoutError:
-            logger.warning("rclone purge timed out for %s", snapshot)
+            return False
+    except Exception:
+        logger.exception("restic forget failed")
+        return False
 
     conn = get_db()
     try:
-        conn.execute("DELETE FROM backups WHERE timestamp = ?", (snapshot,))
+        conn.execute(
+            "DELETE FROM backups WHERE snapshot_id = ? OR snapshot_id LIKE ?",
+            (snapshot_id, snapshot_id + "%"),
+        )
         conn.commit()
     finally:
         conn.close()
-    logger.info("Deleted DB record for snapshot %s", snapshot)
-    return remote_deleted
+    logger.info("Deleted snapshot %s", snapshot_id)
+    return True
 
 
 def get_backup_history(limit=20, offset=0):
@@ -439,7 +540,8 @@ def get_backup_history(limit=20, offset=0):
     try:
         total = conn.execute("SELECT COUNT(*) FROM backups").fetchone()[0]
         rows = conn.execute(
-            "SELECT id, timestamp, status, error_message, created_at, size_bytes, file_count, name "
+            "SELECT id, timestamp, status, error_message, created_at, snapshot_id, "
+            "data_added_bytes, total_size_bytes, file_count, name "
             "FROM backups ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
@@ -450,25 +552,15 @@ def get_backup_history(limit=20, offset=0):
                 "status": r[2],
                 "error_message": r[3],
                 "created_at": r[4],
-                "size_bytes": r[5],
-                "file_count": r[6],
-                "name": r[7],
+                "snapshot_id": r[5],
+                "data_added_bytes": r[6],
+                "total_size_bytes": r[7],
+                "file_count": r[8],
+                "name": r[9],
             }
             for r in rows
         ]
         return history, total
-    finally:
-        conn.close()
-
-
-def get_backup_sizes():
-    conn = get_db()
-    try:
-        rows = conn.execute(
-            "SELECT timestamp, size_bytes, file_count FROM backups "
-            "WHERE status = 'success' AND size_bytes IS NOT NULL"
-        ).fetchall()
-        return {r[0]: {"size_bytes": r[1], "file_count": r[2]} for r in rows}
     finally:
         conn.close()
 
@@ -478,7 +570,7 @@ def get_backup_sizes():
 # ---------------------------------------------------------------------------
 
 
-async def run_restore(snapshot):
+async def run_restore(snapshot_id: str) -> bool:
     global restore_last_snapshot, restore_last_status
 
     err = op_lock.try_acquire(OpKind.RESTORE)
@@ -488,57 +580,43 @@ async def run_restore(snapshot):
 
     try:
         conf = load_config()
-        remote_name = conf["remote_name"]
-        remote_path = conf["remote_path"]
     except Exception:
         logger.exception("Failed to load restore config")
         op_lock.release(OpKind.RESTORE)
         return False
 
-    if not RCLONE_CONF.exists():
-        restore_last_status = "error: no rclone.conf"
+    if not conf.get("repo") or not conf.get("repo_password"):
+        restore_last_status = "error: restic repo not configured"
         op_lock.release(OpKind.RESTORE)
         return False
 
-    if not remote_name or not remote_path:
-        restore_last_status = "error: remote not configured"
+    if not SNAPSHOT_ID_RE.match(snapshot_id):
+        restore_last_status = "error: invalid snapshot id"
         op_lock.release(OpKind.RESTORE)
         return False
 
-    if not SNAPSHOT_RE.match(snapshot):
-        restore_last_status = "error: invalid snapshot name"
-        op_lock.release(OpKind.RESTORE)
-        return False
-
-    src = f"{remote_name}:{remote_path}/{snapshot}"
-    logger.info("Starting restore from %s", src)
+    logger.info("Starting restic restore from %s", snapshot_id)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "rclone",
-            "copy",
-            src,
-            str(ALL_APP_DATA),
-            "--config",
-            str(RCLONE_CONF),
+        args = [
+            "restore",
+            snapshot_id,
+            "--target",
+            "/",  # restic restores the absolute paths as they were captured
             "--exclude",
-            "backup/**",
-            "-v",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate()
-        if stdout:
-            for line in stdout.decode().splitlines():
-                logger.info("rclone: %s", line)
+            str(ALL_APP_DATA / "backup"),
+        ]
+        rc, _stdout, stderr = await _run_restic(args, conf, timeout=None)
 
-        if proc.returncode == 0:
-            restore_last_snapshot = snapshot
+        if rc == 0:
+            restore_last_snapshot = snapshot_id
             restore_last_status = "success"
             logger.info("Restore completed successfully")
         else:
-            restore_last_status = f"error: rclone exit code {proc.returncode}"
-            logger.error("Restore failed with exit code %d", proc.returncode)
+            restore_last_status = (
+                f"error: {stderr.decode(errors='replace').strip() or f'restic exit {rc}'}"
+            )
+            logger.error("Restore failed: %s", restore_last_status)
     except Exception as e:
         restore_last_status = f"error: {e}"
         logger.exception("Restore failed")
@@ -546,6 +624,45 @@ async def run_restore(snapshot):
         op_lock.release(OpKind.RESTORE)
 
     return restore_last_status == "success"
+
+
+# ---------------------------------------------------------------------------
+# Check (repo integrity)
+# ---------------------------------------------------------------------------
+
+
+async def run_check() -> bool:
+    """Run `restic check`. Updates module-level state. Doesn't take op lock —
+    check is read-only; restic takes its own repo lock."""
+    global check_last_status, check_last_output, check_last_at, check_running
+    check_running = True
+    conf = load_config()
+    if not conf.get("repo") or not conf.get("repo_password"):
+        check_last_status = "error"
+        check_last_output = "Restic repo not configured"
+        check_last_at = datetime.now(timezone.utc).isoformat()
+        check_running = False
+        return False
+    try:
+        rc, stdout, stderr = await _run_restic(["check"], conf, timeout=None)
+        output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+        check_last_output = output[-4000:]  # cap
+        check_last_at = datetime.now(timezone.utc).isoformat()
+        if rc == 0:
+            check_last_status = "ok"
+            logger.info("restic check ok")
+            return True
+        check_last_status = "error"
+        logger.error("restic check failed: %s", output)
+        return False
+    except Exception as e:
+        check_last_status = "error"
+        check_last_output = str(e)
+        check_last_at = datetime.now(timezone.utc).isoformat()
+        logger.exception("restic check failed")
+        return False
+    finally:
+        check_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -582,15 +699,27 @@ async def scheduler_loop():
 
 
 def ensure_default_config():
-    if not RCLONE_CONF.exists():
-        LOCAL_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        save_rclone_conf(f"[{DEFAULT_REMOTE_NAME}]\ntype = local\n")
-        logger.info(
-            "Created default rclone.conf with local backup to %s", LOCAL_SNAPSHOTS_DIR
-        )
+    """Make sure config.json exists and has a repo password.
+
+    Generates a random password on first run if the user hasn't supplied one.
+    The password is stored in config.json (0600); losing it makes the repo
+    unreadable, so surface it prominently in the UI.
+    """
+    conf = load_config()
+    dirty = False
     if not CONFIG_FILE.exists():
-        save_config(dict(DEFAULT_CONFIG))
-        logger.info("Created default config.json")
+        dirty = True
+    if not conf.get("repo_password"):
+        conf["repo_password"] = pysecrets.token_urlsafe(32)
+        dirty = True
+        logger.warning(
+            "Generated new restic repo password — back it up via the Backup UI"
+        )
+    if not conf.get("repo"):
+        conf["repo"] = str(RESTIC_REPO_DIR)
+        dirty = True
+    if dirty:
+        save_config(conf)
 
 
 @app.before_serving
@@ -598,6 +727,13 @@ async def startup():
     global scheduler_task
     init_db()
     ensure_default_config()
+    # Best-effort unlock in case a previous run died mid-operation.
+    try:
+        conf = load_config()
+        if conf.get("repo") and conf.get("repo_password"):
+            await _restic_unlock_if_stale(conf)
+    except Exception:
+        logger.warning("startup unlock skipped", exc_info=True)
     scheduler_task = asyncio.create_task(scheduler_loop())
     logger.info("Backup scheduler started")
 
@@ -634,7 +770,6 @@ def route(path, **kwargs):
 @route("/")
 async def index():
     conf = load_config()
-    rclone_conf = load_rclone_conf()
     last = get_last_backup()
     state = {
         "running": op_lock.backup_running,
@@ -646,24 +781,25 @@ async def index():
         "index.html",
         base_path=BASE_PATH,
         config=conf,
-        rclone_conf=rclone_conf,
         state=state,
     )
 
 
 @route("/api/config", methods=["GET"])
 async def get_config():
-    return jsonify(config=load_config(), rclone_conf=load_rclone_conf())
+    conf = load_config()
+    # Only return password once the user explicitly asks; keep it out of the
+    # default GET so it doesn't leak via browser caches / history.
+    redacted = {**conf, "repo_password": "***" if conf.get("repo_password") else ""}
+    return jsonify(config=redacted)
 
 
 @route("/api/config", methods=["POST"])
 async def post_config():
     data = await request.get_json()
-    if "rclone_conf" in data:
-        save_rclone_conf(data["rclone_conf"])
     conf = load_config()
-    for key in ("interval_seconds", "remote_name", "remote_path", "router_api_token"):
-        if key in data:
+    for key in ("interval_seconds", "repo", "repo_password", "router_api_token"):
+        if key in data and data[key] not in (None, "***"):
             conf[key] = data[key]
     if "interval_seconds" in data:
         conf["interval_seconds"] = max(60, int(conf["interval_seconds"]))
@@ -671,23 +807,12 @@ async def post_config():
     return jsonify(ok=True)
 
 
-@route("/api/setup-s3", methods=["POST"])
-async def setup_s3():
-    data = await request.get_json()
-    remote_name = data.get("remote_name", "openhost-backup")
-    bucket = data.get("bucket", "")
-    access_key = data.get("access_key", "")
-    secret_key = data.get("secret_key", "")
-    region = data.get("region", "us-east-1")
-
-    rclone_text = generate_s3_conf(remote_name, bucket, access_key, secret_key, region)
-    save_rclone_conf(rclone_text)
-
+@route("/api/config/password", methods=["GET"])
+async def reveal_password():
+    """Return the actual repo password. Separate endpoint so it doesn't leak
+    into the default config response / UI state dumps."""
     conf = load_config()
-    conf["remote_name"] = remote_name
-    conf["remote_path"] = bucket
-    save_config(conf)
-    return jsonify(ok=True, rclone_conf=rclone_text)
+    return jsonify(ok=True, password=conf.get("repo_password", ""))
 
 
 @route("/api/backup", methods=["POST"])
@@ -712,21 +837,14 @@ async def status():
         last_status=last["status"] if last else None,
         last_error=last["error_message"] if last else None,
         interval_seconds=conf["interval_seconds"],
+        repo=conf.get("repo", ""),
     )
 
 
-@route("/api/backups")
-async def get_backups():
-    snapshots, remote_ok = await list_snapshots()
-    sizes = get_backup_sizes()
-    enriched = []
-    for name in snapshots:
-        entry = {"name": name}
-        if name in sizes:
-            entry["size_bytes"] = sizes[name]["size_bytes"]
-            entry["file_count"] = sizes[name]["file_count"]
-        enriched.append(entry)
-    return jsonify(snapshots=enriched, remote_ok=remote_ok)
+@route("/api/snapshots")
+async def api_snapshots():
+    snapshots, repo_ok = await list_snapshots()
+    return jsonify(ok=True, snapshots=snapshots, repo_ok=repo_ok)
 
 
 @route("/api/restore", methods=["POST"])
@@ -734,10 +852,10 @@ async def trigger_restore():
     if op_lock.busy:
         return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
     data = await request.get_json()
-    snapshot = data.get("snapshot", "")
-    if not snapshot or not SNAPSHOT_RE.match(snapshot):
-        return jsonify(ok=False, error="Invalid snapshot name"), 400
-    asyncio.create_task(run_restore(snapshot))
+    snapshot_id = data.get("snapshot", "")
+    if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
+        return jsonify(ok=False, error="Invalid snapshot id"), 400
+    asyncio.create_task(run_restore(snapshot_id))
     return jsonify(ok=True, message="Restore started")
 
 
@@ -752,14 +870,14 @@ async def restore_status_endpoint():
 
 @route("/api/snapshot/files")
 async def snapshot_files():
-    name = request.args.get("snapshot", "")
-    if not name or not SNAPSHOT_RE.match(name):
-        return jsonify(ok=False, error="Invalid snapshot name"), 400
+    snapshot_id = request.args.get("snapshot", "")
+    if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
+        return jsonify(ok=False, error="Invalid snapshot id"), 400
     subpath = request.args.get("path", "")
     if not validate_subpath(subpath):
         return jsonify(ok=False, error="Invalid path"), 400
     try:
-        files, error = await list_snapshot_files(name, subpath)
+        files, error = await list_snapshot_files(snapshot_id, subpath)
         if error:
             status_code = 404 if "not found" in error.lower() else 500
             return jsonify(ok=False, error=error), status_code
@@ -772,17 +890,37 @@ async def snapshot_files():
 @route("/api/snapshot/delete", methods=["POST"])
 async def snapshot_delete():
     data = await request.get_json()
-    name = data.get("snapshot", "")
-    if not name or not SNAPSHOT_RE.match(name):
-        return jsonify(ok=False, error="Invalid snapshot name"), 400
+    snapshot_id = data.get("snapshot", "")
+    if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
+        return jsonify(ok=False, error="Invalid snapshot id"), 400
     if op_lock.busy:
         return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
     try:
-        remote_deleted = await delete_snapshot(name)
-        return jsonify(ok=True, remote_deleted=remote_deleted)
+        ok = await delete_snapshot(snapshot_id)
+        return jsonify(ok=ok)
     except Exception as e:
         logger.exception("Failed to delete snapshot")
         return jsonify(ok=False, error=str(e)), 500
+
+
+@route("/api/check", methods=["POST"])
+async def trigger_check():
+    # `restic check` is read-only from the data's perspective but it does
+    # acquire a repo lock, so don't run it on top of a backup/restore.
+    if op_lock.busy:
+        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+    asyncio.create_task(run_check())
+    return jsonify(ok=True, message="Check started")
+
+
+@route("/api/check/status")
+async def check_status_endpoint():
+    return jsonify(
+        running=check_running,
+        last_status=check_last_status,
+        last_output=check_last_output,
+        last_at=check_last_at,
+    )
 
 
 @route("/api/history")
@@ -791,44 +929,6 @@ async def backup_history():
     offset = int(request.args.get("offset", 0))
     history, total = get_backup_history(limit, offset)
     return jsonify(ok=True, history=history, total=total)
-
-
-@route("/api/local/files")
-async def local_files():
-    subpath = request.args.get("path", "")
-    if not validate_subpath(subpath):
-        return jsonify(ok=False, error="Invalid path"), 400
-
-    target = ALL_APP_DATA / subpath if subpath else ALL_APP_DATA
-    if not target.exists() or not target.is_dir():
-        return jsonify(ok=False, error="Directory not found"), 404
-
-    try:
-        target.resolve().relative_to(ALL_APP_DATA.resolve())
-    except ValueError:
-        return jsonify(ok=False, error="Invalid path"), 400
-
-    files = []
-    try:
-        for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name)):
-            rel = entry.relative_to(ALL_APP_DATA)
-            if str(rel).startswith("backup"):
-                continue
-            stat = entry.stat()
-            files.append(
-                {
-                    "path": entry.name,
-                    "size": stat.st_size if entry.is_file() else 0,
-                    "is_dir": entry.is_dir(),
-                    "mod_time": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ).strftime("%Y-%m-%dT%H:%M:%S"),
-                }
-            )
-    except PermissionError:
-        return jsonify(ok=False, error="Permission denied"), 403
-
-    return jsonify(ok=True, files=files)
 
 
 @route("/api/backup/rename", methods=["POST"])
@@ -953,8 +1053,6 @@ async def chown_app_data():
             ok=False, error=f"app_data directory not found: {ALL_APP_DATA}"
         ), 404
 
-    import stat
-
     target_uid = 1000
     target_gid = 1000
     app_data = str(ALL_APP_DATA)
@@ -1050,9 +1148,9 @@ async def trigger_direct_push():
                     return jsonify(
                         ok=False,
                         error="Router API token is invalid or expired. "
-                        "Go to the Backups tab, scroll to the rclone.conf section, "
-                        "and set a valid router_api_token in the backup config "
-                        '(POST /api/config with {"router_api_token": "..."}). '
+                        "Go to the Backups tab and set a valid router_api_token "
+                        "in the backup config (POST /api/config with "
+                        '{"router_api_token": "..."}). '
                         "You can generate a token from the OpenHost dashboard "
                         "under API Tokens.",
                     ), 400

@@ -6,7 +6,7 @@
     <title>Backup</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
         h1 { font-size: 1.5rem; margin-bottom: 0; }
         h2 { font-size: 1.1rem; margin-bottom: 12px; color: #333; }
         section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
@@ -15,10 +15,10 @@
             width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px;
             font-size: 0.9rem; margin-bottom: 12px;
         }
-        textarea {
-            width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px;
-            font-family: monospace; font-size: 0.85rem; resize: vertical; min-height: 160px;
-            margin-bottom: 12px;
+        pre.inline-code {
+            font-family: monospace; background: #f3f4f6; padding: 8px 10px;
+            border-radius: 4px; font-size: 0.8rem; word-break: break-all;
+            white-space: pre-wrap; margin-bottom: 8px;
         }
         button {
             padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;
@@ -31,7 +31,8 @@
         .btn-secondary:hover { background: #d1d5db; }
         .btn-danger { background: #dc2626; color: white; }
         .btn-danger:hover { background: #b91c1c; }
-        .btn-row { display: flex; gap: 8px; align-items: center; }
+        .btn-danger:disabled { background: #fca5a5; cursor: not-allowed; }
+        .btn-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
         .status-badge {
             display: inline-block; padding: 2px 8px; border-radius: 12px;
             font-size: 0.8rem; font-weight: 600;
@@ -41,9 +42,7 @@
         .status-running { background: #dbeafe; color: #1e40af; }
         .status-none { background: #f3f4f6; color: #6b7280; }
         .status-restore { background: #fef3c7; color: #92400e; }
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
         .info { font-size: 0.85rem; color: #666; margin-bottom: 12px; line-height: 1.5; }
-        .field-row { margin-bottom: 0; }
         .msg { font-size: 0.85rem; margin-top: 8px; padding: 8px; border-radius: 4px; }
         .msg-ok { background: #dcfce7; color: #166534; }
         .msg-err { background: #fee2e2; color: #991b1b; }
@@ -51,12 +50,10 @@
         dt { font-weight: 600; color: #555; }
         .browse-link { color: #2563eb; cursor: pointer; text-decoration: underline; }
         .browse-link:hover { color: #1d4ed8; }
-        .btn-danger:disabled { background: #fca5a5; cursor: not-allowed; }
-        .inline-name { border: 1px solid #ccc; border-radius: 3px; padding: 2px 6px; font-size: 0.8rem; width: 120px; }
+        .inline-name { border: 1px solid #ccc; border-radius: 3px; padding: 2px 6px; font-size: 0.8rem; width: 140px; }
         .name-label { font-size: 0.8rem; color: #2563eb; cursor: pointer; }
         .name-label:hover { text-decoration: underline; }
 
-        /* Tab navigation */
         .tab-bar { display: flex; gap: 0; margin: 16px 0 24px 0; border-bottom: 2px solid #ddd; }
         .tab-btn {
             padding: 10px 20px; border: none; background: none; cursor: pointer;
@@ -102,6 +99,8 @@
                 <dd id="status-last">{{ state.last_backup or "never" }}</dd>
                 <dt>Interval</dt>
                 <dd>{{ config.interval_seconds }}s</dd>
+                <dt>Repo</dt>
+                <dd style="font-family:monospace;font-size:0.85rem;">{{ config.repo }}</dd>
             </dl>
             <div style="margin-top: 12px;">
                 <label>Backup name (optional)</label>
@@ -109,41 +108,37 @@
             </div>
             <div class="btn-row">
                 <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
+                <button class="btn-secondary" id="btn-check" onclick="triggerCheck()">Run restic check</button>
             </div>
             <div id="backup-msg"></div>
+            <div id="check-state" style="margin-top:12px;"></div>
         </section>
 
-        <!-- Backups -->
+        <!-- Snapshots -->
         <section>
-            <h2>Backups</h2>
-            <p class="info">Click a snapshot row to browse, restore, or delete it.</p>
+            <h2>Snapshots</h2>
+            <p class="info">Snapshots reported by restic. Click a row to browse files, restore, or delete.</p>
             <div class="btn-row" style="margin-bottom: 12px;">
-                <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Load snapshots</button>
+                <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Refresh snapshots</button>
             </div>
-            <div id="history-container" style="display:none;">
+            <div id="snapshots-container" style="display:none;">
                 <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
                     <thead>
                         <tr style="border-bottom:2px solid #ddd;text-align:left;">
-                            <th style="padding:6px 8px;">Time</th>
+                            <th style="padding:6px 8px;">Time (UTC)</th>
+                            <th style="padding:6px 8px;">ID</th>
                             <th style="padding:6px 8px;">Name</th>
-                            <th style="padding:6px 8px;">Status</th>
                             <th style="padding:6px 8px;text-align:right;">Size</th>
-                            <th style="padding:6px 8px;">Error</th>
                         </tr>
                     </thead>
-                    <tbody id="history-body"></tbody>
+                    <tbody id="snapshots-body"></tbody>
                 </table>
-                <div class="btn-row" style="justify-content:space-between;">
-                    <button class="btn-secondary" id="btn-hist-prev" onclick="loadHistory(historyOffset - 20)" disabled>Prev</button>
-                    <span id="history-page" style="font-size:0.85rem;color:#666;"></span>
-                    <button class="btn-secondary" id="btn-hist-next" onclick="loadHistory(historyOffset + 20)" disabled>Next</button>
-                </div>
             </div>
             <div id="action-panel" style="display:none;margin-top:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                     <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
                 </div>
-                <div class="btn-row" style="flex-wrap:wrap;">
+                <div class="btn-row">
                     <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
                     <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
                     <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
@@ -166,54 +161,26 @@
             <div id="manage-msg"></div>
         </section>
 
-        <!-- Quick Setup: S3 -->
+        <!-- Repo config -->
         <section>
-            <h2>Quick Setup: S3</h2>
-            <p class="info">Fill in your S3 credentials to generate an rclone config. This overwrites the config below.</p>
-            <div class="grid-2">
-                <div>
-                    <label>Remote name</label>
-                    <input type="text" id="s3-remote" value="{{ config.remote_name }}">
-                </div>
-                <div>
-                    <label>Bucket</label>
-                    <input type="text" id="s3-bucket" value="{{ config.remote_path }}" placeholder="my-backups">
-                </div>
-            </div>
-            <div class="grid-2">
-                <div>
-                    <label>Access key</label>
-                    <input type="text" id="s3-access-key" placeholder="AKIA...">
-                </div>
-                <div>
-                    <label>Secret key</label>
-                    <input type="password" id="s3-secret-key" placeholder="...">
-                </div>
-            </div>
-            <label>Region</label>
-            <input type="text" id="s3-region" value="us-east-1">
-            <button class="btn-primary" onclick="setupS3()">Generate config</button>
-            <div id="s3-msg"></div>
-        </section>
-
-        <!-- rclone.conf editor -->
-        <section>
-            <h2>rclone.conf</h2>
+            <h2>Repository</h2>
             <p class="info">
-                Edit the rclone config directly. For backends other than S3, run
-                <code>rclone config</code> on your local machine and paste the contents of
-                <code>~/.config/rclone/rclone.conf</code> here.
+                The backup app stores snapshots in a restic repository. By default it
+                points at a local path inside the backup app's own data directory. You
+                can change this to any restic-supported backend (e.g.
+                <code>s3:s3.amazonaws.com/bucket/path</code>,
+                <code>b2:bucket:path</code>, <code>sftp:user@host:/path</code>). Changing
+                the repo URL does not migrate existing data. The repo password is
+                required to read or write the repo — losing it makes backups
+                unrecoverable.
             </p>
-            <textarea id="rclone-conf">{{ rclone_conf }}</textarea>
-            <div class="grid-2">
-                <div>
-                    <label>Remote name (must match a section above)</label>
-                    <input type="text" id="conf-remote-name" value="{{ config.remote_name }}">
-                </div>
-                <div>
-                    <label>Remote path (bucket or path)</label>
-                    <input type="text" id="conf-remote-path" value="{{ config.remote_path }}">
-                </div>
+            <label>Repository URL</label>
+            <input type="text" id="conf-repo" value="{{ config.repo }}">
+            <label>Repository password</label>
+            <input type="password" id="conf-repo-password" placeholder="(unchanged)" autocomplete="off">
+            <div class="btn-row" style="margin-bottom:12px;">
+                <button class="btn-secondary" onclick="showPassword()">Show current password</button>
+                <span id="current-password-display" style="font-family:monospace;font-size:0.85rem;color:#444;"></span>
             </div>
             <label>Backup interval (seconds, minimum 60)</label>
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
@@ -323,10 +290,7 @@
 
     <script>
         const BASE = "{{ base_path }}";
-        let historyOffset = 0;
-        let selectedSnapshot = null;
-        let selectedBackupId = null;
-        let browseMode = null;
+        let selectedSnapshotId = null;
 
         /* ================================================================
            Router token setup
@@ -344,7 +308,7 @@
         }
 
         /* ================================================================
-           Pre-migration: stop apps & chown
+           Pre-migration
            ================================================================ */
 
         async function refreshAppsStatus() {
@@ -405,14 +369,6 @@
             }
         }
 
-        // Refresh app status when migrate tab is shown
-        (function() {
-            const origShowPage = window.showPage;
-            window.addEventListener("hashchange", () => {
-                if (location.hash === "#migrate") refreshAppsStatus();
-            });
-        })();
-
         /* ================================================================
            Tab navigation
            ================================================================ */
@@ -421,10 +377,8 @@
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.getElementById('page-' + name).classList.add('active');
-            // Find the matching tab button
             document.querySelectorAll('.tab-btn').forEach(b => {
-                if (b.textContent.toLowerCase().replace(/\s/g, '') === name ||
-                    (name === 'backup' && b.textContent === 'Backups') ||
+                if ((name === 'backup' && b.textContent === 'Backups') ||
                     (name === 'migrate' && b.textContent === 'Migrate')) {
                     b.classList.add('active');
                 }
@@ -433,7 +387,6 @@
             if (name === 'migrate') refreshAppsStatus();
         }
 
-        // Restore tab from URL hash on load
         (function() {
             const hash = location.hash.replace('#', '');
             if (hash === 'migrate') {
@@ -464,11 +417,11 @@
             const el = document.getElementById(id);
             el.textContent = text;
             el.className = "msg " + (ok ? "msg-ok" : "msg-err");
-            setTimeout(() => { el.textContent = ""; el.className = ""; }, 4000);
+            setTimeout(() => { el.textContent = ""; el.className = ""; }, 6000);
         }
 
         function formatBytes(bytes) {
-            if (bytes === 0) return "0 B";
+            if (!bytes) return "0 B";
             const units = ["B", "KiB", "MiB", "GiB", "TiB"];
             let i = 0;
             let b = bytes;
@@ -478,7 +431,7 @@
 
         function escapeHtml(str) {
             const d = document.createElement("div");
-            d.textContent = str;
+            d.textContent = str == null ? "" : String(str);
             return d.innerHTML.replace(/'/g, "&#39;");
         }
 
@@ -486,34 +439,30 @@
            Backup page
            ================================================================ */
 
-        async function setupS3() {
+        async function saveConfig() {
             const data = {
-                remote_name: document.getElementById("s3-remote").value,
-                bucket: document.getElementById("s3-bucket").value,
-                access_key: document.getElementById("s3-access-key").value,
-                secret_key: document.getElementById("s3-secret-key").value,
-                region: document.getElementById("s3-region").value,
+                repo: document.getElementById("conf-repo").value,
+                interval_seconds: parseInt(document.getElementById("conf-interval").value, 10),
             };
-            const res = await api("/api/setup-s3", { method: "POST", body: data });
+            const pw = document.getElementById("conf-repo-password").value;
+            if (pw) data.repo_password = pw;
+            const res = await api("/api/config", { method: "POST", body: data });
             if (res.ok) {
-                document.getElementById("rclone-conf").value = res.rclone_conf;
-                document.getElementById("conf-remote-name").value = data.remote_name;
-                document.getElementById("conf-remote-path").value = data.bucket;
-                showMsg("s3-msg", "Config generated", true);
+                document.getElementById("conf-repo-password").value = "";
+                showMsg("conf-msg", "Saved", true);
             } else {
-                showMsg("s3-msg", "Error: " + (res.error || "unknown"), false);
+                showMsg("conf-msg", res.error || "Error", false);
             }
         }
 
-        async function saveConfig() {
-            const data = {
-                rclone_conf: document.getElementById("rclone-conf").value,
-                remote_name: document.getElementById("conf-remote-name").value,
-                remote_path: document.getElementById("conf-remote-path").value,
-                interval_seconds: parseInt(document.getElementById("conf-interval").value, 10),
-            };
-            const res = await api("/api/config", { method: "POST", body: data });
-            showMsg("conf-msg", res.ok ? "Saved" : "Error", res.ok);
+        async function showPassword() {
+            const res = await api("/api/config/password");
+            const el = document.getElementById("current-password-display");
+            if (res.ok) {
+                el.textContent = res.password || "(empty)";
+            } else {
+                el.textContent = "error";
+            }
         }
 
         async function triggerBackup() {
@@ -554,60 +503,111 @@
                     lastEl.textContent = res.last_backup || "never";
                     btn.disabled = false;
                     btn.textContent = "Run backup now";
+                    // Snapshots may have changed — refresh the list.
+                    loadSnapshots();
                 }
             };
             poll();
         }
 
-        async function loadHistory(offset) {
-            if (offset < 0) offset = 0;
-            historyOffset = offset;
-            const res = await api("/api/history?limit=20&offset=" + offset);
-            if (!res.ok) return;
+        async function triggerCheck() {
+            const btn = document.getElementById("btn-check");
+            btn.disabled = true;
+            btn.textContent = "Running check...";
+            const stateEl = document.getElementById("check-state");
+            stateEl.innerHTML = '<span class="status-badge status-running">running</span>';
+            const res = await api("/api/check", { method: "POST" });
+            if (!res.ok) {
+                showMsg("backup-msg", res.error || "Failed to start check", false);
+                stateEl.innerHTML = "";
+                btn.disabled = false;
+                btn.textContent = "Run restic check";
+                return;
+            }
+            // Poll for completion.
+            const poll = async () => {
+                const s = await api("/api/check/status");
+                if (s.running) {
+                    setTimeout(poll, 2000);
+                    return;
+                }
+                if (s.last_status === "ok") {
+                    stateEl.innerHTML = '<span class="status-badge status-success">check ok</span> <span style="font-size:0.8rem;color:#666;margin-left:6px;">' + escapeHtml(s.last_at || "") + '</span>';
+                } else if (s.last_status === "error") {
+                    const msg = s.last_output ? '<div style="margin-top:6px;font-family:monospace;font-size:0.78rem;color:#991b1b;white-space:pre-wrap;">' + escapeHtml(s.last_output) + '</div>' : '';
+                    stateEl.innerHTML = '<span class="status-badge status-error">check failed</span>' + msg;
+                } else {
+                    stateEl.innerHTML = "";
+                }
+                btn.disabled = false;
+                btn.textContent = "Run restic check";
+            };
+            setTimeout(poll, 1500);
+        }
 
-            const container = document.getElementById("history-container");
-            const body = document.getElementById("history-body");
+        async function loadSnapshots() {
+            const btn = document.getElementById("btn-load-snapshots");
+            if (btn) { btn.disabled = true; btn.textContent = "Loading..."; }
+            selectedSnapshotId = null;
+            document.getElementById("action-panel").style.display = "none";
+            document.getElementById("browse-container").style.display = "none";
+
+            const res = await api("/api/snapshots");
+            const [hist] = await Promise.all([api("/api/history?limit=100&offset=0")]);
+            const byId = {};
+            if (hist.ok) {
+                (hist.history || []).forEach(h => {
+                    if (h.snapshot_id) byId[h.snapshot_id] = h;
+                });
+            }
+
+            const container = document.getElementById("snapshots-container");
+            const body = document.getElementById("snapshots-body");
             body.innerHTML = "";
 
-            if (res.history.length === 0 && offset === 0) {
-                container.style.display = "none";
+            if (!res.ok || !res.repo_ok) {
+                container.style.display = "block";
+                body.innerHTML = '<tr><td colspan="4" style="padding:6px 8px;color:#991b1b;">Could not read restic repo. Check the repository URL and password.</td></tr>';
+                if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
                 return;
             }
 
-            res.history.forEach(h => {
+            if (!res.snapshots || res.snapshots.length === 0) {
+                container.style.display = "block";
+                body.innerHTML = '<tr><td colspan="4" style="padding:6px 8px;color:#666;">No snapshots yet.</td></tr>';
+                if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
+                return;
+            }
+
+            res.snapshots.forEach(s => {
+                const rec = byId[s.id] || byId[s.short_id] || null;
+                const name = (s.tags || []).filter(t => t.startsWith("name:")).map(t => t.slice(5))[0] || (rec && rec.name) || "";
+                const sizeBytes = rec && rec.total_size_bytes != null ? rec.total_size_bytes : null;
+                const addedBytes = rec && rec.data_added_bytes != null ? rec.data_added_bytes : null;
+                const sizeText = sizeBytes != null
+                    ? formatBytes(sizeBytes) + (addedBytes != null ? " (+" + formatBytes(addedBytes) + ")" : "")
+                    : "-";
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
-                const isSuccess = h.status === "success" && h.timestamp;
-                if (isSuccess) {
-                    tr.style.cursor = "pointer";
-                    tr.onmouseenter = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = "#f8fafc"; };
-                    tr.onmouseleave = () => { if (selectedSnapshot !== h.timestamp) tr.style.background = ""; };
-                    tr.onclick = () => selectSnapshot(h.timestamp, h.id);
-                    if (selectedSnapshot === h.timestamp) {
-                        tr.style.background = "#eff6ff";
-                    }
-                }
-                const badge = h.status === "success"
-                    ? '<span class="status-badge status-success">ok</span>'
-                    : '<span class="status-badge status-error">error</span>';
-                const sizeText = h.size_bytes != null ? formatBytes(h.size_bytes) + " (" + h.file_count + " files)" : "-";
-                const nameHtml = h.name
-                    ? '<span class="name-label" onclick="event.stopPropagation(); renameBackup(' + h.id + ', this)" title="Click to rename">' + escapeHtml(h.name) + '</span>'
-                    : '<span class="name-label" style="color:#aaa;" onclick="event.stopPropagation(); renameBackup(' + h.id + ', this)" title="Click to name">-</span>';
+                tr.style.cursor = "pointer";
+                tr.onmouseenter = () => { if (selectedSnapshotId !== s.id) tr.style.background = "#f8fafc"; };
+                tr.onmouseleave = () => { if (selectedSnapshotId !== s.id) tr.style.background = ""; };
+                tr.onclick = () => selectSnapshot(s.id, s.short_id);
+                const nameHtml = rec
+                    ? (name
+                        ? '<span class="name-label" onclick="event.stopPropagation(); renameBackup(' + rec.id + ', this)">' + escapeHtml(name) + '</span>'
+                        : '<span class="name-label" style="color:#aaa;" onclick="event.stopPropagation(); renameBackup(' + rec.id + ', this)">-</span>')
+                    : (name ? escapeHtml(name) : '<span style="color:#aaa;">-</span>');
                 tr.innerHTML =
-                    '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(h.timestamp || h.created_at) + '</td>' +
+                    '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml((s.time || "").substring(0, 19)) + '</td>' +
+                    '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(s.short_id) + '</td>' +
                     '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
-                    '<td style="padding:6px 8px;">' + badge + '</td>' +
-                    '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>' +
-                    '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(h.error_message || "") + '</td>';
+                    '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>';
                 body.appendChild(tr);
             });
 
-            document.getElementById("btn-hist-prev").disabled = offset === 0;
-            document.getElementById("btn-hist-next").disabled = offset + 20 >= res.total;
-            document.getElementById("history-page").textContent =
-                "Showing " + (offset + 1) + "-" + Math.min(offset + 20, res.total) + " of " + res.total;
             container.style.display = "block";
+            if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
         }
 
         async function renameBackup(id, el) {
@@ -625,7 +625,7 @@
                 const newName = input.value.trim();
                 const res = await api("/api/backup/rename", { method: "POST", body: { id, name: newName } });
                 if (res.ok) {
-                    loadHistory(historyOffset);
+                    loadSnapshots();
                 } else {
                     input.style.borderColor = "#dc2626";
                 }
@@ -634,69 +634,55 @@
             input.onblur = save;
             input.onkeydown = (e) => {
                 if (e.key === "Enter") { input.blur(); }
-                if (e.key === "Escape") { loadHistory(historyOffset); }
+                if (e.key === "Escape") { loadSnapshots(); }
             };
         }
 
-        async function loadSnapshots() {
-            const btn = document.getElementById("btn-load-snapshots");
-            btn.disabled = true;
-            btn.textContent = "Loading...";
-            selectedSnapshot = null;
-            selectedBackupId = null;
-            document.getElementById("action-panel").style.display = "none";
-            document.getElementById("browse-container").style.display = "none";
-            await loadHistory(0);
-            btn.disabled = false;
-            btn.textContent = "Load snapshots";
-        }
-
-        function selectSnapshot(timestamp, backupId) {
-            selectedSnapshot = timestamp;
-            selectedBackupId = backupId;
-            document.getElementById("selected-snapshot-label").textContent = timestamp;
+        function selectSnapshot(id, shortId) {
+            selectedSnapshotId = id;
+            document.getElementById("selected-snapshot-label").textContent = shortId + "  (" + id.substring(0, 16) + "…)";
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
-            document.getElementById("btn-restore").disabled = false;
-            const rows = document.getElementById("history-body").querySelectorAll("tr");
+            const rows = document.getElementById("snapshots-body").querySelectorAll("tr");
             rows.forEach(tr => {
-                const cell = tr.querySelector("td");
-                if (cell && cell.textContent === timestamp) {
+                tr.style.background = "";
+            });
+            // Highlight the selected row.
+            rows.forEach(tr => {
+                const cells = tr.querySelectorAll("td");
+                if (cells.length >= 2 && cells[1].textContent === shortId) {
                     tr.style.background = "#eff6ff";
-                } else {
-                    tr.style.background = "";
                 }
             });
         }
 
-        function renderFileBrowser(res, subpath, browseFunc, label) {
-            const container = document.getElementById("browse-container");
+        function renderFileBrowser(res, subpath) {
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
 
             if (!res.ok) {
                 body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#991b1b;">' + escapeHtml(res.error || "Failed to load files") + '</td></tr>';
+                breadcrumb.innerHTML = "";
                 return;
             }
 
             const parts = subpath ? subpath.split("/") : [];
-            let bc = '<span style="font-size:0.75rem;background:#e0e7ff;color:#3730a3;padding:1px 6px;border-radius:3px;margin-right:6px;">' + escapeHtml(label) + '</span>';
-            bc += '<span class="browse-link" onclick="' + browseFunc + '(\'\')">root</span>';
+            let bc = '<span class="browse-link" onclick="browseSnapshot(\'\')">root</span>';
             let accumulated = "";
             parts.forEach((p, i) => {
                 accumulated += (i > 0 ? "/" : "") + p;
                 const path = accumulated;
-                bc += ' / <span class="browse-link" onclick="' + browseFunc + '(\'' + escapeHtml(path) + '\')">' + escapeHtml(p) + '</span>';
+                bc += ' / <span class="browse-link" onclick="browseSnapshot(\'' + escapeHtml(path) + '\')">' + escapeHtml(p) + '</span>';
             });
             breadcrumb.innerHTML = bc;
 
             body.innerHTML = "";
-            if (res.files.length === 0) {
+            if (!res.files || res.files.length === 0) {
                 body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Empty directory</td></tr>';
                 return;
             }
 
-            const sorted = res.files.sort((a, b) => {
+            const sorted = res.files.slice().sort((a, b) => {
                 if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
                 return a.path.localeCompare(b.path);
             });
@@ -706,61 +692,36 @@
                 tr.style.borderBottom = "1px solid #eee";
                 const fullPath = subpath ? subpath + "/" + f.path : f.path;
                 const nameCell = f.is_dir
-                    ? '<td style="padding:6px 8px;"><span class="browse-link" onclick="' + browseFunc + '(\'' + escapeHtml(fullPath) + '\')">&#128193; ' + escapeHtml(f.path) + '</span></td>'
+                    ? '<td style="padding:6px 8px;"><span class="browse-link" onclick="browseSnapshot(\'' + escapeHtml(fullPath) + '\')">&#128193; ' + escapeHtml(f.path) + '</span></td>'
                     : '<td style="padding:6px 8px;">&#128196; ' + escapeHtml(f.path) + '</td>';
                 const sizeCell = '<td style="padding:6px 8px;text-align:right;">' + (f.is_dir ? "-" : formatBytes(f.size)) + '</td>';
-                const modCell = '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(f.mod_time ? f.mod_time.substring(0, 19) : "") + '</td>';
+                const modCell = '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(f.mod_time ? String(f.mod_time).substring(0, 19) : "") + '</td>';
                 tr.innerHTML = nameCell + sizeCell + modCell;
                 body.appendChild(tr);
             });
         }
 
         async function browseSnapshot(subpath) {
-            const snapshot = selectedSnapshot;
-            if (!snapshot) return;
-            browseMode = "remote";
+            if (!selectedSnapshotId) return;
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
-
             body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
             container.style.display = "block";
 
-            let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(snapshot);
+            let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(selectedSnapshotId);
             if (subpath) url += "&path=" + encodeURIComponent(subpath);
             const res = await api(url);
-
-            if (!res.ok) {
-                browseLocal(subpath, true);
-                return;
-            }
-            renderFileBrowser(res, subpath, "browseSnapshot", "remote");
-        }
-
-        async function browseLocal(subpath, isFallback) {
-            if (!selectedSnapshot) return;
-            browseMode = "local";
-            const container = document.getElementById("browse-container");
-            const body = document.getElementById("browse-body");
-
-            body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Loading...</td></tr>';
-            container.style.display = "block";
-
-            let url = "/api/local/files";
-            if (subpath) url += "?path=" + encodeURIComponent(subpath);
-            const res = await api(url);
-            const label = isFallback ? "local (snapshot not on remote)" : "local";
-            renderFileBrowser(res, subpath, "browseLocal", label);
+            renderFileBrowser(res, subpath);
         }
 
         async function triggerRestore() {
-            const snapshot = selectedSnapshot;
-            if (!snapshot) return;
-            if (!confirm("This will overwrite current app data with the backup from " + snapshot + ". Continue?")) return;
+            if (!selectedSnapshotId) return;
+            if (!confirm("This will overwrite current app data with the selected snapshot. Continue?")) return;
 
             const btn = document.getElementById("btn-restore");
             btn.disabled = true;
             btn.textContent = "Restoring...";
-            const res = await api("/api/restore", { method: "POST", body: { snapshot } });
+            const res = await api("/api/restore", { method: "POST", body: { snapshot: selectedSnapshotId } });
             if (res.ok) {
                 showMsg("manage-msg", "Restore started", true);
                 pollRestore();
@@ -796,24 +757,22 @@
         }
 
         async function deleteSnapshot() {
-            const snapshot = selectedSnapshot;
-            if (!snapshot) return;
-            if (!confirm("Permanently delete backup snapshot " + snapshot + "? This cannot be undone.")) return;
+            if (!selectedSnapshotId) return;
+            if (!confirm("Permanently delete this snapshot? This cannot be undone.")) return;
 
             const btn = document.getElementById("btn-delete");
             btn.disabled = true;
             btn.textContent = "Deleting...";
-            const res = await api("/api/snapshot/delete", { method: "POST", body: { snapshot } });
+            const res = await api("/api/snapshot/delete", { method: "POST", body: { snapshot: selectedSnapshotId } });
             btn.disabled = false;
             btn.textContent = "Delete";
 
             if (res.ok) {
                 showMsg("manage-msg", "Snapshot deleted", true);
-                selectedSnapshot = null;
-                selectedBackupId = null;
+                selectedSnapshotId = null;
                 document.getElementById("action-panel").style.display = "none";
                 document.getElementById("browse-container").style.display = "none";
-                loadHistory(historyOffset);
+                loadSnapshots();
             } else {
                 showMsg("manage-msg", res.error || "Delete failed", false);
             }
@@ -895,7 +854,7 @@
             poll();
         }
 
-        // Auto-load backup snapshots on page load
+        // Auto-load snapshots on page load.
         loadSnapshots();
     </script>
 </body>

@@ -32,8 +32,8 @@ def client(tmp_path):
     backup_app.APP_DATA_DIR.mkdir()
     backup_app.CONFIG_DIR = backup_app.APP_DATA_DIR
     backup_app.DB_FILE = backup_app.APP_DATA_DIR / "backups.db"
-    backup_app.RCLONE_CONF = backup_app.APP_DATA_DIR / "rclone.conf"
     backup_app.CONFIG_FILE = backup_app.APP_DATA_DIR / "config.json"
+    backup_app.RESTIC_REPO_DIR = backup_app.APP_DATA_DIR / "restic-repo"
 
     # Init DB
     backup_app.init_db()
