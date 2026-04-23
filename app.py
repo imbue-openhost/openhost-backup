@@ -29,7 +29,16 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10 GB
 BASE_PATH = os.environ.get("OPENHOST_APP_BASE_PATH", "/backup")
 APP_DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/backup"))
 ALL_APP_DATA = Path("/data/app_data")
+APP_TEMP_DATA = Path("/data/app_temp_data")
 VM_DATA_DIR = Path("/data/vm_data")
+
+# Roots the backup app captures when the ``access_all_data = true``
+# manifest permission is in effect. Order is significant only for UI
+# display (``list_snapshot_files`` surfaces these as the top-level
+# entries when ``root`` is unset). Any root that doesn't exist on disk
+# at backup time is skipped silently so the app still works on
+# instances that only grant a subset of these mounts.
+BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 # Router API token — the backup app needs this to call the local router API.
@@ -453,13 +462,24 @@ async def run_backup(name: str | None = None) -> bool:
         if name:
             tags.append(f"name:{name}")
 
-        args = [
-            "backup",
-            str(ALL_APP_DATA),
-            "--exclude",
-            str(ALL_APP_DATA / "backup"),
-            "--json",
-        ]
+        # Back up every mounted root (app_data, app_temp_data, vm_data).
+        # Skip ones that aren't present — this keeps the app usable on
+        # instances that only grant a subset of data permissions.
+        roots = [p for p in BACKUP_ROOTS if p.is_dir()]
+        if not roots:
+            msg = (
+                "No backup roots available — expected one of: "
+                + ", ".join(str(p) for p in BACKUP_ROOTS)
+            )
+            record_backup(timestamp, "error", msg, name=name)
+            logger.error(msg)
+            return False
+
+        args = ["backup", "--json"]
+        args += [str(p) for p in roots]
+        # Exclude our own restic repo (if it's the local default inside
+        # app_data) to avoid infinite-growth self-inclusion.
+        args += ["--exclude", str(ALL_APP_DATA / "backup")]
         for t in tags:
             args += ["--tag", t]
 
@@ -617,19 +637,66 @@ def validate_subpath(path: str) -> bool:
     return True
 
 
-async def list_snapshot_files(snapshot_id: str, subpath: str = ""):
-    """List files in a snapshot at the given subpath.
+_ROOT_NAMES = {
+    "app_data": ALL_APP_DATA,
+    "app_temp_data": APP_TEMP_DATA,
+    "vm_data": VM_DATA_DIR,
+}
 
-    Returns (files, error). `subpath` is relative to ``ALL_APP_DATA``.
+
+async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):
+    """Return the list of BACKUP_ROOTS actually present in this snapshot.
+
+    A snapshot only contains roots that existed on disk at backup time,
+    so we probe each one with ``restic ls`` to figure out which to show
+    as top-level entries in the browser.
+    """
+    present: list[dict] = []
+    for name, path in _ROOT_NAMES.items():
+        args = ["ls", "--json", snapshot_id, str(path)]
+        try:
+            rc, _stdout, _stderr = await _run_restic(args, conf, timeout=60)
+        except Exception:
+            continue
+        if rc == 0:
+            present.append(
+                {
+                    "path": name,
+                    "size": 0,
+                    "is_dir": True,
+                    "mod_time": "",
+                }
+            )
+    return present
+
+
+async def list_snapshot_files(
+    snapshot_id: str, subpath: str = "", root: str | None = None
+):
+    """List files in a snapshot.
+
+    Browsing model:
+      * ``root`` unset → return the synthetic top level (one entry per
+        captured root: app_data / app_temp_data / vm_data).
+      * ``root`` set → resolve to the matching absolute path, optionally
+        appended with ``subpath``, and return direct children of that dir
+        from the snapshot.
+
+    Returns ``(files, error)``.
     """
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return [], "Restic repo not configured"
 
-    # `restic ls --json <id> <path>` emits NDJSON: one "snapshot" header then
-    # one "node" per entry. We want entries that are direct children of
-    # `target_path`.
-    target_path = str(ALL_APP_DATA)
+    if not root:
+        # Top level: surface which roots the snapshot actually contains.
+        return await _list_roots_in_snapshot(snapshot_id, conf), None
+
+    if root not in _ROOT_NAMES:
+        return [], f"Unknown root: {root}"
+
+    # Resolve the absolute path restic is being asked about.
+    target_path = str(_ROOT_NAMES[root])
     if subpath:
         target_path = target_path.rstrip("/") + "/" + subpath
 
@@ -763,7 +830,14 @@ def get_backup_history(limit=20, offset=0):
 # ---------------------------------------------------------------------------
 
 
-async def run_restore(snapshot_id: str) -> bool:
+async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
+    """Restore a snapshot.
+
+    If ``root`` is None, every captured path in the snapshot is
+    restored. Otherwise only the named root (``app_data``,
+    ``app_temp_data``, or ``vm_data``) is touched via restic's
+    ``--include`` filter.
+    """
     global restore_last_snapshot, restore_last_status
 
     err = op_lock.try_acquire(OpKind.RESTORE)
@@ -788,7 +862,14 @@ async def run_restore(snapshot_id: str) -> bool:
         op_lock.release(OpKind.RESTORE)
         return False
 
-    logger.info("Starting restic restore from %s", snapshot_id)
+    if root is not None and root not in _ROOT_NAMES:
+        restore_last_status = f"error: unknown root '{root}'"
+        op_lock.release(OpKind.RESTORE)
+        return False
+
+    logger.info(
+        "Starting restic restore from %s (root=%s)", snapshot_id, root or "all"
+    )
 
     try:
         args = [
@@ -796,9 +877,15 @@ async def run_restore(snapshot_id: str) -> bool:
             snapshot_id,
             "--target",
             "/",  # restic restores the absolute paths as they were captured
-            "--exclude",
-            str(ALL_APP_DATA / "backup"),
         ]
+        # restic 0.17 forbids mixing --include and --exclude in one
+        # restore. When restoring a specific root we use --include
+        # (narrowing); otherwise we use --exclude to keep our own repo
+        # directory from being clobbered.
+        if root:
+            args += ["--include", str(_ROOT_NAMES[root])]
+        else:
+            args += ["--exclude", str(ALL_APP_DATA / "backup")]
         try:
             rc, _stdout, stderr = await _run_restic(
                 args, conf, timeout=RESTORE_TIMEOUT_SECONDS
@@ -1156,7 +1243,10 @@ async def trigger_restore():
     snapshot_id = data.get("snapshot", "")
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
         return jsonify(ok=False, error="Invalid snapshot id"), 400
-    asyncio.create_task(run_restore(snapshot_id))
+    root = data.get("root") or None
+    if root is not None and root not in _ROOT_NAMES:
+        return jsonify(ok=False, error=f"Unknown root: {root}"), 400
+    asyncio.create_task(run_restore(snapshot_id, root=root))
     return jsonify(ok=True, message="Restore started")
 
 
@@ -1174,15 +1264,20 @@ async def snapshot_files():
     snapshot_id = request.args.get("snapshot", "")
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
         return jsonify(ok=False, error="Invalid snapshot id"), 400
+    # ``root`` picks one of the three captured top-level trees. Omitted =
+    # return the synthetic root that lists all captured trees.
+    root = request.args.get("root") or None
+    if root is not None and root not in _ROOT_NAMES:
+        return jsonify(ok=False, error=f"Unknown root: {root}"), 400
     subpath = request.args.get("path", "")
     if not validate_subpath(subpath):
         return jsonify(ok=False, error="Invalid path"), 400
     try:
-        files, error = await list_snapshot_files(snapshot_id, subpath)
+        files, error = await list_snapshot_files(snapshot_id, subpath, root=root)
         if error:
             status_code = 404 if "not found" in error.lower() else 500
             return jsonify(ok=False, error=error), status_code
-        return jsonify(ok=True, files=files)
+        return jsonify(ok=True, files=files, root=root)
     except Exception as e:
         logger.exception("Failed to list snapshot files")
         return jsonify(ok=False, error=str(e)), 500

@@ -159,7 +159,7 @@
                     <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
                 </div>
                 <div class="btn-row">
-                    <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
+                    <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot(null, '')">Browse</button>
                     <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
                     <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
                 </div>
@@ -823,18 +823,19 @@
         // than inline onclick handlers. HTML attribute parsing entity-decodes
         // string values before the JS parser sees them, so inline handlers
         // are unsafe with user-controllable content (adversarial filenames in
-        // snapshots). Using textContent + data-path + delegated listeners is
+        // snapshots). Using textContent + data-* + delegated listeners is
         // safe because the DOM never interprets the value as code.
-        function makeBrowseLink(label, path) {
+        function makeBrowseLink(label, root, path) {
             const span = document.createElement("span");
             span.className = "browse-link";
             span.textContent = label;
-            span.dataset.path = path;
-            span.addEventListener("click", () => browseSnapshot(path));
+            span.dataset.root = root || "";
+            span.dataset.path = path || "";
+            span.addEventListener("click", () => browseSnapshot(root, path));
             return span;
         }
 
-        function renderFileBrowser(res, subpath) {
+        function renderFileBrowser(res, root, subpath) {
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
 
@@ -851,14 +852,19 @@
                 return;
             }
 
+            // Breadcrumb: snapshot root -> [root name] -> subpath parts
             breadcrumb.textContent = "";
-            breadcrumb.appendChild(makeBrowseLink("root", ""));
+            breadcrumb.appendChild(makeBrowseLink("snapshot", null, ""));
+            if (root) {
+                breadcrumb.appendChild(document.createTextNode(" / "));
+                breadcrumb.appendChild(makeBrowseLink(root, root, ""));
+            }
             const parts = subpath ? subpath.split("/") : [];
             let accumulated = "";
             parts.forEach((p, i) => {
                 accumulated += (i > 0 ? "/" : "") + p;
                 breadcrumb.appendChild(document.createTextNode(" / "));
-                breadcrumb.appendChild(makeBrowseLink(p, accumulated));
+                breadcrumb.appendChild(makeBrowseLink(p, root, accumulated));
             });
 
             body.textContent = "";
@@ -867,7 +873,7 @@
                 const td = document.createElement("td");
                 td.colSpan = 3;
                 td.style.cssText = "padding:6px 8px;color:#666;";
-                td.textContent = "Empty directory";
+                td.textContent = root ? "Empty directory" : "Snapshot has no captured roots";
                 tr.appendChild(td);
                 body.appendChild(tr);
                 return;
@@ -885,9 +891,17 @@
                 const nameTd = document.createElement("td");
                 nameTd.style.cssText = "padding:6px 8px;";
                 if (f.is_dir) {
-                    const fullPath = subpath ? subpath + "/" + f.path : f.path;
-                    const link = makeBrowseLink("\uD83D\uDCC1 " + f.path, fullPath);
-                    nameTd.appendChild(link);
+                    // At the synthetic root (no root selected yet), each row IS
+                    // a root; clicking it enters that root at empty subpath.
+                    // Otherwise, it's a dir within a root; clicking appends.
+                    if (!root) {
+                        const link = makeBrowseLink("\uD83D\uDCC1 " + f.path, f.path, "");
+                        nameTd.appendChild(link);
+                    } else {
+                        const fullPath = subpath ? subpath + "/" + f.path : f.path;
+                        const link = makeBrowseLink("\uD83D\uDCC1 " + f.path, root, fullPath);
+                        nameTd.appendChild(link);
+                    }
                 } else {
                     nameTd.textContent = "\uD83D\uDCC4 " + f.path;
                 }
@@ -907,7 +921,7 @@
             });
         }
 
-        async function browseSnapshot(subpath) {
+        async function browseSnapshot(root, subpath) {
             if (!selectedSnapshotId) return;
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
@@ -915,9 +929,10 @@
             container.style.display = "block";
 
             let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(selectedSnapshotId);
+            if (root) url += "&root=" + encodeURIComponent(root);
             if (subpath) url += "&path=" + encodeURIComponent(subpath);
             const res = await api(url);
-            renderFileBrowser(res, subpath);
+            renderFileBrowser(res, root || null, subpath || "");
         }
 
         async function triggerRestore() {
