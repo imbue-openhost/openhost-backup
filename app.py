@@ -569,6 +569,43 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         return [], False
 
 
+async def repo_stats() -> tuple[dict | None, str | None]:
+    """Return (stats, error) — how much space the restic repo is using.
+
+    Uses ``restic stats --mode raw-data`` which reports the deduplicated /
+    compressed on-disk footprint of the repository (this is the number
+    that matters for S3 cost / local disk usage). Also scopes to the
+    openhost tag so a shared repo isn't double-counted with unrelated
+    snapshots.
+    """
+    conf = load_config()
+    if not conf.get("repo") or not conf.get("repo_password"):
+        return None, "Restic repo not configured"
+    try:
+        rc, stdout, stderr = await _run_restic(
+            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost"],
+            conf,
+            timeout=60,
+        )
+        if rc != 0:
+            return None, stderr.decode(errors="replace").strip() or f"restic exit {rc}"
+        data = json.loads(stdout.decode(errors="replace") or "{}")
+        # raw-data mode returns total_size / total_blob_count / snapshots_count
+        # and compression stats. It does NOT return total_file_count (that
+        # only exists for restore-size / files-by-contents). We surface
+        # total_size because that's the actual on-disk / S3 footprint.
+        return {
+            "total_size_bytes": data.get("total_size", 0),
+            "total_uncompressed_size_bytes": data.get("total_uncompressed_size", 0),
+            "total_blob_count": data.get("total_blob_count", 0),
+            "snapshots_count": data.get("snapshots_count", 0),
+            "compression_ratio": data.get("compression_ratio"),
+        }, None
+    except Exception as e:
+        logger.exception("repo_stats failed")
+        return None, str(e)
+
+
 def validate_subpath(path: str) -> bool:
     if not path:
         return True
@@ -1101,6 +1138,14 @@ async def status():
 async def api_snapshots():
     snapshots, repo_ok = await list_snapshots()
     return jsonify(ok=True, snapshots=snapshots, repo_ok=repo_ok)
+
+
+@route("/api/repo/stats")
+async def api_repo_stats():
+    stats, error = await repo_stats()
+    if error:
+        return jsonify(ok=False, error=error), 500
+    return jsonify(ok=True, stats=stats)
 
 
 @route("/api/restore", methods=["POST"])

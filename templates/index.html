@@ -117,6 +117,10 @@
                 </dd>
                 <dt>Location</dt>
                 <dd id="status-location" style="font-family:monospace;font-size:0.85rem;word-break:break-all;">{{ backend.location or config.repo }}</dd>
+                <dt title="Deduplicated + compressed on-disk size of the restic repository">Repo size</dt>
+                <dd id="status-repo-size">
+                    <span style="color:#888;font-size:0.85rem;">loading…</span>
+                </dd>
             </dl>
             <div style="margin-top: 12px;">
                 <label>Backup name (optional)</label>
@@ -144,7 +148,7 @@
                             <th style="padding:6px 8px;">Time (UTC)</th>
                             <th style="padding:6px 8px;">ID</th>
                             <th style="padding:6px 8px;">Name</th>
-                            <th style="padding:6px 8px;text-align:right;">Size</th>
+                            <th style="padding:6px 8px;text-align:right;" title="Logical size of the files in this snapshot (before dedup/compression)">Snapshot size</th>
                         </tr>
                     </thead>
                     <tbody id="snapshots-body"></tbody>
@@ -545,6 +549,26 @@
             }
         }
 
+        async function loadRepoStats() {
+            const el = document.getElementById("status-repo-size");
+            if (!el) return;
+            const res = await api("/api/repo/stats");
+            if (!res.ok) {
+                el.innerHTML = '<span style="color:#991b1b;font-size:0.85rem;">' + escapeHtml(res.error || "unavailable") + '</span>';
+                return;
+            }
+            const s = res.stats || {};
+            const size = formatBytes(s.total_size_bytes || 0);
+            const snaps = s.snapshots_count != null ? s.snapshots_count : "?";
+            // Compression ratio > 1 means restic's zstd saved space. Only
+            // show it when we actually got a number back.
+            let ratioNote = "";
+            if (s.compression_ratio && s.compression_ratio > 1.01) {
+                ratioNote = ", " + s.compression_ratio.toFixed(2) + "× compression";
+            }
+            el.innerHTML = escapeHtml(size) + ' <span style="color:#666;font-size:0.85rem;">(' + escapeHtml(String(snaps)) + ' snapshots' + escapeHtml(ratioNote) + ')</span>';
+        }
+
         async function loadEnvKeys() {
             const res = await api("/api/config");
             const el = document.getElementById("env-existing");
@@ -644,8 +668,9 @@
                     lastEl.textContent = res.last_backup || "never";
                     btn.disabled = false;
                     btn.textContent = "Run backup now";
-                    // Snapshots may have changed — refresh the list.
+                    // Snapshots may have changed — refresh the list + repo size.
                     loadSnapshots();
+                    loadRepoStats();
                 }
             };
             poll();
@@ -954,6 +979,7 @@
                 document.getElementById("action-panel").style.display = "none";
                 document.getElementById("browse-container").style.display = "none";
                 loadSnapshots();
+                loadRepoStats();
             } else {
                 showMsg("manage-msg", res.error || "Delete failed", false);
             }
@@ -1035,9 +1061,10 @@
             poll();
         }
 
-        // Auto-load snapshots + env keys on page load.
+        // Auto-load snapshots + env keys + repo stats on page load.
         loadSnapshots();
         loadEnvKeys();
+        loadRepoStats();
     </script>
 </body>
 </html>
