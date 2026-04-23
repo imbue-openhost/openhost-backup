@@ -724,10 +724,7 @@
                 const rec = byId[s.id] || byId[s.short_id] || null;
                 const name = (s.tags || []).filter(t => t.startsWith("name:")).map(t => t.slice(5))[0] || (rec && rec.name) || "";
                 const sizeBytes = rec && rec.total_size_bytes != null ? rec.total_size_bytes : null;
-                const addedBytes = rec && rec.data_added_bytes != null ? rec.data_added_bytes : null;
-                const sizeText = sizeBytes != null
-                    ? formatBytes(sizeBytes) + (addedBytes != null ? " (+" + formatBytes(addedBytes) + ")" : "")
-                    : "-";
+                const sizeText = sizeBytes != null ? formatBytes(sizeBytes) : "-";
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
                 tr.style.cursor = "pointer";
