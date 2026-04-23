@@ -153,6 +153,11 @@
                     </thead>
                     <tbody id="snapshots-body"></tbody>
                 </table>
+                <div id="snapshots-pager" class="btn-row" style="justify-content:space-between;display:none;">
+                    <button class="btn-secondary" id="btn-snap-prev" onclick="changeSnapshotsPage(-1)" disabled>Prev</button>
+                    <span id="snapshots-page-info" style="font-size:0.85rem;color:#666;"></span>
+                    <button class="btn-secondary" id="btn-snap-next" onclick="changeSnapshotsPage(1)" disabled>Next</button>
+                </div>
             </div>
             <div id="action-panel" style="display:none;margin-top:12px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
@@ -360,6 +365,13 @@
     <script>
         const BASE = "{{ base_path }}";
         let selectedSnapshotId = null;
+        // Client-side pagination for the snapshots table. The /api/snapshots
+        // endpoint returns the full list in one shot (restic has no native
+        // pagination), so we just slice it by page on the client.
+        const SNAPSHOTS_PER_PAGE = 10;
+        let snapshotsAll = [];
+        let snapshotsNameMap = {};
+        let snapshotsPage = 0;
 
         /* ================================================================
            Router token setup
@@ -718,35 +730,69 @@
             document.getElementById("action-panel").style.display = "none";
             document.getElementById("browse-container").style.display = "none";
 
-            const res = await api("/api/snapshots");
-            const [hist] = await Promise.all([api("/api/history?limit=100&offset=0")]);
-            const byId = {};
+            // Fire both fetches in parallel (Promise.all now actually has >1).
+            const [res, hist] = await Promise.all([
+                api("/api/snapshots"),
+                api("/api/history?limit=500&offset=0"),
+            ]);
+            snapshotsNameMap = {};
             if (hist.ok) {
                 (hist.history || []).forEach(h => {
-                    if (h.snapshot_id) byId[h.snapshot_id] = h;
+                    if (h.snapshot_id) snapshotsNameMap[h.snapshot_id] = h;
                 });
             }
 
             const container = document.getElementById("snapshots-container");
             const body = document.getElementById("snapshots-body");
+            const pager = document.getElementById("snapshots-pager");
             body.innerHTML = "";
+            pager.style.display = "none";
 
             if (!res.ok || !res.repo_ok) {
                 container.style.display = "block";
                 body.innerHTML = '<tr><td colspan="4" style="padding:6px 8px;color:#991b1b;">Could not read restic repo. Check the repository URL and password.</td></tr>';
                 if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
+                snapshotsAll = [];
                 return;
             }
 
-            if (!res.snapshots || res.snapshots.length === 0) {
+            snapshotsAll = res.snapshots || [];
+
+            if (snapshotsAll.length === 0) {
                 container.style.display = "block";
                 body.innerHTML = '<tr><td colspan="4" style="padding:6px 8px;color:#666;">No snapshots yet.</td></tr>';
                 if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
                 return;
             }
 
-            res.snapshots.forEach(s => {
-                const rec = byId[s.id] || byId[s.short_id] || null;
+            // Reset to page 0 whenever the underlying list changes. If the
+            // current page is out of range (e.g. after deleting the last
+            // snapshot on page 3), clamp it down.
+            const maxPage = Math.max(0, Math.ceil(snapshotsAll.length / SNAPSHOTS_PER_PAGE) - 1);
+            if (snapshotsPage > maxPage) snapshotsPage = maxPage;
+            renderSnapshotsPage();
+
+            container.style.display = "block";
+            if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
+        }
+
+        function renderSnapshotsPage() {
+            const body = document.getElementById("snapshots-body");
+            const pager = document.getElementById("snapshots-pager");
+            body.innerHTML = "";
+
+            const total = snapshotsAll.length;
+            if (total === 0) {
+                pager.style.display = "none";
+                return;
+            }
+
+            const start = snapshotsPage * SNAPSHOTS_PER_PAGE;
+            const end = Math.min(start + SNAPSHOTS_PER_PAGE, total);
+            const slice = snapshotsAll.slice(start, end);
+
+            slice.forEach(s => {
+                const rec = snapshotsNameMap[s.id] || snapshotsNameMap[s.short_id] || null;
                 const name = (s.tags || []).filter(t => t.startsWith("name:")).map(t => t.slice(5))[0] || (rec && rec.name) || "";
                 const sizeBytes = rec && rec.total_size_bytes != null ? rec.total_size_bytes : null;
                 const sizeText = sizeBytes != null ? formatBytes(sizeBytes) : "-";
@@ -756,6 +802,7 @@
                 tr.onmouseenter = () => { if (selectedSnapshotId !== s.id) tr.style.background = "#f8fafc"; };
                 tr.onmouseleave = () => { if (selectedSnapshotId !== s.id) tr.style.background = ""; };
                 tr.onclick = () => selectSnapshot(s.id, s.short_id);
+                if (selectedSnapshotId === s.id) tr.style.background = "#eff6ff";
                 const nameHtml = rec
                     ? (name
                         ? '<span class="name-label" onclick="event.stopPropagation(); renameBackup(' + rec.id + ', this)">' + escapeHtml(name) + '</span>'
@@ -769,8 +816,21 @@
                 body.appendChild(tr);
             });
 
-            container.style.display = "block";
-            if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
+            const pageCount = Math.ceil(total / SNAPSHOTS_PER_PAGE);
+            document.getElementById("snapshots-page-info").textContent =
+                "Showing " + (start + 1) + "\u2013" + end + " of " + total +
+                " (page " + (snapshotsPage + 1) + "/" + pageCount + ")";
+            document.getElementById("btn-snap-prev").disabled = snapshotsPage === 0;
+            document.getElementById("btn-snap-next").disabled = end >= total;
+            pager.style.display = total > SNAPSHOTS_PER_PAGE ? "flex" : "none";
+        }
+
+        function changeSnapshotsPage(delta) {
+            const pageCount = Math.ceil(snapshotsAll.length / SNAPSHOTS_PER_PAGE);
+            const next = snapshotsPage + delta;
+            if (next < 0 || next >= pageCount) return;
+            snapshotsPage = next;
+            renderSnapshotsPage();
         }
 
         async function renameBackup(id, el) {
