@@ -1,7 +1,7 @@
 [app]
 name = "backup"
 version = "0.1.0"
-description = "User-controlled backups of app data via rclone"
+description = "User-controlled incremental backups of app data via restic"
 
 [runtime]
 type = "serverfull"

@@ -396,3 +396,100 @@ class TestStatusBackend:
         # Default is a local path.
         assert data["backend"]["type"] == "local"
         assert data["backend"]["remote"] is False
+
+
+class TestPasswordReveal:
+    async def test_password_reveal_requires_auth(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.get("/api/config/password")
+        assert resp.status_code == 401
+        data = await resp.get_json()
+        assert data["ok"] is False
+
+    @patch("app._verify_admin_token", new_callable=AsyncMock)
+    async def test_password_reveal_with_valid_token(self, mock_verify, client):
+        backup_app.ensure_default_config()
+        mock_verify.return_value = True
+        resp = await client.get(
+            "/api/config/password",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+        assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["ok"] is True
+        # Password is the auto-generated one from ensure_default_config.
+        assert data["password"]
+
+    @patch("app._verify_admin_token", new_callable=AsyncMock)
+    async def test_password_reveal_with_invalid_token(self, mock_verify, client):
+        mock_verify.return_value = False
+        resp = await client.get(
+            "/api/config/password",
+            headers={"Authorization": "Bearer bad-token"},
+        )
+        assert resp.status_code == 401
+
+
+class TestConfigRedactsRouterToken:
+    async def test_router_api_token_redacted(self, client):
+        # Seed a token directly.
+        backup_app.ensure_default_config()
+        conf = backup_app.load_config()
+        conf["router_api_token"] = "secret-router-token"
+        backup_app.save_config(conf)
+
+        resp = await client.get("/api/config")
+        data = await resp.get_json()
+        assert data["config"]["router_api_token"] == "***"
+        # Underlying storage still has the real value.
+        assert backup_app.load_config()["router_api_token"] == "secret-router-token"
+
+
+class TestPostConfigSensitiveWrites:
+    async def test_first_router_token_bootstraps_without_auth(self, client):
+        # Fresh install — no token yet — setting one should succeed.
+        backup_app.ensure_default_config()
+        # Make sure it's really empty.
+        conf = backup_app.load_config()
+        conf["router_api_token"] = ""
+        backup_app.save_config(conf)
+
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"router_api_token": "first-token"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+
+    async def test_rotate_router_token_requires_auth(self, client):
+        backup_app.ensure_default_config()
+        conf = backup_app.load_config()
+        conf["router_api_token"] = "existing"
+        backup_app.save_config(conf)
+
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"router_api_token": "rotated"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 401
+        # Token should NOT have been rotated.
+        assert backup_app.load_config()["router_api_token"] == "existing"
+
+    async def test_set_repo_password_requires_auth(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"repo_password": "new-pw"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 401
+
+    async def test_invalid_interval_seconds(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"interval_seconds": "abc"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400

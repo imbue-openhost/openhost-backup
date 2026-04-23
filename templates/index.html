@@ -183,12 +183,16 @@
             <p class="info">
                 The backup app stores snapshots in a restic repository. By default it
                 points at a local path inside the backup app's own data directory. You
-                can change this to any restic-supported backend (e.g.
-                <code>s3:s3.amazonaws.com/bucket/path</code>,
-                <code>b2:bucket:path</code>, <code>sftp:user@host:/path</code>). Changing
-                the repo URL does not migrate existing data. The repo password is
-                required to read or write the repo — losing it makes backups
-                unrecoverable.
+                can change this to any restic-supported backend. For AWS S3, use the
+                <strong>region-specific</strong> endpoint matching your bucket's region,
+                e.g. <code>s3:s3.us-west-2.amazonaws.com/bucket/path</code> (using the
+                generic <code>s3.amazonaws.com</code> endpoint works but adds an extra
+                redirect on every request and can fail signature checks if
+                <code>AWS_DEFAULT_REGION</code> doesn't match the bucket). Other
+                examples: <code>b2:bucket:path</code>,
+                <code>sftp:user@host:/path</code>. Changing the repo URL does not
+                migrate existing data. The repo password is required to read or write
+                the repo — losing it makes backups unrecoverable.
             </p>
             <label>Repository URL</label>
             <input type="text" id="conf-repo" value="{{ config.repo }}">
@@ -517,12 +521,27 @@
         }
 
         async function showPassword() {
-            const res = await api("/api/config/password");
+            // Password reveal requires an explicit Bearer token because the
+            // backup app can't tell, from inside its container, whether a
+            // caller is the owner in a browser vs. another app on the same
+            // Docker network. Prompt for the owner's OpenHost API token.
+            const token = prompt(
+                "Paste an OpenHost API token to reveal the restic repo password.\n\n" +
+                "You can generate one from the OpenHost dashboard → API Tokens. " +
+                "This token is not stored in your browser.");
+            if (!token) return;
             const el = document.getElementById("current-password-display");
-            if (res.ok) {
-                el.textContent = res.password || "(empty)";
+            const r = await fetch(BASE + "/api/config/password", {
+                headers: { "Authorization": "Bearer " + token.trim() },
+            });
+            let body = {};
+            try { body = await r.json(); } catch {}
+            if (r.status === 401) {
+                el.textContent = "unauthorized — token rejected by router";
+            } else if (body.ok) {
+                el.textContent = body.password || "(empty)";
             } else {
-                el.textContent = "error";
+                el.textContent = "error: " + (body.error || r.status);
             }
         }
 
@@ -778,29 +797,57 @@
             });
         }
 
+        // Build navigation links via addEventListener + data attributes rather
+        // than inline onclick handlers. HTML attribute parsing entity-decodes
+        // string values before the JS parser sees them, so inline handlers
+        // are unsafe with user-controllable content (adversarial filenames in
+        // snapshots). Using textContent + data-path + delegated listeners is
+        // safe because the DOM never interprets the value as code.
+        function makeBrowseLink(label, path) {
+            const span = document.createElement("span");
+            span.className = "browse-link";
+            span.textContent = label;
+            span.dataset.path = path;
+            span.addEventListener("click", () => browseSnapshot(path));
+            return span;
+        }
+
         function renderFileBrowser(res, subpath) {
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
 
             if (!res.ok) {
-                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#991b1b;">' + escapeHtml(res.error || "Failed to load files") + '</td></tr>';
-                breadcrumb.innerHTML = "";
+                body.textContent = "";
+                const tr = document.createElement("tr");
+                const td = document.createElement("td");
+                td.colSpan = 3;
+                td.style.cssText = "padding:6px 8px;color:#991b1b;";
+                td.textContent = res.error || "Failed to load files";
+                tr.appendChild(td);
+                body.appendChild(tr);
+                breadcrumb.textContent = "";
                 return;
             }
 
+            breadcrumb.textContent = "";
+            breadcrumb.appendChild(makeBrowseLink("root", ""));
             const parts = subpath ? subpath.split("/") : [];
-            let bc = '<span class="browse-link" onclick="browseSnapshot(\'\')">root</span>';
             let accumulated = "";
             parts.forEach((p, i) => {
                 accumulated += (i > 0 ? "/" : "") + p;
-                const path = accumulated;
-                bc += ' / <span class="browse-link" onclick="browseSnapshot(\'' + escapeHtml(path) + '\')">' + escapeHtml(p) + '</span>';
+                breadcrumb.appendChild(document.createTextNode(" / "));
+                breadcrumb.appendChild(makeBrowseLink(p, accumulated));
             });
-            breadcrumb.innerHTML = bc;
 
-            body.innerHTML = "";
+            body.textContent = "";
             if (!res.files || res.files.length === 0) {
-                body.innerHTML = '<tr><td colspan="3" style="padding:6px 8px;color:#666;">Empty directory</td></tr>';
+                const tr = document.createElement("tr");
+                const td = document.createElement("td");
+                td.colSpan = 3;
+                td.style.cssText = "padding:6px 8px;color:#666;";
+                td.textContent = "Empty directory";
+                tr.appendChild(td);
+                body.appendChild(tr);
                 return;
             }
 
@@ -812,13 +859,28 @@
             sorted.forEach(f => {
                 const tr = document.createElement("tr");
                 tr.style.borderBottom = "1px solid #eee";
-                const fullPath = subpath ? subpath + "/" + f.path : f.path;
-                const nameCell = f.is_dir
-                    ? '<td style="padding:6px 8px;"><span class="browse-link" onclick="browseSnapshot(\'' + escapeHtml(fullPath) + '\')">&#128193; ' + escapeHtml(f.path) + '</span></td>'
-                    : '<td style="padding:6px 8px;">&#128196; ' + escapeHtml(f.path) + '</td>';
-                const sizeCell = '<td style="padding:6px 8px;text-align:right;">' + (f.is_dir ? "-" : formatBytes(f.size)) + '</td>';
-                const modCell = '<td style="padding:6px 8px;font-size:0.8rem;color:#666;">' + escapeHtml(f.mod_time ? String(f.mod_time).substring(0, 19) : "") + '</td>';
-                tr.innerHTML = nameCell + sizeCell + modCell;
+
+                const nameTd = document.createElement("td");
+                nameTd.style.cssText = "padding:6px 8px;";
+                if (f.is_dir) {
+                    const fullPath = subpath ? subpath + "/" + f.path : f.path;
+                    const link = makeBrowseLink("\uD83D\uDCC1 " + f.path, fullPath);
+                    nameTd.appendChild(link);
+                } else {
+                    nameTd.textContent = "\uD83D\uDCC4 " + f.path;
+                }
+
+                const sizeTd = document.createElement("td");
+                sizeTd.style.cssText = "padding:6px 8px;text-align:right;";
+                sizeTd.textContent = f.is_dir ? "-" : formatBytes(f.size);
+
+                const modTd = document.createElement("td");
+                modTd.style.cssText = "padding:6px 8px;font-size:0.8rem;color:#666;";
+                modTd.textContent = f.mod_time ? String(f.mod_time).substring(0, 19) : "";
+
+                tr.appendChild(nameTd);
+                tr.appendChild(sizeTd);
+                tr.appendChild(modTd);
                 body.appendChild(tr);
             });
         }

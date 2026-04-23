@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-import secrets as pysecrets
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,7 +81,6 @@ ALLOWED_ENV_KEYS = {
     "OS_PASSWORD",
     "OS_TENANT_ID",
     "OS_TENANT_NAME",
-    "RCLONE_BWLIMIT",
 }
 
 # Snapshot IDs are hex strings; restic emits 8-char short IDs and 64-char long
@@ -274,6 +273,40 @@ def _extract_bearer_token() -> str | None:
     return None
 
 
+async def _verify_admin_token(supplied: str | None) -> bool:
+    """Return True iff ``supplied`` is a valid admin Bearer token.
+
+    The backup app is reachable unauthenticated from inside the container
+    network (co-located apps on the Docker bridge can hit
+    ``http://backup:8080/...`` directly, bypassing the OpenHost router's
+    auth layer). Sensitive operations — password reveal, writing the
+    stored router_api_token or repo_password — must therefore require an
+    explicit caller token.
+
+    We accept any token that the local OpenHost router accepts. The
+    router validates the token by checking it against the owner API
+    tokens table, so this gives us real auth even though the backup app
+    itself doesn't have a user database.
+    """
+    if not supplied:
+        return False
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(verify=False, timeout=5) as client:
+            r = await client.get(
+                f"{ROUTER_URL}/api/apps",
+                headers={"Authorization": f"Bearer {supplied}"},
+            )
+            return (
+                r.status_code == 200
+                and "json" in r.headers.get("content-type", "")
+            )
+    except Exception:
+        logger.exception("Admin token verification failed")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Restic helpers
 # ---------------------------------------------------------------------------
@@ -298,7 +331,12 @@ def _restic_env(conf: dict) -> dict:
 
 
 async def _run_restic(args: list[str], conf: dict, timeout: float | None = None):
-    """Run `restic <args>` with configured repo, return (returncode, stdout, stderr)."""
+    """Run `restic <args>` with configured repo, return (returncode, stdout, stderr).
+
+    Raises asyncio.TimeoutError if the subprocess exceeds ``timeout``. On
+    either timeout OR task cancellation, the subprocess is killed so we
+    don't leak a live restic process holding the repo lock.
+    """
     env = _restic_env(conf)
     proc = await asyncio.create_subprocess_exec(
         "restic",
@@ -309,11 +347,37 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        # Reap the child so it doesn't become a zombie.
+        try:
+            await proc.wait()
+        except Exception:
+            pass
         raise
     return proc.returncode, stdout, stderr
+
+
+def _parse_ndjson(data: bytes):
+    """Iterate over NDJSON messages in ``data``, skipping blank/invalid lines."""
+    for raw in data.decode(errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            yield json.loads(raw)
+        except json.JSONDecodeError:
+            logger.debug("restic: non-JSON stdout line: %s", raw)
+
+
+# Long enough for multi-GB S3 uploads on slow links but still finite — a
+# wedged TCP connection can't permanently brick the scheduler.
+BACKUP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+RESTORE_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours
+CHECK_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
 
 
 async def ensure_repo_initialized(conf: dict) -> tuple[bool, str | None]:
@@ -331,10 +395,12 @@ async def ensure_repo_initialized(conf: dict) -> tuple[bool, str | None]:
     # If the repo simply doesn't exist, init it. Heuristic on the error text;
     # restic doesn't expose a clean "not found" exit code.
     if "does not exist" in err.lower() or "unable to open config" in err.lower() or "no such file" in err.lower():
-        # Local repo path: make sure parent exists.
-        repo = conf["repo"]
-        if not repo.startswith(("s3:", "b2:", "sftp:", "rest:", "gs:", "azure:", "swift:", "rclone:")):
-            Path(repo).parent.mkdir(parents=True, exist_ok=True)
+        # Local repo path: make sure parent exists. classify_repo already
+        # strips any `local:` prefix, so we use its `location` as the on-disk
+        # path rather than the raw repo string.
+        info = classify_repo(conf["repo"])
+        if info["type"] == "local" and info["location"]:
+            Path(info["location"]).parent.mkdir(parents=True, exist_ok=True)
         rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
         if rc2 != 0:
             return False, f"restic init failed: {err2.decode(errors='replace').strip()}"
@@ -397,29 +463,23 @@ async def run_backup(name: str | None = None) -> bool:
         for t in tags:
             args += ["--tag", t]
 
-        env = _restic_env(conf)
-        proc = await asyncio.create_subprocess_exec(
-            "restic",
-            *args,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+        # Go through the shared helper so the subprocess has a bounded
+        # timeout and gets properly killed on cancellation. BACKUP_TIMEOUT
+        # is generous for large instances but still finite — a wedged S3
+        # connection would otherwise hold the op lock forever.
+        try:
+            rc, stdout, stderr = await _run_restic(args, conf, timeout=BACKUP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            msg = f"restic backup timed out after {BACKUP_TIMEOUT_SECONDS}s"
+            record_backup(timestamp, "error", msg, name=name)
+            logger.error(msg)
+            return False
 
         summary = None
         if stdout:
             # Restic emits NDJSON to stdout with --json; the last `summary`
             # message contains the snapshot ID and byte counts.
-            for raw in stdout.decode(errors="replace").splitlines():
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.info("restic: %s", raw)
-                    continue
+            for msg in _parse_ndjson(stdout):
                 if msg.get("message_type") == "summary":
                     summary = msg
 
@@ -428,7 +488,7 @@ async def run_backup(name: str | None = None) -> bool:
                 if line.strip():
                     logger.info("restic stderr: %s", line)
 
-        if proc.returncode == 0 and summary is not None:
+        if rc == 0 and summary is not None:
             record_backup(
                 timestamp,
                 "success",
@@ -446,13 +506,13 @@ async def run_backup(name: str | None = None) -> bool:
             )
             return True
 
-        if proc.returncode == 0:
+        if rc == 0:
             # Succeeded but we somehow missed the summary line.
             record_backup(timestamp, "success", name=name)
             logger.info("Backup completed (no summary parsed)")
             return True
 
-        error_msg = stderr.decode(errors="replace").strip() or f"restic exit code {proc.returncode}"
+        error_msg = stderr.decode(errors="replace").strip() or f"restic exit code {rc}"
         record_backup(timestamp, "error", error_msg, name=name)
         logger.error("Backup failed: %s", error_msg)
         return False
@@ -478,13 +538,17 @@ async def list_snapshots() -> tuple[list[dict], bool]:
     if not conf.get("repo") or not conf.get("repo_password"):
         return [], False
     try:
+        # Scope to the "openhost" tag so, if the user points this app at a
+        # repo shared with other hosts/projects, we only surface snapshots
+        # written by this app. Backups are created with --tag openhost in
+        # run_backup.
         rc, stdout, stderr = await _run_restic(
-            ["snapshots", "--json"], conf, timeout=60
+            ["snapshots", "--json", "--tag", "openhost"], conf, timeout=60
         )
         if rc != 0:
             logger.error("restic snapshots failed: %s", stderr.decode(errors="replace").strip())
             return [], False
-        entries = json.loads(stdout.decode() or "[]")
+        entries = json.loads(stdout.decode(errors="replace") or "[]")
         out = []
         for e in entries:
             out.append(
@@ -576,13 +640,19 @@ async def list_snapshot_files(snapshot_id: str, subpath: str = ""):
 
 
 async def delete_snapshot(snapshot_id: str) -> bool:
-    """Remove a snapshot. Runs `forget`; prune happens separately / later."""
+    """Remove a snapshot.
+
+    Runs ``restic forget --prune`` so disk/object-store space is reclaimed
+    immediately. Prune on a large repo can be slow (several minutes on an
+    S3 repo with a lot of data) — we set a generous but bounded timeout so
+    a wedged prune can't permanently hold the UI.
+    """
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return False
     try:
         rc, _out, stderr = await _run_restic(
-            ["forget", snapshot_id], conf, timeout=120
+            ["forget", "--prune", snapshot_id], conf, timeout=30 * 60
         )
         if rc != 0:
             logger.warning(
@@ -595,13 +665,26 @@ async def delete_snapshot(snapshot_id: str) -> bool:
         logger.exception("restic forget failed")
         return False
 
+    # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
+    # that restic emits in its --json summary, so an exact match on the
+    # user-supplied ID is sufficient when they pass a full ID. When they
+    # pass a short (8-char) ID, match by prefix with length >= 8 to avoid
+    # accidental matches on arbitrary substrings.
     conn = get_db()
     try:
-        conn.execute(
-            "DELETE FROM backups WHERE snapshot_id = ? OR snapshot_id LIKE ?",
-            (snapshot_id, snapshot_id + "%"),
-        )
+        if len(snapshot_id) >= 40:
+            conn.execute(
+                "DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,)
+            )
+        else:
+            conn.execute(
+                "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
+                (len(snapshot_id), snapshot_id),
+            )
         conn.commit()
+    except sqlite3.Error:
+        # The restic forget already succeeded; don't fail the operation.
+        logger.exception("DB cleanup failed for snapshot %s", snapshot_id)
     finally:
         conn.close()
     logger.info("Deleted snapshot %s", snapshot_id)
@@ -679,7 +762,16 @@ async def run_restore(snapshot_id: str) -> bool:
             "--exclude",
             str(ALL_APP_DATA / "backup"),
         ]
-        rc, _stdout, stderr = await _run_restic(args, conf, timeout=None)
+        try:
+            rc, _stdout, stderr = await _run_restic(
+                args, conf, timeout=RESTORE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            restore_last_status = (
+                f"error: restore timed out after {RESTORE_TIMEOUT_SECONDS}s"
+            )
+            logger.error(restore_last_status)
+            return False
 
         if rc == 0:
             restore_last_snapshot = snapshot_id
@@ -705,19 +797,35 @@ async def run_restore(snapshot_id: str) -> bool:
 
 
 async def run_check() -> bool:
-    """Run `restic check`. Updates module-level state. Doesn't take op lock —
-    check is read-only; restic takes its own repo lock."""
+    """Run `restic check`. Updates module-level state.
+
+    Note: this coroutine doesn't take ``op_lock`` itself — callers (the
+    HTTP route) are expected to gate on both ``op_lock.busy`` and
+    ``check_running`` to avoid colliding with backup/restore or another
+    concurrent check. restic itself acquires its own repo-level lock.
+    """
     global check_last_status, check_last_output, check_last_at, check_running
-    check_running = True
-    conf = load_config()
-    if not conf.get("repo") or not conf.get("repo_password"):
-        check_last_status = "error"
-        check_last_output = "Restic repo not configured"
-        check_last_at = datetime.now(timezone.utc).isoformat()
-        check_running = False
-        return False
+    # Set the flag inside the try so that any exception from load_config /
+    # _run_restic still runs the finally clause that clears it. Without
+    # this, a corrupt config.json would leave check_running=True forever.
     try:
-        rc, stdout, stderr = await _run_restic(["check"], conf, timeout=None)
+        check_running = True
+        conf = load_config()
+        if not conf.get("repo") or not conf.get("repo_password"):
+            check_last_status = "error"
+            check_last_output = "Restic repo not configured"
+            check_last_at = datetime.now(timezone.utc).isoformat()
+            return False
+        try:
+            rc, stdout, stderr = await _run_restic(
+                ["check"], conf, timeout=CHECK_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            check_last_status = "error"
+            check_last_output = f"restic check timed out after {CHECK_TIMEOUT_SECONDS}s"
+            check_last_at = datetime.now(timezone.utc).isoformat()
+            logger.error(check_last_output)
+            return False
         output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
         check_last_output = output[-4000:]  # cap
         check_last_at = datetime.now(timezone.utc).isoformat()
@@ -783,7 +891,7 @@ def ensure_default_config():
     if not CONFIG_FILE.exists():
         dirty = True
     if not conf.get("repo_password"):
-        conf["repo_password"] = pysecrets.token_urlsafe(32)
+        conf["repo_password"] = secrets.token_urlsafe(32)
         dirty = True
         logger.warning(
             "Generated new restic repo password — back it up via the Backup UI"
@@ -863,8 +971,9 @@ async def index():
 @route("/api/config", methods=["GET"])
 async def get_config():
     conf = load_config()
-    # Redact secrets: password + env values. Report which env keys exist so
-    # the UI can render them without leaking plaintext.
+    # Redact secrets: repo password, env values (backend credentials), and
+    # the router API token. Report which env keys exist so the UI can
+    # render them without leaking plaintext.
     env = conf.get("env") or {}
     env_keys = sorted(k for k, v in env.items() if v)
     redacted = {
@@ -872,6 +981,7 @@ async def get_config():
         "repo_password": "***" if conf.get("repo_password") else "",
         "env": {k: "***" for k in env_keys},
         "env_keys": env_keys,
+        "router_api_token": "***" if conf.get("router_api_token") else "",
         "backend": classify_repo(conf.get("repo", "")),
     }
     return jsonify(config=redacted)
@@ -880,7 +990,36 @@ async def get_config():
 @route("/api/config", methods=["POST"])
 async def post_config():
     data = await request.get_json()
-    conf = load_config()
+    # Writing the repo password or router_api_token is a privileged
+    # operation — gate it on a valid router token so a co-located app
+    # on the same Docker network can't rotate these under us. Other
+    # fields (repo URL, interval, env without secrets...) are not
+    # gated so the UI's default flows still work unauthenticated within
+    # the router boundary.
+    current_conf = load_config()
+    # Writing these fields is privileged — without a check, any app on
+    # the local Docker network could rotate them.
+    sensitive_write = "repo_password" in data or "router_api_token" in data
+    # Bootstrap exception: a fresh install has no router_api_token yet, so
+    # we let the user set one without authorization. Once set, future
+    # writes require an explicit Bearer token.
+    bootstrap_setting_token = (
+        "router_api_token" in data
+        and not current_conf.get("router_api_token")
+        and "repo_password" not in data
+    )
+    if sensitive_write and not bootstrap_setting_token:
+        # Explicit Bearer token in the header only — don't fall back to the
+        # app's stored router_api_token, since the point of this check is
+        # to stop a local caller from rotating these secrets.
+        supplied = _extract_bearer_token()
+        if not await _verify_admin_token(supplied):
+            return jsonify(
+                ok=False,
+                error="Explicit Bearer token required to modify repo_password or router_api_token",
+            ), 401
+
+    conf = current_conf
     for key in ("interval_seconds", "repo", "repo_password", "router_api_token"):
         if key in data and data[key] not in (None, "***"):
             conf[key] = data[key]
@@ -904,15 +1043,29 @@ async def post_config():
                 current_env[k] = str(v)
         conf["env"] = current_env
     if "interval_seconds" in data:
-        conf["interval_seconds"] = max(60, int(conf["interval_seconds"]))
+        try:
+            interval = int(data["interval_seconds"])
+        except (TypeError, ValueError):
+            return jsonify(
+                ok=False, error="interval_seconds must be an integer"
+            ), 400
+        conf["interval_seconds"] = max(60, interval)
     save_config(conf)
     return jsonify(ok=True)
 
 
 @route("/api/config/password", methods=["GET"])
 async def reveal_password():
-    """Return the actual repo password. Separate endpoint so it doesn't leak
-    into the default config response / UI state dumps."""
+    """Return the actual repo password.
+
+    Gated on an explicit Bearer token in the ``Authorization`` header —
+    the password unlocks the entire backup archive, and without this
+    check any co-located app on the same Docker network could read it
+    from ``http://backup:8080/api/config/password``.
+    """
+    supplied = _extract_bearer_token()
+    if not await _verify_admin_token(supplied):
+        return jsonify(ok=False, error="Bearer token required"), 401
     conf = load_config()
     return jsonify(ok=True, password=conf.get("repo_password", ""))
 
@@ -1009,9 +1162,12 @@ async def snapshot_delete():
 @route("/api/check", methods=["POST"])
 async def trigger_check():
     # `restic check` is read-only from the data's perspective but it does
-    # acquire a repo lock, so don't run it on top of a backup/restore.
+    # acquire a repo lock, so don't run it on top of a backup/restore, and
+    # don't spawn a second check if one is already in flight.
     if op_lock.busy:
         return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+    if check_running:
+        return jsonify(ok=False, error="check already running"), 409
     asyncio.create_task(run_check())
     return jsonify(ok=True, message="Check started")
 
