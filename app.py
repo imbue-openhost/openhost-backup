@@ -50,11 +50,77 @@ DEFAULT_CONFIG = {
     "repo": str(RESTIC_REPO_DIR),
     # Password for the restic repo. Generated on first boot if missing.
     "repo_password": "",
+    # Extra env vars forwarded to restic (e.g. AWS_ACCESS_KEY_ID,
+    # AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, B2_ACCOUNT_ID, etc.).
+    # This is where backend credentials live.
+    "env": {},
+}
+
+# Env vars that restic / its backends recognise. We whitelist what we accept
+# from the API to avoid letting callers stuff arbitrary variables into the
+# subprocess environment.
+ALLOWED_ENV_KEYS = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_DEFAULT_REGION",
+    "AWS_REGION",
+    "B2_ACCOUNT_ID",
+    "B2_ACCOUNT_KEY",
+    "AZURE_ACCOUNT_NAME",
+    "AZURE_ACCOUNT_KEY",
+    "AZURE_ACCOUNT_SAS",
+    "GOOGLE_PROJECT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ST_AUTH",
+    "ST_USER",
+    "ST_KEY",
+    "OS_AUTH_URL",
+    "OS_REGION_NAME",
+    "OS_USERNAME",
+    "OS_PASSWORD",
+    "OS_TENANT_ID",
+    "OS_TENANT_NAME",
+    "RCLONE_BWLIMIT",
 }
 
 # Snapshot IDs are hex strings; restic emits 8-char short IDs and 64-char long
 # ones. Accept either (plus anything in between) for validation on API input.
 SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
+
+
+def classify_repo(repo: str) -> dict:
+    """Return ``{"type": <label>, "remote": bool, "location": <display>}``.
+
+    Used by the UI so users can tell at a glance whether their snapshots are
+    stored on a remote backend (e.g. S3) or just on the same instance's local
+    disk. The latter is risky: if the instance dies, so does the backup.
+    """
+    if not repo:
+        return {"type": "unknown", "remote": False, "location": ""}
+    # Restic backend prefixes (see https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html)
+    if repo.startswith("s3:"):
+        return {"type": "s3", "remote": True, "location": repo[3:]}
+    if repo.startswith("b2:"):
+        return {"type": "b2", "remote": True, "location": repo[3:]}
+    if repo.startswith("azure:"):
+        return {"type": "azure", "remote": True, "location": repo[6:]}
+    if repo.startswith("gs:"):
+        return {"type": "gcs", "remote": True, "location": repo[3:]}
+    if repo.startswith("swift:"):
+        return {"type": "swift", "remote": True, "location": repo[6:]}
+    if repo.startswith("sftp:"):
+        return {"type": "sftp", "remote": True, "location": repo[5:]}
+    if repo.startswith("rest:"):
+        return {"type": "rest-server", "remote": True, "location": repo[5:]}
+    if repo.startswith("rclone:"):
+        return {"type": "rclone", "remote": True, "location": repo[7:]}
+    # Anything else is a local path (no scheme, or `local:`).
+    if repo.startswith("local:"):
+        repo_path = repo[6:]
+    else:
+        repo_path = repo
+    return {"type": "local", "remote": False, "location": repo_path}
 
 # Single lock for mutual exclusion across backup / restore / migration.
 op_lock = OperationLock()
@@ -221,6 +287,13 @@ def _restic_env(conf: dict) -> dict:
     # Suppress progress output in unattended runs; JSON flag gives structured
     # output where we need it.
     env["RESTIC_PROGRESS_FPS"] = "0"
+    # Forward any configured backend credentials (S3 keys, etc.). Only keys
+    # in ALLOWED_ENV_KEYS are accepted via the API; anything already in
+    # config is trusted.
+    for k, v in (conf.get("env") or {}).items():
+        if v is None or v == "":
+            continue
+        env[k] = str(v)
     return env
 
 
@@ -777,20 +850,30 @@ async def index():
         "last_status": last["status"] if last else None,
         "last_error": last["error_message"] if last else None,
     }
+    backend = classify_repo(conf.get("repo", ""))
     return await render_template(
         "index.html",
         base_path=BASE_PATH,
         config=conf,
         state=state,
+        backend=backend,
     )
 
 
 @route("/api/config", methods=["GET"])
 async def get_config():
     conf = load_config()
-    # Only return password once the user explicitly asks; keep it out of the
-    # default GET so it doesn't leak via browser caches / history.
-    redacted = {**conf, "repo_password": "***" if conf.get("repo_password") else ""}
+    # Redact secrets: password + env values. Report which env keys exist so
+    # the UI can render them without leaking plaintext.
+    env = conf.get("env") or {}
+    env_keys = sorted(k for k, v in env.items() if v)
+    redacted = {
+        **conf,
+        "repo_password": "***" if conf.get("repo_password") else "",
+        "env": {k: "***" for k in env_keys},
+        "env_keys": env_keys,
+        "backend": classify_repo(conf.get("repo", "")),
+    }
     return jsonify(config=redacted)
 
 
@@ -801,6 +884,25 @@ async def post_config():
     for key in ("interval_seconds", "repo", "repo_password", "router_api_token"):
         if key in data and data[key] not in (None, "***"):
             conf[key] = data[key]
+    # Handle env updates. `env` is a dict of key->value. Empty string means
+    # "clear this key". Any key not in ALLOWED_ENV_KEYS is rejected so a
+    # caller can't shove arbitrary vars into the subprocess env.
+    if "env" in data:
+        if not isinstance(data["env"], dict):
+            return jsonify(ok=False, error="'env' must be an object"), 400
+        current_env = dict(conf.get("env") or {})
+        for k, v in data["env"].items():
+            if k not in ALLOWED_ENV_KEYS:
+                return jsonify(
+                    ok=False,
+                    error=f"env key '{k}' not allowed. Allowed: "
+                    f"{', '.join(sorted(ALLOWED_ENV_KEYS))}",
+                ), 400
+            if v is None or v == "":
+                current_env.pop(k, None)
+            else:
+                current_env[k] = str(v)
+        conf["env"] = current_env
     if "interval_seconds" in data:
         conf["interval_seconds"] = max(60, int(conf["interval_seconds"]))
     save_config(conf)
@@ -838,6 +940,7 @@ async def status():
         last_error=last["error_message"] if last else None,
         interval_seconds=conf["interval_seconds"],
         repo=conf.get("repo", ""),
+        backend=classify_repo(conf.get("repo", "")),
     )
 
 

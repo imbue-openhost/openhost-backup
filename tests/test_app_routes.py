@@ -293,3 +293,106 @@ class TestHealthEndpoint:
     async def test_health(self, client):
         response = await client.get("/health")
         assert response.status_code == 200
+
+
+class TestClassifyRepo:
+    def test_local_path(self):
+        assert backup_app.classify_repo("/var/backups/restic") == {
+            "type": "local",
+            "remote": False,
+            "location": "/var/backups/restic",
+        }
+
+    def test_local_prefix(self):
+        assert backup_app.classify_repo("local:/var/backups") == {
+            "type": "local",
+            "remote": False,
+            "location": "/var/backups",
+        }
+
+    def test_s3(self):
+        r = backup_app.classify_repo("s3:s3.us-east-1.amazonaws.com/mybucket/path")
+        assert r["type"] == "s3"
+        assert r["remote"] is True
+        assert r["location"] == "s3.us-east-1.amazonaws.com/mybucket/path"
+
+    def test_b2(self):
+        r = backup_app.classify_repo("b2:bucket:path")
+        assert r["type"] == "b2"
+        assert r["remote"] is True
+
+    def test_sftp(self):
+        r = backup_app.classify_repo("sftp:user@host:/data")
+        assert r["type"] == "sftp"
+        assert r["remote"] is True
+
+    def test_empty(self):
+        assert backup_app.classify_repo("") == {
+            "type": "unknown",
+            "remote": False,
+            "location": "",
+        }
+
+
+class TestConfigEnv:
+    async def test_env_set_and_redacted(self, client):
+        # Start with the default config in the fixture's CONFIG_FILE.
+        backup_app.ensure_default_config()
+
+        # Set a whitelisted env var.
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": "test-key"}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["ok"] is True
+
+        # GET should redact the value but list the key.
+        resp2 = await client.get("/api/config")
+        data2 = await resp2.get_json()
+        assert data2["config"]["env"]["AWS_ACCESS_KEY_ID"] == "***"
+        assert "AWS_ACCESS_KEY_ID" in data2["config"]["env_keys"]
+
+        # Underlying config actually stores the raw value.
+        conf = backup_app.load_config()
+        assert conf["env"]["AWS_ACCESS_KEY_ID"] == "test-key"
+
+    async def test_env_disallowed_key_rejected(self, client):
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"PATH": "/evil"}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+        data = await resp.get_json()
+        assert "not allowed" in data["error"]
+
+    async def test_env_clear(self, client):
+        backup_app.ensure_default_config()
+        # Seed a value.
+        conf = backup_app.load_config()
+        conf["env"] = {"AWS_ACCESS_KEY_ID": "to-be-cleared"}
+        backup_app.save_config(conf)
+
+        # Clear it by passing empty string.
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": ""}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        conf = backup_app.load_config()
+        assert "AWS_ACCESS_KEY_ID" not in (conf.get("env") or {})
+
+
+class TestStatusBackend:
+    async def test_status_includes_backend(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.get("/api/status")
+        data = await resp.get_json()
+        assert "backend" in data
+        # Default is a local path.
+        assert data["backend"]["type"] == "local"
+        assert data["backend"]["remote"] is False

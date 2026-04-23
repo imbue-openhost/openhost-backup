@@ -82,6 +82,14 @@
         <!-- Status -->
         <section>
             <h2>Status</h2>
+            {% if backend.type == "local" %}
+            <div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.85rem;color:#92400e;">
+                <strong>Warning:</strong> snapshots are stored on this instance's local
+                disk ({{ backend.location }}). If this instance is lost, the backups
+                are lost with it. Point the repository at a remote backend (S3, B2,
+                SFTP, etc.) in the Repository section below.
+            </div>
+            {% endif %}
             <dl>
                 <dt>State</dt>
                 <dd id="status-state">
@@ -99,8 +107,16 @@
                 <dd id="status-last">{{ state.last_backup or "never" }}</dd>
                 <dt>Interval</dt>
                 <dd>{{ config.interval_seconds }}s</dd>
-                <dt>Repo</dt>
-                <dd style="font-family:monospace;font-size:0.85rem;">{{ config.repo }}</dd>
+                <dt>Backend</dt>
+                <dd id="status-backend">
+                    {% if backend.remote %}
+                        <span class="status-badge status-success">{{ backend.type }}</span>
+                    {% else %}
+                        <span class="status-badge status-error">{{ backend.type }} (on this instance)</span>
+                    {% endif %}
+                </dd>
+                <dt>Location</dt>
+                <dd id="status-location" style="font-family:monospace;font-size:0.85rem;word-break:break-all;">{{ backend.location or config.repo }}</dd>
             </dl>
             <div style="margin-top: 12px;">
                 <label>Backup name (optional)</label>
@@ -186,6 +202,51 @@
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
             <button class="btn-primary" onclick="saveConfig()">Save</button>
             <div id="conf-msg"></div>
+        </section>
+
+        <!-- Backend credentials -->
+        <section>
+            <h2>Backend credentials</h2>
+            <p class="info">
+                Credentials forwarded to <code>restic</code> as environment variables.
+                Fill these in when pointing at a remote backend (S3, B2, Azure, etc.).
+                Values are stored in <code>config.json</code> alongside the repo
+                password. Leave a field blank to leave the current value unchanged;
+                enter a single space to clear it.
+            </p>
+            <div id="env-existing" style="font-size:0.85rem;color:#555;margin-bottom:12px;"></div>
+
+            <details style="margin-bottom:16px;">
+                <summary style="cursor:pointer;font-weight:600;font-size:0.9rem;color:#2563eb;">AWS S3 quick setup</summary>
+                <div style="margin-top:12px;">
+                    <label>Bucket (e.g. my-openhost-backups/andrew-1)</label>
+                    <input type="text" id="s3-bucket" placeholder="my-bucket/path">
+                    <label>Region</label>
+                    <input type="text" id="s3-region" value="us-east-1">
+                    <label>AWS_ACCESS_KEY_ID</label>
+                    <input type="text" id="s3-access-key" autocomplete="off" placeholder="AKIA...">
+                    <label>AWS_SECRET_ACCESS_KEY</label>
+                    <input type="password" id="s3-secret-key" autocomplete="off">
+                    <button class="btn-primary" onclick="setupS3()">Apply S3 config</button>
+                </div>
+            </details>
+
+            <details>
+                <summary style="cursor:pointer;font-weight:600;font-size:0.9rem;color:#2563eb;">Other backends (raw env vars)</summary>
+                <div style="margin-top:12px;">
+                    <p class="info">
+                        Any <code>restic</code>-recognised env var can be set here. See the
+                        <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a>
+                        for the right keys for your backend.
+                    </p>
+                    <label>Key</label>
+                    <input type="text" id="env-key" placeholder="B2_ACCOUNT_ID">
+                    <label>Value (blank = unchanged, single space = clear)</label>
+                    <input type="password" id="env-value" autocomplete="off">
+                    <button class="btn-secondary" onclick="setEnvKey()">Set</button>
+                </div>
+            </details>
+            <div id="env-msg"></div>
         </section>
 
     </div>
@@ -462,6 +523,67 @@
                 el.textContent = res.password || "(empty)";
             } else {
                 el.textContent = "error";
+            }
+        }
+
+        async function loadEnvKeys() {
+            const res = await api("/api/config");
+            const el = document.getElementById("env-existing");
+            if (!el) return;
+            const keys = (res.config && res.config.env_keys) || [];
+            if (keys.length === 0) {
+                el.innerHTML = '<em style="color:#888;">No backend credentials set.</em>';
+            } else {
+                el.innerHTML = "Currently set: " + keys.map(k => '<code style="background:#f3f4f6;padding:1px 6px;border-radius:3px;margin-right:4px;">' + escapeHtml(k) + '</code>').join("");
+            }
+        }
+
+        async function setupS3() {
+            const bucket = document.getElementById("s3-bucket").value.trim();
+            const region = document.getElementById("s3-region").value.trim() || "us-east-1";
+            const accessKey = document.getElementById("s3-access-key").value.trim();
+            const secretKey = document.getElementById("s3-secret-key").value;
+            if (!bucket) { showMsg("env-msg", "Enter a bucket", false); return; }
+            if (!accessKey || !secretKey) { showMsg("env-msg", "Enter access + secret keys", false); return; }
+
+            const repoUrl = "s3:s3." + region + ".amazonaws.com/" + bucket;
+            // Apply repo URL + credentials together.
+            const payload = {
+                repo: repoUrl,
+                env: {
+                    AWS_ACCESS_KEY_ID: accessKey,
+                    AWS_SECRET_ACCESS_KEY: secretKey,
+                    AWS_DEFAULT_REGION: region,
+                },
+            };
+            const res = await api("/api/config", { method: "POST", body: payload });
+            if (res.ok) {
+                document.getElementById("s3-secret-key").value = "";
+                document.getElementById("conf-repo").value = repoUrl;
+                showMsg("env-msg", "S3 config applied. Run a backup to initialize the new repo.", true);
+                loadEnvKeys();
+            } else {
+                showMsg("env-msg", res.error || "Error", false);
+            }
+        }
+
+        async function setEnvKey() {
+            const key = document.getElementById("env-key").value.trim();
+            const val = document.getElementById("env-value").value;
+            if (!key) { showMsg("env-msg", "Enter a key", false); return; }
+            // Single space = clear (send empty string).
+            const sendVal = val === " " ? "" : val;
+            if (sendVal === "" && val !== " ") {
+                showMsg("env-msg", "Enter a value (or a single space to clear)", false);
+                return;
+            }
+            const res = await api("/api/config", { method: "POST", body: { env: { [key]: sendVal } } });
+            if (res.ok) {
+                document.getElementById("env-value").value = "";
+                showMsg("env-msg", sendVal === "" ? "Key cleared" : "Key set", true);
+                loadEnvKeys();
+            } else {
+                showMsg("env-msg", res.error || "Error", false);
             }
         }
 
@@ -854,8 +976,9 @@
             poll();
         }
 
-        // Auto-load snapshots on page load.
+        // Auto-load snapshots + env keys on page load.
         loadSnapshots();
+        loadEnvKeys();
     </script>
 </body>
 </html>
