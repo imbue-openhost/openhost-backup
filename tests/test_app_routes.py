@@ -32,8 +32,8 @@ def client(tmp_path):
     backup_app.APP_DATA_DIR.mkdir()
     backup_app.CONFIG_DIR = backup_app.APP_DATA_DIR
     backup_app.DB_FILE = backup_app.APP_DATA_DIR / "backups.db"
-    backup_app.RCLONE_CONF = backup_app.APP_DATA_DIR / "rclone.conf"
     backup_app.CONFIG_FILE = backup_app.APP_DATA_DIR / "config.json"
+    backup_app.RESTIC_REPO_DIR = backup_app.APP_DATA_DIR / "restic-repo"
 
     # Init DB
     backup_app.init_db()
@@ -293,3 +293,203 @@ class TestHealthEndpoint:
     async def test_health(self, client):
         response = await client.get("/health")
         assert response.status_code == 200
+
+
+class TestClassifyRepo:
+    def test_local_path(self):
+        assert backup_app.classify_repo("/var/backups/restic") == {
+            "type": "local",
+            "remote": False,
+            "location": "/var/backups/restic",
+        }
+
+    def test_local_prefix(self):
+        assert backup_app.classify_repo("local:/var/backups") == {
+            "type": "local",
+            "remote": False,
+            "location": "/var/backups",
+        }
+
+    def test_s3(self):
+        r = backup_app.classify_repo("s3:s3.us-east-1.amazonaws.com/mybucket/path")
+        assert r["type"] == "s3"
+        assert r["remote"] is True
+        assert r["location"] == "s3.us-east-1.amazonaws.com/mybucket/path"
+
+    def test_b2(self):
+        r = backup_app.classify_repo("b2:bucket:path")
+        assert r["type"] == "b2"
+        assert r["remote"] is True
+
+    def test_sftp(self):
+        r = backup_app.classify_repo("sftp:user@host:/data")
+        assert r["type"] == "sftp"
+        assert r["remote"] is True
+
+    def test_empty(self):
+        assert backup_app.classify_repo("") == {
+            "type": "unknown",
+            "remote": False,
+            "location": "",
+        }
+
+
+class TestConfigEnv:
+    async def test_env_set_and_redacted(self, client):
+        # Start with the default config in the fixture's CONFIG_FILE.
+        backup_app.ensure_default_config()
+
+        # Set a whitelisted env var.
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": "test-key"}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["ok"] is True
+
+        # GET should redact the value but list the key.
+        resp2 = await client.get("/api/config")
+        data2 = await resp2.get_json()
+        assert data2["config"]["env"]["AWS_ACCESS_KEY_ID"] == "***"
+        assert "AWS_ACCESS_KEY_ID" in data2["config"]["env_keys"]
+
+        # Underlying config actually stores the raw value.
+        conf = backup_app.load_config()
+        assert conf["env"]["AWS_ACCESS_KEY_ID"] == "test-key"
+
+    async def test_env_disallowed_key_rejected(self, client):
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"PATH": "/evil"}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+        data = await resp.get_json()
+        assert "not allowed" in data["error"]
+
+    async def test_env_clear(self, client):
+        backup_app.ensure_default_config()
+        # Seed a value.
+        conf = backup_app.load_config()
+        conf["env"] = {"AWS_ACCESS_KEY_ID": "to-be-cleared"}
+        backup_app.save_config(conf)
+
+        # Clear it by passing empty string.
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": ""}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        conf = backup_app.load_config()
+        assert "AWS_ACCESS_KEY_ID" not in (conf.get("env") or {})
+
+
+class TestStatusBackend:
+    async def test_status_includes_backend(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.get("/api/status")
+        data = await resp.get_json()
+        assert "backend" in data
+        # Default is a local path.
+        assert data["backend"]["type"] == "local"
+        assert data["backend"]["remote"] is False
+
+
+class TestPasswordReveal:
+    async def test_password_reveal_requires_auth(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.get("/api/config/password")
+        assert resp.status_code == 401
+        data = await resp.get_json()
+        assert data["ok"] is False
+
+    @patch("app._verify_admin_token", new_callable=AsyncMock)
+    async def test_password_reveal_with_valid_token(self, mock_verify, client):
+        backup_app.ensure_default_config()
+        mock_verify.return_value = True
+        resp = await client.get(
+            "/api/config/password",
+            headers={"Authorization": "Bearer valid-token"},
+        )
+        assert resp.status_code == 200
+        data = await resp.get_json()
+        assert data["ok"] is True
+        # Password is the auto-generated one from ensure_default_config.
+        assert data["password"]
+
+    @patch("app._verify_admin_token", new_callable=AsyncMock)
+    async def test_password_reveal_with_invalid_token(self, mock_verify, client):
+        mock_verify.return_value = False
+        resp = await client.get(
+            "/api/config/password",
+            headers={"Authorization": "Bearer bad-token"},
+        )
+        assert resp.status_code == 401
+
+
+class TestConfigRedactsRouterToken:
+    async def test_router_api_token_redacted(self, client):
+        # Seed a token directly.
+        backup_app.ensure_default_config()
+        conf = backup_app.load_config()
+        conf["router_api_token"] = "secret-router-token"
+        backup_app.save_config(conf)
+
+        resp = await client.get("/api/config")
+        data = await resp.get_json()
+        assert data["config"]["router_api_token"] == "***"
+        # Underlying storage still has the real value.
+        assert backup_app.load_config()["router_api_token"] == "secret-router-token"
+
+
+class TestPostConfigSensitiveWrites:
+    async def test_first_router_token_bootstraps_without_auth(self, client):
+        # Fresh install — no token yet — setting one should succeed.
+        backup_app.ensure_default_config()
+        # Make sure it's really empty.
+        conf = backup_app.load_config()
+        conf["router_api_token"] = ""
+        backup_app.save_config(conf)
+
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"router_api_token": "first-token"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+
+    async def test_rotate_router_token_requires_auth(self, client):
+        backup_app.ensure_default_config()
+        conf = backup_app.load_config()
+        conf["router_api_token"] = "existing"
+        backup_app.save_config(conf)
+
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"router_api_token": "rotated"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 401
+        # Token should NOT have been rotated.
+        assert backup_app.load_config()["router_api_token"] == "existing"
+
+    async def test_set_repo_password_requires_auth(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"repo_password": "new-pw"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 401
+
+    async def test_invalid_interval_seconds(self, client):
+        backup_app.ensure_default_config()
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"interval_seconds": "abc"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
