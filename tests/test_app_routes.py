@@ -493,3 +493,115 @@ class TestPostConfigSensitiveWrites:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
+
+
+class TestEnsureRepoInitialized:
+    """``ensure_repo_initialized`` is the single entry point that decides
+    whether to ``restic init`` an unconfigured repo.  Three behaviours
+    must hold:
+
+    1. ``auto_init=True`` always inits on a "not initialized" signal.
+    2. ``auto_init=False`` never inits and reports a clear error.
+    3. ``auto_init=None`` only inits when ``classify_repo(...)`` says the
+       repo is local — protecting against typo'd remote URLs creating
+       empty repositories at the wrong location (S3 buckets, SFTP paths,
+       etc.) when an end-user clicks a read-only UI button.
+    """
+
+    @staticmethod
+    def _patch_run_restic(monkeypatch, sequence):
+        """Replace _run_restic with a callable that yields the next entry
+        from ``sequence`` on each invocation.  Each entry is a tuple of
+        (returncode, stdout_bytes, stderr_bytes)."""
+        calls: list[list[str]] = []
+        it = iter(sequence)
+
+        async def fake(args, conf, timeout=None):
+            calls.append(list(args))
+            return next(it)
+
+        monkeypatch.setattr(backup_app, "_run_restic", fake)
+        return calls
+
+    async def test_returns_ready_when_cat_config_succeeds(self, monkeypatch):
+        self._patch_run_restic(monkeypatch, [(0, b"", b"")])
+        initialized_now, err = await backup_app.ensure_repo_initialized(
+            {"repo": "/tmp/x", "repo_password": "p"}
+        )
+        assert initialized_now is False
+        assert err is None
+
+    async def test_local_auto_inits_by_default(self, monkeypatch, tmp_path):
+        repo = tmp_path / "repo"
+        calls = self._patch_run_restic(
+            monkeypatch,
+            [
+                (1, b"", b"unable to open config file"),  # cat config
+                (0, b"", b""),  # init
+            ],
+        )
+        initialized_now, err = await backup_app.ensure_repo_initialized(
+            {"repo": str(repo), "repo_password": "p"}
+        )
+        assert initialized_now is True
+        assert err is None
+        assert calls == [["cat", "config"], ["init"]]
+
+    async def test_remote_does_not_auto_init_by_default(self, monkeypatch):
+        calls = self._patch_run_restic(
+            monkeypatch,
+            [(1, b"", b"Fatal: unable to open config file")],
+        )
+        initialized_now, err = await backup_app.ensure_repo_initialized(
+            {"repo": "s3:s3.amazonaws.com/my-bucket/typo", "repo_password": "p"}
+        )
+        assert initialized_now is False
+        assert err is not None
+        assert "not initialized" in err.lower()
+        # Must NOT have invoked restic init.
+        assert calls == [["cat", "config"]]
+
+    async def test_remote_inits_when_explicitly_opted_in(self, monkeypatch):
+        calls = self._patch_run_restic(
+            monkeypatch,
+            [
+                (1, b"", b"unable to open config file"),
+                (0, b"", b""),
+            ],
+        )
+        initialized_now, err = await backup_app.ensure_repo_initialized(
+            {"repo": "s3:s3.amazonaws.com/bucket/path", "repo_password": "p"},
+            auto_init=True,
+        )
+        assert initialized_now is True
+        assert err is None
+        assert calls == [["cat", "config"], ["init"]]
+
+    async def test_auto_init_false_never_inits_local_either(
+        self, monkeypatch, tmp_path
+    ):
+        calls = self._patch_run_restic(
+            monkeypatch,
+            [(1, b"", b"unable to open config file")],
+        )
+        initialized_now, err = await backup_app.ensure_repo_initialized(
+            {"repo": str(tmp_path / "repo"), "repo_password": "p"},
+            auto_init=False,
+        )
+        assert initialized_now is False
+        assert err is not None
+        assert "not initialized" in err.lower()
+        assert calls == [["cat", "config"]]
+
+    async def test_non_init_error_passes_through(self, monkeypatch):
+        # e.g. wrong password — must NOT auto-init regardless of mode.
+        self._patch_run_restic(
+            monkeypatch,
+            [(1, b"", b"wrong password or no key found")],
+        )
+        initialized_now, err = await backup_app.ensure_repo_initialized(
+            {"repo": "/tmp/x", "repo_password": "p"}
+        )
+        assert initialized_now is False
+        assert err is not None
+        assert "wrong password" in err.lower()

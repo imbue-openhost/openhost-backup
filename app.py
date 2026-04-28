@@ -389,10 +389,25 @@ RESTORE_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours
 CHECK_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
 
 
-async def ensure_repo_initialized(conf: dict) -> tuple[bool, str | None]:
+async def ensure_repo_initialized(
+    conf: dict, *, auto_init: bool | None = None
+) -> tuple[bool, str | None]:
     """Ensure the restic repo exists; run `restic init` if not.
 
     Returns (initialized_now, error_message).
+
+    ``auto_init`` controls what happens when ``cat config`` fails with a
+    "repo does not exist" signal:
+
+    - ``True``  — always run ``restic init`` (used by ``run_backup`` so the
+      first scheduled backup creates the repo regardless of backend).
+    - ``False`` — never auto-init; report a "not initialized" error so the
+      caller / UI can prompt the user explicitly.
+    - ``None``  — auto-init only when the repo is local (no remote backend
+      prefix).  Safer default for read-only operations: a typo'd S3 URL
+      won't silently create an empty bucket-side repo at the wrong path,
+      but a fresh local install still "just works" when the user clicks
+      a UI button.
     """
     # `cat config` is a cheap way to confirm the repo exists and the password
     # is correct. It returns non-zero on either missing repo or wrong password.
@@ -401,13 +416,25 @@ async def ensure_repo_initialized(conf: dict) -> tuple[bool, str | None]:
         return False, None
 
     err = stderr.decode(errors="replace").strip()
-    # If the repo simply doesn't exist, init it. Heuristic on the error text;
-    # restic doesn't expose a clean "not found" exit code.
-    if "does not exist" in err.lower() or "unable to open config" in err.lower() or "no such file" in err.lower():
+    # If the repo simply doesn't exist, decide whether to init. Heuristic on
+    # the error text; restic doesn't expose a clean "not found" exit code.
+    err_lower = err.lower()
+    is_not_initialized = (
+        "does not exist" in err_lower
+        or "unable to open config" in err_lower
+        or "no such file" in err_lower
+    )
+    if is_not_initialized:
+        info = classify_repo(conf["repo"])
+        should_init = auto_init if auto_init is not None else not info["remote"]
+        if not should_init:
+            return False, (
+                f"Repository not initialized at {conf['repo']!r}. Run a backup "
+                f"to create it, or pass auto_init=True for this operation."
+            )
         # Local repo path: make sure parent exists. classify_repo already
         # strips any `local:` prefix, so we use its `location` as the on-disk
         # path rather than the raw repo string.
-        info = classify_repo(conf["repo"])
         if info["type"] == "local" and info["location"]:
             Path(info["location"]).parent.mkdir(parents=True, exist_ok=True)
         rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
@@ -452,7 +479,9 @@ async def run_backup(name: str | None = None) -> bool:
     logger.info("Starting restic backup to %s", conf["repo"])
 
     try:
-        init_err = (await ensure_repo_initialized(conf))[1]
+        # Backup always creates the repo if missing — that's the operation
+        # users opt into knowing it'll write to the configured location.
+        init_err = (await ensure_repo_initialized(conf, auto_init=True))[1]
         if init_err:
             record_backup(timestamp, "error", init_err, name=name)
             logger.error("Backup failed: %s", init_err)
@@ -557,6 +586,16 @@ async def list_snapshots() -> tuple[list[dict], bool]:
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return [], False
+    # Auto-init for local repos so the snapshots panel doesn't render
+    # "unable to open config file" on a freshly-configured install where
+    # the user hasn't triggered a backup yet.  Remote repos are NOT
+    # auto-inited from a read endpoint — that's reserved for run_backup
+    # so a typo'd S3/B2/SFTP URL can't silently create an empty repo at
+    # the wrong location.
+    init_err = (await ensure_repo_initialized(conf))[1]
+    if init_err:
+        logger.info("list_snapshots: %s", init_err)
+        return [], False
     try:
         # Scope to the "openhost" tag so, if the user points this app at a
         # repo shared with other hosts/projects, we only surface snapshots
@@ -601,6 +640,10 @@ async def repo_stats() -> tuple[dict | None, str | None]:
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return None, "Restic repo not configured"
+    # Auto-init only for local repos (see list_snapshots for the rationale).
+    init_err = (await ensure_repo_initialized(conf))[1]
+    if init_err:
+        return None, init_err
     try:
         rc, stdout, stderr = await _run_restic(
             ["stats", "--mode", "raw-data", "--json", "--tag", "openhost"],
@@ -939,6 +982,17 @@ async def run_check() -> bool:
             check_last_status = "error"
             check_last_output = "Restic repo not configured"
             check_last_at = datetime.now(timezone.utc).isoformat()
+            return False
+        # Auto-init only for local repos so a fresh-install user clicking
+        # "Run check" doesn't see a confusing "unable to open config file"
+        # error on a repo that simply hasn't been backed up yet.  Remote
+        # repos still error here so we don't silently create them.
+        init_err = (await ensure_repo_initialized(conf))[1]
+        if init_err:
+            check_last_status = "error"
+            check_last_output = init_err
+            check_last_at = datetime.now(timezone.utc).isoformat()
+            logger.info("run_check: %s", init_err)
             return False
         try:
             rc, stdout, stderr = await _run_restic(
