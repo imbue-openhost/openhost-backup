@@ -11,6 +11,7 @@ import json
 import os
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -255,7 +256,9 @@ class TestChownAppDataEndpoint:
             "secrets": {"status": "stopped"},
             "backup": {"status": "running"},
         }
-        # Create a test file so os.walk has something to iterate
+        # Create a test file so os.walk has something to iterate.  Real files
+        # in the test environment are owned by the test user (uid below the
+        # subuid floor), so they are eligible for chown.
         (backup_app.ALL_APP_DATA / "testapp").mkdir(exist_ok=True)
         (backup_app.ALL_APP_DATA / "testapp" / "data.db").touch()
 
@@ -264,10 +267,56 @@ class TestChownAppDataEndpoint:
         data = await response.get_json()
         assert data["ok"] is True
         assert data["count"] > 0
+        assert data["skipped"] == 0
         # Verify chown was called with uid=1000, gid=1000
         for call_args in mock_chown.call_args_list:
             assert call_args[0][1] == 1000  # uid
             assert call_args[0][2] == 1000  # gid
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("os.chown")
+    @patch("app._get_router_apps")
+    async def test_chown_skips_subuid_mapped_files(
+        self, mock_get, mock_chown, client
+    ):
+        """Files owned by a subuid-mapped user (uid >= 100000) must be left alone.
+
+        Container apps that run a non-root in-container user (e.g. postgres at
+        container uid 70) appear on the host as a subuid-shifted uid like
+        165605.  Chowning those to 1000 destroys the user-namespace mapping,
+        breaking the app.
+        """
+        mock_get.return_value = {
+            "secrets": {"status": "stopped"},
+            "backup": {"status": "running"},
+        }
+        # One ordinary file plus one subuid-mapped file under app_data.
+        (backup_app.ALL_APP_DATA / "plane").mkdir(exist_ok=True)
+        (backup_app.ALL_APP_DATA / "plane" / "postgres_conf").touch()
+        (backup_app.ALL_APP_DATA / "plane" / "regular_file").touch()
+
+        # Patch lstat *only* in the chown helper's dotted path.  os.walk uses
+        # os.lstat too but goes through the C accelerator and is unaffected.
+        real_lstat = os.lstat
+
+        def _fake_lstat(path):
+            st = real_lstat(path)
+            if str(path).endswith("postgres_conf"):
+                # Pretend this file is subuid-mapped on the host.
+                return SimpleNamespace(
+                    st_uid=165605, st_gid=165605, st_mode=st.st_mode
+                )
+            return st
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("app.os.lstat", side_effect=_fake_lstat):
+            response = await client.post("/api/chown-app-data")
+        data = await response.get_json()
+        assert data["ok"] is True
+        assert data["skipped"] >= 1
+        # The subuid-mapped path must never have been chown'd.
+        chowned_paths = {call_args[0][0] for call_args in mock_chown.call_args_list}
+        assert not any(p.endswith("postgres_conf") for p in chowned_paths)
         backup_app.ROUTER_API_TOKEN = ""
 
     @patch("app._get_router_apps")
