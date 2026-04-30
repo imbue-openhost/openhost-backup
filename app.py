@@ -1468,12 +1468,30 @@ async def stop_all_apps():
         return jsonify(ok=False, error=str(e)), 500
 
 
+# UIDs at or above this value are taken to be subuid-mapped — i.e. a host-side
+# representation of a non-root user inside a rootless container's user
+# namespace.  Distros conventionally allocate subuid ranges starting at
+# 100000 (Debian/Ubuntu) or 165536 (the kernel-recommended floor); real
+# interactive users are well below this.  Anything in this range is owned by
+# a process running inside a container under a non-root in-container user
+# (postgres, rabbitmq, mysql, etc.) and chowning it to the host user destroys
+# the user-namespace mapping, leaving the in-container user unable to read
+# its own data.
+_SUBUID_FLOOR: int = 100000
+
+
 @route("/api/chown-app-data", methods=["POST"])
 async def chown_app_data():
-    """Recursively chown all app_data to match the host user.
+    """Recursively chown app_data to the host user, skipping subuid-mapped files.
 
     Only allowed when all non-backup apps are stopped, to prevent
     ownership changes on files being actively written.
+
+    Files whose current owner uid is at or above ``_SUBUID_FLOOR`` are
+    assumed to be subuid-mapped state owned by a non-root in-container
+    user (e.g. postgres at uid 70 → host uid 165605) and are left alone.
+    Chowning those would destroy the user-namespace mapping and break the
+    affected app.
     """
     router_token = _extract_bearer_token() or get_router_api_token()
     if not router_token:
@@ -1509,30 +1527,44 @@ async def chown_app_data():
     target_uid = 1000
     target_gid = 1000
     app_data = str(ALL_APP_DATA)
-    logger.info("chown -R %s:%s %s", target_uid, target_gid, app_data)
+    logger.info("chown -R %s:%s %s (skipping subuid-mapped files)", target_uid, target_gid, app_data)
 
     count = 0
+    skipped = 0
     errors = 0
+
+    def _chown_one(path: str) -> None:
+        nonlocal count, skipped, errors
+        try:
+            st = os.lstat(path)
+        except OSError as e:
+            errors += 1
+            logger.warning("stat failed for %s: %s", path, e)
+            return
+        if st.st_uid >= _SUBUID_FLOOR or st.st_gid >= _SUBUID_FLOOR:
+            # Subuid-mapped state owned by a non-root in-container user.
+            # Leaving it alone keeps that app working.
+            skipped += 1
+            return
+        try:
+            os.chown(path, target_uid, target_gid, follow_symlinks=False)
+            count += 1
+        except OSError as e:
+            errors += 1
+            logger.warning("chown failed for %s: %s", path, e)
+
     for root, dirs, files in os.walk(app_data):
         for name in dirs + files:
-            path = os.path.join(root, name)
-            try:
-                os.chown(path, target_uid, target_gid)
-                count += 1
-            except OSError as e:
-                errors += 1
-                logger.warning("chown failed for %s: %s", path, e)
-    try:
-        os.chown(app_data, target_uid, target_gid)
-        count += 1
-    except OSError:
-        errors += 1
+            _chown_one(os.path.join(root, name))
+    _chown_one(app_data)
 
-    logger.info("chown complete: %d items fixed, %d errors", count, errors)
+    logger.info("chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors)
     return jsonify(
         ok=True,
-        message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid})",
+        message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid}); "
+        f"skipped {skipped} subuid-mapped items",
         count=count,
+        skipped=skipped,
         errors=errors,
     )
 
