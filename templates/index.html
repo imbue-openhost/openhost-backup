@@ -54,6 +54,26 @@
         .name-label { font-size: 0.8rem; color: #2563eb; cursor: pointer; }
         .name-label:hover { text-decoration: underline; }
 
+        details.scope-block { margin-top: 16px; border-top: 1px solid #eee; padding-top: 12px; }
+        details.scope-block > summary {
+            cursor: pointer; font-weight: 600; font-size: 0.9rem; color: #2563eb;
+        }
+        dl.scope-list {
+            display: grid; grid-template-columns: auto 1fr; gap: 4px 16px;
+            font-size: 0.85rem; margin-top: 6px;
+        }
+        dl.scope-list dt { font-weight: 600; color: #555; padding-top: 2px; }
+        dl.scope-list dd { color: #333; }
+        ul.scope-items { list-style: none; padding: 0; margin: 0; }
+        ul.scope-items li { padding: 2px 0; line-height: 1.5; }
+        ul.scope-items code { font-family: monospace; background: #f3f4f6; padding: 1px 6px; border-radius: 3px; font-size: 0.8rem; }
+        .scope-reason { color: #666; font-size: 0.82rem; }
+        .scope-tag {
+            display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 10px;
+            font-size: 0.72rem; font-weight: 600; vertical-align: 1px;
+        }
+        .scope-tag-missing { background: #f3f4f6; color: #6b7280; }
+
         .tab-bar { display: flex; gap: 0; margin: 16px 0 24px 0; border-bottom: 2px solid #ddd; }
         .tab-btn {
             padding: 10px 20px; border: none; background: none; cursor: pointer;
@@ -132,6 +152,44 @@
             </div>
             <div id="backup-msg"></div>
             <div id="check-state" style="margin-top:12px;"></div>
+
+            <details class="scope-block">
+                <summary>What is and isn't backed up</summary>
+                <p class="info" style="margin-top:8px;">
+                    Snapshots capture the paths below. Excluded paths
+                    are intentionally not in the snapshot pipeline —
+                    restoring a snapshot will not bring back their
+                    contents.
+                </p>
+                <dl class="scope-list">
+                    <dt>Included</dt>
+                    <dd>
+                        <ul class="scope-items">
+                            {% for entry in scope.included %}
+                            <li>
+                                <code>{{ entry.path }}</code>
+                                {% if not entry.present %}
+                                <span class="scope-tag scope-tag-missing" title="Mount not granted on this instance; the backup loop skips it silently.">not granted on this instance</span>
+                                {% endif %}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </dd>
+                    <dt>Excluded</dt>
+                    <dd>
+                        <ul class="scope-items">
+                            {% for entry in scope.excluded %}
+                            <li>
+                                <code>{{ entry.path }}</code>
+                                {% if entry.reason %}
+                                <span class="scope-reason">— {{ entry.reason }}</span>
+                                {% endif %}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </dd>
+                </dl>
+            </details>
         </section>
 
         <!-- Snapshots -->
@@ -330,6 +388,12 @@
                     <br><br>
                     <strong>Not migrated:</strong> API tokens, owner password, and other
                     system-level settings are not transferred.
+                    {% for entry in scope.excluded if entry.user_facing and entry.reason %}
+                    The path <code>{{ entry.path }}</code> is also excluded from
+                    the snapshot pipeline. {{ entry.reason }}
+                    {% endfor %}
+                    See <em>What is and isn't backed up</em> on the Backups tab
+                    for the full list.
                 </div>
             </details>
 
@@ -364,6 +428,14 @@
 
     <script>
         const BASE = "{{ base_path }}";
+        // Excluded entries are sourced from the same _backup_scope_summary
+        // helper that renders the Status panel, so the in-browser note
+        // and the Status panel can never disagree about which paths
+        // are excluded.  Each entry carries ``user_facing`` so the
+        // snapshots-browser note can skip implementation-detail
+        // exclusions (e.g. the backup app's own restic repo dir)
+        // without the JS having to know which path that is.
+        const EXCLUDED_ENTRIES = {{ scope.excluded | tojson }};
         let selectedSnapshotId = null;
         // Client-side pagination for the snapshots table. The /api/snapshots
         // endpoint returns the full list in one shot (restic has no native
@@ -895,6 +967,39 @@
             return span;
         }
 
+        // Surface the same exclusion list that's in the Status panel
+        // here too — at the synthetic top of the file browser users
+        // see "where's app_archive?" most often, since access_all_data
+        // does mount /data/app_archive into the backup app and a
+        // separate UI (the file browser of an access_all_data app) does
+        // show those bytes.  Paths come from EXCLUDED_ENTRIES, populated
+        // from the server-side _backup_scope_summary helper, so the
+        // two UI surfaces can never disagree about what's excluded.
+        // Wording stays brief here; the full per-path rationale lives
+        // in the Status panel and we link there.
+        function _appendArchiveExclusionNote(tbody) {
+            // Show only the operator-relevant exclusions; the helper
+            // marks implementation-detail ones (like the backup app's
+            // own restic repo dir) as ``user_facing=false``.
+            const userExcludes = EXCLUDED_ENTRIES.filter(e => e.user_facing).map(e => e.path);
+            if (userExcludes.length === 0) return;
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = 3;
+            td.style.cssText = "padding:8px;color:#666;font-size:0.8rem;border-top:1px dashed #e5e7eb;";
+            const codeBits = userExcludes.map(p => {
+                const code = document.createElement("code");
+                code.style.cssText = "background:#f3f4f6;padding:1px 4px;border-radius:3px;";
+                code.textContent = p;
+                return code.outerHTML;
+            });
+            td.innerHTML = "Note: " + codeBits.join(", ") +
+                " " + (userExcludes.length === 1 ? "is" : "are") +
+                " intentionally not captured. See <em>What is and isn't backed up</em> in the Status section for details.";
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        }
+
         function renderFileBrowser(res, root, subpath) {
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
@@ -936,8 +1041,10 @@
                 td.textContent = root ? "Empty directory" : "Snapshot has no captured roots";
                 tr.appendChild(td);
                 body.appendChild(tr);
+                if (!root) _appendArchiveExclusionNote(body);
                 return;
             }
+            if (!root) _appendArchiveExclusionNote(body);
 
             const sorted = res.files.slice().sort((a, b) => {
                 if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;

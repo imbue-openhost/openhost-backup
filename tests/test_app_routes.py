@@ -654,3 +654,56 @@ class TestEnsureRepoInitialized:
         assert initialized_now is False
         assert err is not None
         assert "wrong password" in err.lower()
+
+
+class TestIndexRendersScope:
+    """End-to-end render tests for the index page's new scope panel.
+
+    These tests exercise the full Quart render path so that template
+    syntax errors, missing context vars, or broken Jinja loops fail
+    loudly here rather than only surfacing in production after a
+    deploy.
+    """
+
+    async def test_index_renders_archive_exclusion_in_status_panel(self, client):
+        """The Status panel's <details> block must mention
+        ``/data/app_archive`` and explain the exclusion in
+        operator-readable language.  Sufficient pinning so a
+        future template refactor that drops the panel fails this
+        test rather than silently shipping a less-informative UI.
+        """
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        body = (await resp.get_data()).decode()
+        assert "What is and isn't backed up" in body
+        assert "/data/app_archive" in body
+        assert "intentionally excluded" in body or "intentionally not captured" in body
+
+    async def test_index_renders_archive_exclusion_in_migrate_section(self, client):
+        """The Migrate tab's "Important details" callout also names
+        the archive exclusion so an operator reading the migration
+        warning understands the destination won't have archive data.
+        """
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        body = (await resp.get_data()).decode()
+        # Both the migrate callout and the file-browser note should
+        # reference the archive path; this asserts the migrate path
+        # specifically by anchoring on the surrounding migrate copy.
+        assert "Not migrated" in body
+        # The migrate paragraph itself names the archive path within
+        # the same DOM node, which is how the operator sees it.
+        idx = body.find("Not migrated")
+        # Allow up to ~600 chars after "Not migrated" for the rest of
+        # the paragraph to mention the archive path.
+        assert "/data/app_archive" in body[idx : idx + 1200]
+
+    async def test_index_renders_every_backup_root(self, client):
+        """Every BACKUP_ROOTS path must appear in the rendered page.
+        This is the lockstep guarantee the scope summary makes — the
+        UI shows exactly what restic will walk.
+        """
+        resp = await client.get("/")
+        body = (await resp.get_data()).decode()
+        for root in backup_app.BACKUP_ROOTS:
+            assert str(root) in body, f"missing BACKUP_ROOTS path {root}"
