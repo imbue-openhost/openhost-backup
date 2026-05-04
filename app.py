@@ -30,6 +30,7 @@ BASE_PATH = os.environ.get("OPENHOST_APP_BASE_PATH", "/backup")
 APP_DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/backup"))
 ALL_APP_DATA = Path("/data/app_data")
 APP_TEMP_DATA = Path("/data/app_temp_data")
+APP_ARCHIVE = Path("/data/app_archive")
 VM_DATA_DIR = Path("/data/vm_data")
 
 # Roots the backup app captures when the ``access_all_data = true``
@@ -39,6 +40,25 @@ VM_DATA_DIR = Path("/data/vm_data")
 # at backup time is skipped silently so the app still works on
 # instances that only grant a subset of these mounts.
 BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
+
+# ``access_all_data = true`` mounts ``/data/app_archive`` into the
+# container so the backup app can see it for migration / inspection,
+# but the archive tier is intentionally NOT backed up:
+#
+# - ``local`` archive backend: the data already lives on the host's
+#   persistent volume — operators back that up out-of-band the same
+#   way they back up app_data.
+# - ``s3`` archive backend: the bytes are already in S3 (the bucket
+#   IS the durable store) and JuiceFS writes hourly metadata dumps
+#   to ``<bucket>/<prefix>/meta/`` so the metadata DB is recoverable
+#   too.  Pulling those bytes back through restic would double-store
+#   them and inflate snapshot size by orders of magnitude.
+#
+# Restic still receives this as an explicit ``--exclude`` (in addition
+# to ``/data/app_archive`` not being in BACKUP_ROOTS), so a future
+# refactor that adds it to the roots list won't silently start
+# capturing the archive.
+BACKUP_EXCLUDES = (ALL_APP_DATA / "backup", APP_ARCHIVE)
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 # Router API token — the backup app needs this to call the local router API.
@@ -506,9 +526,11 @@ async def run_backup(name: str | None = None) -> bool:
 
         args = ["backup", "--json"]
         args += [str(p) for p in roots]
-        # Exclude our own restic repo (if it's the local default inside
-        # app_data) to avoid infinite-growth self-inclusion.
-        args += ["--exclude", str(ALL_APP_DATA / "backup")]
+        # Exclude our own restic repo (avoid self-inclusion + infinite
+        # growth) and ``/data/app_archive`` (rationale documented at the
+        # BACKUP_EXCLUDES definition).
+        for ex in BACKUP_EXCLUDES:
+            args += ["--exclude", str(ex)]
         for t in tags:
             args += ["--tag", t]
 
@@ -923,12 +945,14 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
         ]
         # restic 0.17 forbids mixing --include and --exclude in one
         # restore. When restoring a specific root we use --include
-        # (narrowing); otherwise we use --exclude to keep our own repo
-        # directory from being clobbered.
+        # (narrowing); otherwise we use --exclude so we don't clobber
+        # our own repo directory or the archive tier (which the backup
+        # never captured in the first place — see BACKUP_EXCLUDES).
         if root:
             args += ["--include", str(_ROOT_NAMES[root])]
         else:
-            args += ["--exclude", str(ALL_APP_DATA / "backup")]
+            for ex in BACKUP_EXCLUDES:
+                args += ["--exclude", str(ex)]
         try:
             rc, _stdout, stderr = await _run_restic(
                 args, conf, timeout=RESTORE_TIMEOUT_SECONDS
