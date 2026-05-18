@@ -26,6 +26,18 @@ import app as backup_app
 @pytest.fixture
 def client(tmp_path):
     """Create a Quart test client with isolated data directories."""
+    # Save originals so we can restore them after the test — other
+    # test modules (test_excludes.py) rely on the module-level
+    # constants retaining their import-time values.
+    orig = {
+        "ALL_APP_DATA": backup_app.ALL_APP_DATA,
+        "APP_DATA_DIR": backup_app.APP_DATA_DIR,
+        "CONFIG_DIR": backup_app.CONFIG_DIR,
+        "DB_FILE": backup_app.DB_FILE,
+        "CONFIG_FILE": backup_app.CONFIG_FILE,
+        "RESTIC_REPO_DIR": backup_app.RESTIC_REPO_DIR,
+    }
+
     # Override paths so tests don't touch real data
     backup_app.ALL_APP_DATA = tmp_path / "app_data"
     backup_app.ALL_APP_DATA.mkdir()
@@ -39,7 +51,11 @@ def client(tmp_path):
     # Init DB
     backup_app.init_db()
 
-    return backup_app.app.test_client()
+    yield backup_app.app.test_client()
+
+    # Restore original module globals.
+    for attr, val in orig.items():
+        setattr(backup_app, attr, val)
 
 
 def _make_tar_gz(contents: dict[str, bytes]) -> bytes:
