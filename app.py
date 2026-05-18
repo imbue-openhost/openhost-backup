@@ -1167,7 +1167,70 @@ async def index():
         config=conf,
         state=state,
         backend=backend,
+        scope=_backup_scope_summary(),
     )
+
+
+def _backup_scope_summary() -> dict:
+    """Snapshot the scope of what backup currently captures and skips.
+
+    Surfaced in the UI so the user can tell, at a glance, that
+    ``/data/app_archive`` is intentionally outside the snapshot —
+    important because access_all_data mounts the archive into the
+    backup container and the file-browser path can otherwise leave
+    the impression that those bytes will be in the next snapshot.
+
+    Built off the same ``BACKUP_ROOTS`` / ``BACKUP_EXCLUDES`` tuples
+    that the backup + restore code paths use, so the UI can never
+    drift from the actual restic command line.  Each entry carries
+    a short ``reason`` string suitable for inline rendering.
+
+    ``present`` reflects whether the path exists on disk now; the
+    backup loop skips missing roots (instances may grant only a
+    subset of data permissions), so showing this lets the operator
+    distinguish "permission not granted" from "present and excluded".
+    """
+    included = []
+    for p in BACKUP_ROOTS:
+        included.append({"path": str(p), "present": p.is_dir()})
+
+    excluded = []
+    for p in BACKUP_EXCLUDES:
+        # ``user_facing=False`` marks an exclude that's an
+        # implementation detail (the backup app's own restic repo
+        # dir) rather than something the operator chose to keep
+        # outside the snapshot pipeline.  Surfaced this way so the
+        # snapshots-browser note can hide self-references without
+        # the JS having to hard-code which path that is — the JS
+        # filters on ``user_facing`` and stays in lockstep with
+        # whatever the helper decides counts as operator-relevant.
+        if p == APP_ARCHIVE:
+            reason = (
+                "Archive tier is its own durable store (S3 bucket or "
+                "host-managed local archive); double-storing through "
+                "restic would inflate snapshots without adding safety."
+            )
+            user_facing = True
+        elif p == ALL_APP_DATA / "backup":
+            reason = (
+                "The backup app's own data dir contains the restic "
+                "repository — including it would self-reference and "
+                "grow each snapshot unboundedly."
+            )
+            user_facing = False
+        else:
+            reason = ""
+            user_facing = True
+        excluded.append(
+            {
+                "path": str(p),
+                "present": p.exists(),
+                "reason": reason,
+                "user_facing": user_facing,
+            }
+        )
+
+    return {"included": included, "excluded": excluded}
 
 
 @route("/api/config", methods=["GET"])

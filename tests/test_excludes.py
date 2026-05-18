@@ -43,3 +43,69 @@ def test_app_archive_not_in_root_names() -> None:
     """
     assert "app_archive" not in backup_app._ROOT_NAMES
     assert Path("/data/app_archive") not in backup_app._ROOT_NAMES.values()
+
+
+def test_backup_scope_summary_lists_archive_as_excluded() -> None:
+    """The ``scope`` blob the index template renders must explicitly
+    name ``/data/app_archive`` in its ``excluded`` list with a non-
+    empty reason string.
+
+    This is the load-bearing UI invariant for "make the exclusion
+    visible" — if a future refactor drops the archive from the
+    exclude list (by mistake or by removing the explicit ``--exclude``
+    when the mount becomes optional), this test fails so the UI's
+    promise to operators stays in lockstep with the code's behavior.
+    """
+    summary = backup_app._backup_scope_summary()
+
+    excluded_paths = [entry["path"] for entry in summary["excluded"]]
+    assert "/data/app_archive" in excluded_paths
+
+    archive_entry = next(
+        e for e in summary["excluded"] if e["path"] == "/data/app_archive"
+    )
+    assert archive_entry["reason"], (
+        "Archive exclusion must carry a human-readable reason; "
+        "without it the UI just shows a path with no context."
+    )
+
+
+def test_backup_scope_summary_lists_every_backup_root_in_included() -> None:
+    """``scope.included`` must enumerate exactly ``BACKUP_ROOTS`` so
+    the UI cannot diverge from what restic actually walks.  Pinning
+    set-equality (rather than just containment) so adding a root to
+    the code without surfacing it in the UI fails this test.
+    """
+    summary = backup_app._backup_scope_summary()
+    included_paths = {entry["path"] for entry in summary["included"]}
+    expected = {str(p) for p in backup_app.BACKUP_ROOTS}
+    assert included_paths == expected
+
+
+def test_backup_scope_summary_lists_every_exclude_in_excluded() -> None:
+    """Mirror invariant on the exclude side: every entry in
+    ``BACKUP_EXCLUDES`` must surface in the UI scope blob, so an
+    exclude added to the code (e.g. for some future privileged
+    mount) doesn't slip past operators.
+    """
+    summary = backup_app._backup_scope_summary()
+    excluded_paths = {entry["path"] for entry in summary["excluded"]}
+    expected = {str(p) for p in backup_app.BACKUP_EXCLUDES}
+    assert excluded_paths == expected
+
+
+def test_backup_scope_summary_marks_self_repo_as_implementation_detail() -> None:
+    """The backup app's own restic-repo-containing data dir is an
+    implementation detail (it has to be excluded so snapshots don't
+    self-reference).  It must be flagged ``user_facing=False`` so
+    the snapshots-browser note and the Migrate callout can
+    suppress it without hard-coding the path on the JS side.
+
+    Conversely, the archive tier must be ``user_facing=True`` —
+    that's the whole point of surfacing it.
+    """
+    summary = backup_app._backup_scope_summary()
+    by_path = {entry["path"]: entry for entry in summary["excluded"]}
+
+    assert by_path["/data/app_data/backup"]["user_facing"] is False
+    assert by_path["/data/app_archive"]["user_facing"] is True
