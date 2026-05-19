@@ -408,6 +408,13 @@ BACKUP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
 RESTORE_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours
 CHECK_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
 
+# Guard against concurrent `restic init` calls. When the UI loads, multiple
+# API endpoints (snapshots, stats, check) call ensure_repo_initialized at
+# the same time. Without this lock, two concurrent `restic init` invocations
+# can corrupt the repo (the second init races with the first, producing keys
+# that fail ciphertext verification).
+_init_lock = asyncio.Lock()
+
 
 async def ensure_repo_initialized(
     conf: dict, *, auto_init: bool | None = None
@@ -429,39 +436,40 @@ async def ensure_repo_initialized(
       but a fresh local install still "just works" when the user clicks
       a UI button.
     """
-    # `cat config` is a cheap way to confirm the repo exists and the password
-    # is correct. It returns non-zero on either missing repo or wrong password.
-    rc, _stdout, stderr = await _run_restic(["cat", "config"], conf, timeout=30)
-    if rc == 0:
-        return False, None
+    async with _init_lock:
+        # `cat config` is a cheap way to confirm the repo exists and the password
+        # is correct. It returns non-zero on either missing repo or wrong password.
+        rc, _stdout, stderr = await _run_restic(["cat", "config"], conf, timeout=30)
+        if rc == 0:
+            return False, None
 
-    err = stderr.decode(errors="replace").strip()
-    # If the repo simply doesn't exist, decide whether to init. Heuristic on
-    # the error text; restic doesn't expose a clean "not found" exit code.
-    err_lower = err.lower()
-    is_not_initialized = (
-        "does not exist" in err_lower
-        or "unable to open config" in err_lower
-        or "no such file" in err_lower
-    )
-    if is_not_initialized:
-        info = classify_repo(conf["repo"])
-        should_init = auto_init if auto_init is not None else not info["remote"]
-        if not should_init:
-            return False, (
-                f"Repository not initialized at {conf['repo']!r}. Run a backup "
-                f"to create it, or pass auto_init=True for this operation."
-            )
-        # Local repo path: make sure parent exists. classify_repo already
-        # strips any `local:` prefix, so we use its `location` as the on-disk
-        # path rather than the raw repo string.
-        if info["type"] == "local" and info["location"]:
-            Path(info["location"]).parent.mkdir(parents=True, exist_ok=True)
-        rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
-        if rc2 != 0:
-            return False, f"restic init failed: {err2.decode(errors='replace').strip()}"
-        return True, None
-    return False, f"restic repo check failed: {err}"
+        err = stderr.decode(errors="replace").strip()
+        # If the repo simply doesn't exist, decide whether to init. Heuristic on
+        # the error text; restic doesn't expose a clean "not found" exit code.
+        err_lower = err.lower()
+        is_not_initialized = (
+            "does not exist" in err_lower
+            or "unable to open config" in err_lower
+            or "no such file" in err_lower
+        )
+        if is_not_initialized:
+            info = classify_repo(conf["repo"])
+            should_init = auto_init if auto_init is not None else not info["remote"]
+            if not should_init:
+                return False, (
+                    f"Repository not initialized at {conf['repo']!r}. Run a backup "
+                    f"to create it, or pass auto_init=True for this operation."
+                )
+            # Local repo path: make sure parent exists. classify_repo already
+            # strips any `local:` prefix, so we use its `location` as the on-disk
+            # path rather than the raw repo string.
+            if info["type"] == "local" and info["location"]:
+                Path(info["location"]).parent.mkdir(parents=True, exist_ok=True)
+            rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
+            if rc2 != 0:
+                return False, f"restic init failed: {err2.decode(errors='replace').strip()}"
+            return True, None
+        return False, f"restic repo check failed: {err}"
 
 
 async def _restic_unlock_if_stale(conf: dict) -> None:
