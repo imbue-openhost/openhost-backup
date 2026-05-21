@@ -254,21 +254,26 @@
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
 
             <h3>Backend configuration</h3>
-                <p class="info">
-                    Configure where your snapshots are stored.<br>
-                    See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on how to configure the different backend types.<br>
-                    Auth credentials are often provided via env vars, depending on backend.<br>
-                    For AWS S3 (and compatable providers), this should look something like:<br>
-                    • URL: <code>s3:s3.us-west-2.amazonaws.com/bucket/</code><br>
-                    • env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code><br>
-                    Other examples:<br>
-                    • <code>sftp:user@host:/path</code><br>
-                    Changing the URL does not migrate existing data; losing the password makes backups unrecoverable.
-                </p>
-                <label>Backend URL</label>
-                <input type="text" id="conf-repo" value="{{ config.repo }}">
-                <label>Environment variables (<code>KEY=value;KEY2=value2</code>)</label>
-                <input type="password" id="conf-env" value="{{ env_string }}" placeholder="AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=..." autocomplete="off">
+            <p class="info">
+                Configure where your snapshots are stored.
+                See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on backend types.
+                Auth credentials are often provided via env vars.
+            </p>
+            <p class="info">
+                For AWS S3 (and compatible providers):
+            </p>
+            <ul class="info" style="margin-bottom:12px;padding-left:20px;font-size:0.85rem;color:#666;line-height:1.5;">
+                <li>URL: <code>s3:s3.us-west-2.amazonaws.com/bucket/</code></li>
+                <li>Env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code></li>
+            </ul>
+            <p class="info">
+                Other examples: <code>sftp:user@host:/path</code>.
+                Changing the URL does not migrate existing data; losing the password makes backups unrecoverable.
+            </p>
+            <label>Backend URL</label>
+            <input type="text" id="conf-repo" value="{{ config.repo }}">
+            <label>Environment variables (<code>KEY=value;KEY2=value2</code>)</label>
+            <input type="password" id="conf-env" value="{{ env_string }}" placeholder="AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=..." autocomplete="off">
 
             <div class="btn-row">
                 <button class="btn-secondary" onclick="toggleConfSecrets()" id="btn-show-secrets">Show secrets</button>
