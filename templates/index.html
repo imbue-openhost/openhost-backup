@@ -633,14 +633,17 @@
             const resultEl = document.getElementById("test-result");
             const headerCls = res.ok ? "msg-ok" : "msg-err";
             const headerText = res.message || (res.ok ? "Connection OK" : "Connection failed");
-            resultEl.innerHTML =
-                '<div class="msg ' + headerCls + '">' + headerText + '</div>' +
-                '<div id="test-debug" style="margin-top:8px;"></div>' +
-                '<div style="font-size:0.85rem;color:#666;margin-top:6px;margin-bottom:4px;">Restic output:</div>' +
-                '<pre style="margin:0;padding:10px;background:#0b1020;color:#e2e8f0;border-radius:4px;font-size:0.78rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;">' +
-                escapeHtml(res.output || "(no output)") +
-                '</pre>';
-            renderTestDebug();
+            let html = '<div class="msg ' + headerCls + '">' + headerText + '</div>';
+            if (!res.ok) {
+                html +=
+                    '<div id="test-debug" style="margin-top:8px;"></div>' +
+                    '<div style="font-size:0.85rem;color:#666;margin-top:6px;margin-bottom:4px;">Restic output:</div>' +
+                    '<pre style="margin:0;padding:10px;background:#0b1020;color:#e2e8f0;border-radius:4px;font-size:0.78rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;">' +
+                    escapeHtml(res.output || "(no output)") +
+                    '</pre>';
+            }
+            resultEl.innerHTML = html;
+            if (!res.ok) renderTestDebug();
         }
 
         function renderTestDebug() {
