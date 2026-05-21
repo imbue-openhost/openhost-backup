@@ -467,7 +467,7 @@ def _is_secret_env(key: str) -> bool:
 
 async def test_restic_connection(
     conf: dict, *, timeout: float = 10.0
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     """Run ``restic cat config`` once with a short timeout, no retries.
 
     Returns ``(ok, output)`` where ``output`` is the raw stderr restic
@@ -514,9 +514,26 @@ async def test_restic_connection(
     text = bytes(buf).decode(errors="replace")
     if timed_out:
         text = (text + f"\n\n[killed after {timeout:.0f}s — no retries]").lstrip()
-    if proc.returncode == 0 and not timed_out:
-        return True, text or "(no output)"
-    return False, text or f"restic exited with code {proc.returncode}"
+    return _classify_restic_test(proc.returncode, text, timed_out)
+
+
+def _classify_restic_test(
+    returncode: int | None, output: str, timed_out: bool
+) -> tuple[bool, str, str]:
+    """Decide whether a restic test should read as success or failure.
+
+    Exit 0 → success.
+    "repository does not exist" → success ("reachable, just no repo yet" —
+    a backup will create it). The bucket / path / creds all worked; the
+    only "missing" thing is the user hasn't initialized a repo there yet,
+    which is the expected state on first run.
+    Anything else → failure.
+    """
+    if returncode == 0 and not timed_out:
+        return True, "Connection OK", output or "(no output)"
+    if not timed_out and "repository does not exist" in output.lower():
+        return True, "Reachable — no repository at this location yet (a backup will create it)", output
+    return False, "Connection failed", output or f"restic exited with code {returncode}"
 
 
 def _build_restic_debug(conf: dict) -> dict:
@@ -1384,9 +1401,9 @@ async def api_repo_test():
         "env": merged_env,
     }
 
-    ok, output = await test_restic_connection(test_conf)
+    ok, message, output = await test_restic_connection(test_conf)
     debug = _build_restic_debug(test_conf)
-    return jsonify(ok=ok, output=output, debug=debug)
+    return jsonify(ok=ok, message=message, output=output, debug=debug)
 
 
 @route("/api/backup", methods=["POST"])

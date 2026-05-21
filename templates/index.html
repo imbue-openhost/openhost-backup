@@ -604,7 +604,7 @@
         function renderTestResult(res) {
             const resultEl = document.getElementById("test-result");
             const headerCls = res.ok ? "msg-ok" : "msg-err";
-            const headerText = res.ok ? "Connection OK" : "Connection failed";
+            const headerText = res.message || (res.ok ? "Connection OK" : "Connection failed");
             resultEl.innerHTML =
                 '<div class="msg ' + headerCls + '">' + headerText + '</div>' +
                 '<div id="test-debug" style="margin-top:8px;"></div>' +
