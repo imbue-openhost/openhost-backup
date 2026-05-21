@@ -261,19 +261,18 @@
             <h3>Backend configuration</h3>
             <p class="info">
                 Configure where your snapshots are stored.<br>
-                See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on backend types.<br>
+                See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on configuring the various backend options.<br>
                 Auth credentials are often provided via env vars; set those here also.
             </p>
             <p class="info">
-                For AWS S3 (and compatible providers):
+                e.g. for AWS S3 (and s3-compatible providers):
             </p>
             <ul class="info" style="margin-bottom:12px;padding-left:20px;font-size:0.85rem;color:#666;line-height:1.5;">
                 <li>URL: <code>s3:s3.us-west-2.amazonaws.com/bucket/</code></li>
                 <li>Env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code></li>
             </ul>
             <p class="info">
-                Other examples: <code>sftp:user@host:/path</code>.<br>
-                Changing the URL does not migrate existing data; losing the password makes backups unrecoverable.
+                Changing the URL does not migrate existing data.
             </p>
             <label>Backend URL</label>
             <input type="text" id="conf-repo" value="{{ config.repo }}">
