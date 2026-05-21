@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,13 +74,9 @@ DB_FILE = CONFIG_DIR / "backups.db"
 RESTIC_REPO_DIR = APP_DATA_DIR / "restic-repo"
 
 DEFAULT_CONFIG = {
-    "interval_seconds": 3600,
-    "repo": str(RESTIC_REPO_DIR),
-    # Password for the restic repo. Generated on first boot if missing.
+    "interval_seconds": 0,
+    "repo": "",
     "repo_password": "",
-    # Extra env vars forwarded to restic (e.g. AWS_ACCESS_KEY_ID,
-    # AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, B2_ACCOUNT_ID, etc.).
-    # This is where backend credentials live.
     "env": {},
 }
 
@@ -1151,6 +1146,10 @@ async def scheduler_loop():
         conf = load_config()
         interval = conf["interval_seconds"]
 
+        if not interval or not conf.get("repo"):
+            await asyncio.sleep(30)
+            continue
+
         if first_run:
             first_run = False
             last = get_last_backup()
@@ -1174,27 +1173,13 @@ async def scheduler_loop():
 
 
 def ensure_default_config():
-    """Make sure config.json exists and has a repo password.
+    """Make sure config.json exists with default values.
 
-    Generates a random password on first run if the user hasn't supplied one.
-    The password is stored in config.json (0600); losing it makes the repo
-    unreadable, so surface it prominently in the UI.
+    Does not auto-generate a password or set a repo — the user configures
+    those through the UI. Backups won't run until configured.
     """
-    conf = load_config()
-    dirty = False
     if not CONFIG_FILE.exists():
-        dirty = True
-    if not conf.get("repo_password"):
-        conf["repo_password"] = secrets.token_urlsafe(32)
-        dirty = True
-        logger.warning(
-            "Generated new restic repo password — back it up via the Backup UI"
-        )
-    if not conf.get("repo"):
-        conf["repo"] = str(RESTIC_REPO_DIR)
-        dirty = True
-    if dirty:
-        save_config(conf)
+        save_config(load_config())
 
 
 @app.before_serving
@@ -1366,7 +1351,7 @@ async def post_config():
             return jsonify(
                 ok=False, error="interval_seconds must be an integer"
             ), 400
-        conf["interval_seconds"] = max(60, interval)
+        conf["interval_seconds"] = 0 if interval <= 0 else max(60, interval)
     save_config(conf)
     return jsonify(ok=True)
 

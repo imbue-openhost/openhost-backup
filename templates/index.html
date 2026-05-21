@@ -104,14 +104,20 @@
         <!-- Status -->
         <section>
             <h2>Status</h2>
-            {% if backend.type == "local" %}
+            {% if not config.repo %}
+            <div style="background:#f3f4f6;border:1px solid #d1d5db;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.85rem;color:#555;">
+                Backups are not configured yet. Set up a backend and password in the
+                configuration section below, then save to start automatic backups.
+            </div>
+            {% elif backend.type == "local" %}
             <div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.85rem;color:#92400e;">
                 <strong>Warning:</strong> snapshots are stored on this instance's local
                 disk ({{ backend.location }}). If this instance is lost, the backups
                 are lost with it. Point the repository at a remote backend (S3, B2,
-                SFTP, etc.) in the Repository section below.
+                SFTP, etc.) in the configuration section below.
             </div>
             {% endif %}
+            {% if config.repo %}
             <dl>
                 <dt>State</dt>
                 <dd id="status-state">
@@ -128,7 +134,7 @@
                 <dt>Last backup</dt>
                 <dd id="status-last">{{ state.last_backup or "never" }}</dd>
                 <dt>Interval</dt>
-                <dd>{{ config.interval_seconds }}s</dd>
+                <dd>{% if config.interval_seconds %}{{ config.interval_seconds }}s{% else %}disabled{% endif %}</dd>
                 <dt>Backend</dt>
                 <dd id="status-backend">
                     {% if backend.remote %}
@@ -144,11 +150,7 @@
                     <span style="color:#888;font-size:0.85rem;">loading…</span>
                 </dd>
             </dl>
-            <div style="margin-top: 12px;">
-                <label>Backup name (optional)</label>
-                <input type="text" id="backup-name" placeholder="e.g. before-deploy, weekly" style="margin-bottom:8px;">
-            </div>
-            <div class="btn-row">
+            <div class="btn-row" style="margin-top:12px;">
                 <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
                 <button class="btn-secondary" id="btn-check" onclick="triggerCheck()">Run restic check</button>
             </div>
@@ -192,6 +194,7 @@
                     </dd>
                 </dl>
             </details>
+            {% endif %}
         </section>
 
         <!-- Snapshots -->
@@ -254,9 +257,12 @@
                 The password used to encrypt the backup.
                 You will need this password to restore from your backups, so make sure to keep it safe.
             </p>
-            <input type="password" id="conf-repo-password" value="{{ config.repo_password or '' }}" autocomplete="off">
-            <label>Backup interval (seconds, minimum 60)</label>
-            <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
+            <div style="display:flex;gap:8px;margin-bottom:12px;">
+                <input type="text" id="conf-repo-password" value="{{ config.repo_password or '' }}" autocomplete="off" style="margin-bottom:0;">
+                <button class="btn-secondary" onclick="generatePassword()" style="white-space:nowrap;">Generate</button>
+            </div>
+            <label>Backup interval (seconds, 0 = disabled, minimum 60 when enabled)</label>
+            <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="0">
 
             <h3>Backend configuration</h3>
             <p class="info">
@@ -264,12 +270,11 @@
                 See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on configuring the various backend options.<br>
                 Auth credentials are often provided via env vars; set those here also.
             </p>
-            <p class="info">
-                e.g. for AWS S3 (and s3-compatible providers):
-            </p>
-            <ul class="info" style="margin-bottom:12px;padding-left:20px;font-size:0.85rem;color:#666;line-height:1.5;">
-                <li>URL: <code>s3:s3.us-west-2.amazonaws.com/bucket/</code></li>
-                <li>Env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code></li>
+            <p class="info">Examples:</p>
+            <ul class="info" style="margin-bottom:12px;padding-left:20px;font-size:0.85rem;color:#666;line-height:1.8;">
+                <li><strong>Local filesystem:</strong> <code>/data/app_data/backup/restic-repo</code></li>
+                <li><strong>AWS S3:</strong> URL: <code>s3:s3.us-west-2.amazonaws.com/bucket/</code>,
+                    env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code></li>
             </ul>
             <p class="info">
                 Changing the URL does not migrate existing data.
@@ -578,11 +583,12 @@
         }
 
         function configPayload() {
+            const interval = parseInt(document.getElementById("conf-interval").value, 10);
             return {
                 repo: document.getElementById("conf-repo").value,
                 repo_password: document.getElementById("conf-repo-password").value,
                 env: parseEnvString(document.getElementById("conf-env").value),
-                interval_seconds: parseInt(document.getElementById("conf-interval").value, 10),
+                interval_seconds: isNaN(interval) ? 0 : interval,
             };
         }
 
@@ -604,8 +610,18 @@
             renderTestResult(res);
         }
 
+        function generatePassword() {
+            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            const arr = new Uint8Array(32);
+            crypto.getRandomValues(arr);
+            const pw = Array.from(arr, b => chars[b % chars.length]).join("");
+            const el = document.getElementById("conf-repo-password");
+            el.value = pw;
+            el.type = "text";
+        }
+
         function toggleConfSecrets() {
-            const ids = ["conf-repo-password", "conf-env"];
+            const ids = ["conf-env"];
             const btn = document.getElementById("btn-show-secrets");
             const showing = ids[0] && document.getElementById(ids[0]).type === "text";
             const newType = showing ? "password" : "text";
@@ -686,10 +702,8 @@
             const btn = document.getElementById("btn-backup");
             btn.disabled = true;
             btn.textContent = "Starting...";
-            const name = document.getElementById("backup-name").value.trim() || undefined;
-            const res = await api("/api/backup", { method: "POST", body: { name } });
+            const res = await api("/api/backup", { method: "POST", body: {} });
             if (res.ok) {
-                document.getElementById("backup-name").value = "";
                 showMsg("backup-msg", "Backup started", true);
                 pollStatus();
             } else {
@@ -1211,9 +1225,11 @@
             poll();
         }
 
-        // Auto-load snapshots + repo stats on page load.
+        // Auto-load snapshots + repo stats on page load (only if configured).
+        {% if config.repo %}
         loadSnapshots();
         loadRepoStats();
+        {% endif %}
     </script>
 </body>
 </html>

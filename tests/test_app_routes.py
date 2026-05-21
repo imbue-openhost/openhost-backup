@@ -471,8 +471,8 @@ class TestStatusBackend:
         resp = await client.get("/api/status")
         data = await resp.get_json()
         assert "backend" in data
-        # Default is a local path.
-        assert data["backend"]["type"] == "local"
+        # Default config has no repo configured.
+        assert data["backend"]["type"] == "unknown"
         assert data["backend"]["remote"] is False
 
 
@@ -688,6 +688,9 @@ class TestIndexRendersScope:
         This is the lockstep guarantee the scope summary makes — the
         UI shows exactly what restic will walk.
         """
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        backup_app.save_config(conf)
         resp = await client.get("/")
         body = (await resp.get_data()).decode()
         for root in backup_app.BACKUP_ROOTS:
