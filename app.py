@@ -480,6 +480,85 @@ async def _restic_unlock_if_stale(conf: dict) -> None:
         logger.warning("restic unlock failed on startup", exc_info=True)
 
 
+def _is_secret_env(key: str) -> bool:
+    """Mark which env vars the UI should hide behind 'Show secrets' by default.
+
+    AWS_ACCESS_KEY_ID is a public identifier (like a username), so it's
+    shown.
+    """
+    k = key.upper()
+    if k == "AWS_ACCESS_KEY_ID":
+        return False
+    return any(token in k for token in ("PASSWORD", "SECRET", "TOKEN"))
+
+
+async def test_restic_connection(
+    conf: dict, *, timeout: float = 10.0
+) -> tuple[bool, str]:
+    """Run ``restic cat config`` once with a short timeout, no retries.
+
+    Returns ``(ok, output)`` where ``output`` is the raw stderr restic
+    produced (which, in the retry-storm case, captures each backend error
+    plus the cancellation line). We don't parse — the caller surfaces this
+    verbatim.
+    """
+    env = _restic_env(conf)
+    proc = await asyncio.create_subprocess_exec(
+        "restic", "cat", "config",
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr: bytes = b""
+    timed_out = False
+    try:
+        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2)
+        except Exception:
+            pass
+    text = stderr.decode(errors="replace")
+    if timed_out:
+        text = (text + f"\n\n[killed after {timeout:.0f}s — no retries]").lstrip()
+    if proc.returncode == 0 and not timed_out:
+        return True, text or "(no output)"
+    return False, text or f"restic exited with code {proc.returncode}"
+
+
+def _build_restic_debug(conf: dict) -> dict:
+    """Return the restic command + env used for testing.
+
+    All values are included in plaintext — this app has no public routes,
+    so callers are already authed as the owner by the OpenHost router.
+    The UI hides the secret-looking values behind a 'Show secrets' button
+    purely as a shoulder-surfing guard.
+    """
+    env = _restic_env(conf)
+    # Only the keys restic actually reads from us, not the whole process env.
+    keys: list[str] = ["RESTIC_REPOSITORY", "RESTIC_PASSWORD", "RESTIC_PROGRESS_FPS"]
+    for k in (conf.get("env") or {}):
+        if k not in keys:
+            keys.append(k)
+    entries = []
+    for k in keys:
+        v = env.get(k, "")
+        entries.append({
+            "key": k,
+            "secret": _is_secret_env(k),
+            "value": v,
+        })
+    return {
+        "command": "restic cat config",
+        "env": entries,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Backup
 # ---------------------------------------------------------------------------
@@ -1341,6 +1420,27 @@ async def reveal_password():
         return jsonify(ok=False, error="Bearer token required"), 401
     conf = load_config()
     return jsonify(ok=True, password=conf.get("repo_password", ""))
+
+
+@route("/api/repo/test", methods=["POST"])
+async def api_repo_test():
+    """Test the restic connection once, no retries.
+
+    Body (all optional): ``repo``, ``repo_password`` — override the saved
+    values for the test, so the user can try a new URL/password before
+    committing them with Save. The saved ``env`` is always used.
+    """
+    data = await request.get_json(silent=True) or {}
+    conf = load_config()
+    repo = (data.get("repo") or conf.get("repo") or "").strip()
+    if not repo:
+        return jsonify(ok=False, error="No repo URL configured"), 400
+    repo_password = data.get("repo_password") or conf.get("repo_password", "")
+    test_conf = {**conf, "repo": repo, "repo_password": repo_password}
+
+    ok, output = await test_restic_connection(test_conf)
+    debug = _build_restic_debug(test_conf)
+    return jsonify(ok=ok, output=output, debug=debug)
 
 
 @route("/api/backup", methods=["POST"])

@@ -272,8 +272,12 @@
             </div>
             <label>Backup interval (seconds, minimum 60)</label>
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
-            <button class="btn-primary" onclick="saveConfig()">Save</button>
+            <div class="btn-row">
+                <button class="btn-secondary" onclick="testConnection()">Test</button>
+                <button class="btn-primary" onclick="saveConfig()">Save</button>
+            </div>
             <div id="conf-msg"></div>
+            <div id="test-result"></div>
         </section>
 
         <!-- Backend credentials -->
@@ -607,6 +611,67 @@
             } else {
                 showMsg("conf-msg", res.error || "Error", false);
             }
+        }
+
+        async function testConnection() {
+            const resultEl = document.getElementById("test-result");
+            resultEl.innerHTML = '<div class="msg" style="color:#555;">Testing…</div>';
+            const body = { repo: document.getElementById("conf-repo").value };
+            const pw = document.getElementById("conf-repo-password").value;
+            if (pw) body.repo_password = pw;
+            const res = await api("/api/repo/test", { method: "POST", body });
+            window._lastTestDebug = res.debug || null;
+            window._showSecrets = false;
+            renderTestResult(res);
+        }
+
+        function renderTestResult(res) {
+            const resultEl = document.getElementById("test-result");
+            const headerCls = res.ok ? "msg-ok" : "msg-err";
+            const headerText = res.ok ? "Connection OK" : "Connection failed";
+            resultEl.innerHTML =
+                '<div class="msg ' + headerCls + '">' + headerText + '</div>' +
+                '<div id="test-debug" style="margin-top:8px;"></div>' +
+                '<div style="font-size:0.85rem;color:#666;margin-top:6px;margin-bottom:4px;">Restic output:</div>' +
+                '<pre style="margin:0;padding:10px;background:#0b1020;color:#e2e8f0;border-radius:4px;font-size:0.78rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;">' +
+                escapeHtml(res.output || "(no output)") +
+                '</pre>';
+            renderTestDebug();
+        }
+
+        function renderTestDebug() {
+            const el = document.getElementById("test-debug");
+            if (!el) return;
+            const debug = window._lastTestDebug;
+            if (!debug) { el.innerHTML = ""; return; }
+            const show = !!window._showSecrets;
+            const cmdLine = '<div style="margin-bottom:4px;color:#666;">$ ' + escapeHtml(debug.command) + '</div>';
+            const envLines = (debug.env || []).map(e => {
+                const v = e.value || "";
+                let displayed;
+                if (!v) {
+                    displayed = '<span style="color:#999;">(unset)</span>';
+                } else if (e.secret && !show) {
+                    displayed = '<span style="color:#999;">*** (' + v.length + ' chars)</span>';
+                } else {
+                    displayed = escapeHtml(v);
+                }
+                return '<div>' + escapeHtml(e.key) + '=' + displayed + '</div>';
+            }).join("");
+            const hasSecret = (debug.env || []).some(e => e.secret && e.value);
+            const btn = hasSecret
+                ? '<button class="btn-secondary" style="margin-top:8px;" onclick="toggleTestSecrets()">' +
+                  (show ? "Hide secrets" : "Show secrets") + '</button>'
+                : "";
+            el.innerHTML =
+                '<div style="padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;font-family:monospace;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;">' +
+                cmdLine + envLines +
+                '</div>' + btn;
+        }
+
+        function toggleTestSecrets() {
+            window._showSecrets = !window._showSecrets;
+            renderTestDebug();
         }
 
         async function showPassword() {
