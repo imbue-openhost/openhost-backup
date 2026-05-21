@@ -471,21 +471,31 @@ async def test_restic_connection(
     """Run ``restic cat config`` once with a short timeout, no retries.
 
     Returns ``(ok, output)`` where ``output`` is the raw stderr restic
-    produced (which, in the retry-storm case, captures each backend error
-    plus the cancellation line). We don't parse — the caller surfaces this
-    verbatim.
+    produced. We drain stderr incrementally in a background task so that
+    when we kill restic at the timeout, all the bytes it printed up to
+    that point — typically several ``retrying after Xs: <backend error>``
+    lines — are already in our buffer.
     """
     env = _restic_env(conf)
     proc = await asyncio.create_subprocess_exec(
         "restic", "cat", "config",
         env=env,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    stderr: bytes = b""
+    buf = bytearray()
+
+    async def drain() -> None:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                return
+            buf.extend(chunk)
+
+    drain_task = asyncio.create_task(drain())
     timed_out = False
     try:
-        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
         try:
@@ -493,10 +503,15 @@ async def test_restic_connection(
         except ProcessLookupError:
             pass
         try:
-            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2)
+            await proc.wait()
         except Exception:
             pass
-    text = stderr.decode(errors="replace")
+    try:
+        await asyncio.wait_for(drain_task, timeout=2)
+    except asyncio.TimeoutError:
+        drain_task.cancel()
+
+    text = bytes(buf).decode(errors="replace")
     if timed_out:
         text = (text + f"\n\n[killed after {timeout:.0f}s — no retries]").lstrip()
     if proc.returncode == 0 and not timed_out:
