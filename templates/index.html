@@ -619,6 +619,19 @@
             const body = { repo: document.getElementById("conf-repo").value };
             const pw = document.getElementById("conf-repo-password").value;
             if (pw) body.repo_password = pw;
+            // Pull in any creds typed into the "Backend credentials" section
+            // below — saves the user from having to Apply S3 / Save first.
+            const env = {};
+            const awsAccess = (document.getElementById("s3-access-key").value || "").trim();
+            const awsSecret = document.getElementById("s3-secret-key").value;
+            const awsRegion = (document.getElementById("s3-region").value || "").trim();
+            if (awsAccess) env.AWS_ACCESS_KEY_ID = awsAccess;
+            if (awsSecret) env.AWS_SECRET_ACCESS_KEY = awsSecret;
+            if (awsRegion) env.AWS_DEFAULT_REGION = awsRegion;
+            const rawKey = (document.getElementById("env-key").value || "").trim();
+            const rawVal = document.getElementById("env-value").value;
+            if (rawKey && rawVal) env[rawKey] = rawVal;
+            if (Object.keys(env).length) body.env = env;
             const res = await api("/api/repo/test", { method: "POST", body });
             window._lastTestDebug = res.debug || null;
             window._showSecrets = false;

@@ -1436,7 +1436,21 @@ async def api_repo_test():
     if not repo:
         return jsonify(ok=False, error="No repo URL configured"), 400
     repo_password = data.get("repo_password") or conf.get("repo_password", "")
-    test_conf = {**conf, "repo": repo, "repo_password": repo_password}
+    # Merge env overrides on top of saved env so the user can test credentials
+    # they've typed into the page (AWS quick setup, raw env setter) without
+    # having to Apply/Save first.
+    env_override = data.get("env") or {}
+    merged_env = {**(conf.get("env") or {})}
+    for k, v in env_override.items():
+        if v is None or v == "":
+            continue
+        merged_env[k] = v
+    test_conf = {
+        **conf,
+        "repo": repo,
+        "repo_password": repo_password,
+        "env": merged_env,
+    }
 
     ok, output = await test_restic_connection(test_conf)
     debug = _build_restic_debug(test_conf)
