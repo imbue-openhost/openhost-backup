@@ -7,8 +7,9 @@
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
-        h1 { font-size: 1.5rem; margin-bottom: 0; }
-        h2 { font-size: 1.1rem; margin-bottom: 12px; color: #333; }
+        h1 { font-size: 2rem; margin-bottom: 0; }
+        h2 { font-size: 1.5rem; margin-bottom: 12px; color: #333; }
+        h3 { font-size: 1.0rem; margin-bottom: 12px; color: #333; }
         section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
         label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; color: #555; }
         input[type="text"], input[type="number"], input[type="password"] {
@@ -248,16 +249,20 @@
         <!-- Restic config -->
         <section>
             <h2>Restic configuration</h2>
-            <label>Repository password (this is used to encrypt the backups)</label>
+            <label>Repository password</label>
+            <p class="info">
+                The password used to encrypt the backup.
+                You will need this password to restore from your backups, so make sure to keep it safe.
+            </p>
             <input type="password" id="conf-repo-password" value="{{ config.repo_password or '' }}" autocomplete="off">
             <label>Backup interval (seconds, minimum 60)</label>
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
 
             <h3>Backend configuration</h3>
             <p class="info">
-                Configure where your snapshots are stored.
-                See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on backend types.
-                Auth credentials are often provided via env vars.
+                Configure where your snapshots are stored.<br>
+                See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on backend types.<br>
+                Auth credentials are often provided via env vars; set those here also.
             </p>
             <p class="info">
                 For AWS S3 (and compatible providers):
@@ -267,7 +272,7 @@
                 <li>Env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code></li>
             </ul>
             <p class="info">
-                Other examples: <code>sftp:user@host:/path</code>.
+                Other examples: <code>sftp:user@host:/path</code>.<br>
                 Changing the URL does not migrate existing data; losing the password makes backups unrecoverable.
             </p>
             <label>Backend URL</label>
