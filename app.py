@@ -448,17 +448,6 @@ async def _restic_unlock_if_stale(conf: dict) -> None:
         logger.warning("restic unlock failed on startup", exc_info=True)
 
 
-def _is_secret_env(key: str) -> bool:
-    """Mark which env vars the UI should hide behind 'Show secrets' by default.
-
-    AWS_ACCESS_KEY_ID is a public identifier (like a username), so it's
-    shown.
-    """
-    k = key.upper()
-    if k == "AWS_ACCESS_KEY_ID":
-        return False
-    return any(token in k for token in ("PASSWORD", "SECRET", "TOKEN"))
-
 
 async def test_restic_connection(
     conf: dict, *, timeout: float = 10.0
@@ -548,11 +537,7 @@ def _build_restic_debug(conf: dict) -> dict:
     entries = []
     for k in keys:
         v = env.get(k, "")
-        entries.append({
-            "key": k,
-            "secret": _is_secret_env(k),
-            "value": v,
-        })
+        entries.append({"key": k, "value": v})
     return {
         "command": "restic cat config",
         "env": entries,
