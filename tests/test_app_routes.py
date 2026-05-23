@@ -400,56 +400,69 @@ class TestClassifyRepo:
 
 
 class TestConfigEnv:
-    async def test_env_set_and_redacted(self, client):
-        # Start with the default config in the fixture's CONFIG_FILE.
+    async def test_env_set_and_returned_plaintext(self, client):
         backup_app.ensure_default_config()
 
-        # Set a whitelisted env var.
         resp = await client.post(
             "/api/config",
             data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": "test-key"}}),
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 200
-        data = await resp.get_json()
-        assert data["ok"] is True
+        assert (await resp.get_json())["ok"] is True
 
-        # GET should redact the value but list the key.
         resp2 = await client.get("/api/config")
         data2 = await resp2.get_json()
-        assert data2["config"]["env"]["AWS_ACCESS_KEY_ID"] == "***"
-        assert "AWS_ACCESS_KEY_ID" in data2["config"]["env_keys"]
+        # No redaction — the app is owner-only behind the router, so GET
+        # returns what's saved.
+        assert data2["config"]["env"]["AWS_ACCESS_KEY_ID"] == "test-key"
+        assert backup_app.load_config()["env"]["AWS_ACCESS_KEY_ID"] == "test-key"
 
-        # Underlying config actually stores the raw value.
-        conf = backup_app.load_config()
-        assert conf["env"]["AWS_ACCESS_KEY_ID"] == "test-key"
-
-    async def test_env_disallowed_key_rejected(self, client):
+    async def test_env_accepts_arbitrary_keys(self, client):
+        # No whitelist anymore — owner can set any env var restic needs.
         resp = await client.post(
             "/api/config",
-            data=json.dumps({"env": {"PATH": "/evil"}}),
+            data=json.dumps({"env": {"B2_ACCOUNT_ID": "abc", "CUSTOM_KEY": "v"}}),
             headers={"Content-Type": "application/json"},
         )
-        assert resp.status_code == 400
-        data = await resp.get_json()
-        assert "not allowed" in data["error"]
+        assert resp.status_code == 200
+        conf = backup_app.load_config()
+        assert conf["env"]["B2_ACCOUNT_ID"] == "abc"
+        assert conf["env"]["CUSTOM_KEY"] == "v"
 
-    async def test_env_clear(self, client):
+    async def test_env_post_replaces_rather_than_merging(self, client):
+        # The form posts the entire env block on every save; older keys
+        # must disappear when omitted, not silently linger.
         backup_app.ensure_default_config()
-        # Seed a value.
+        conf = backup_app.load_config()
+        conf["env"] = {"OLD_KEY": "stale", "AWS_ACCESS_KEY_ID": "k"}
+        backup_app.save_config(conf)
+
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": "k"}}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        env = backup_app.load_config().get("env") or {}
+        assert env == {"AWS_ACCESS_KEY_ID": "k"}
+
+    async def test_env_empty_values_dropped(self, client):
+        # Submitting "" for a key in the env dict drops the key rather
+        # than persisting an empty string (which restic would still
+        # see in os.environ).
+        backup_app.ensure_default_config()
         conf = backup_app.load_config()
         conf["env"] = {"AWS_ACCESS_KEY_ID": "to-be-cleared"}
         backup_app.save_config(conf)
 
-        # Clear it by passing empty string.
         resp = await client.post(
             "/api/config",
             data=json.dumps({"env": {"AWS_ACCESS_KEY_ID": ""}}),
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 200
-        conf = backup_app.load_config()
-        assert "AWS_ACCESS_KEY_ID" not in (conf.get("env") or {})
+        assert "AWS_ACCESS_KEY_ID" not in (backup_app.load_config().get("env") or {})
 
 
 class TestStatusBackend:
@@ -458,56 +471,9 @@ class TestStatusBackend:
         resp = await client.get("/api/status")
         data = await resp.get_json()
         assert "backend" in data
-        # Default is a local path.
-        assert data["backend"]["type"] == "local"
+        # Default config has no repo configured.
+        assert data["backend"]["type"] == "unknown"
         assert data["backend"]["remote"] is False
-
-
-class TestPasswordReveal:
-    async def test_password_reveal_requires_auth(self, client):
-        backup_app.ensure_default_config()
-        resp = await client.get("/api/config/password")
-        assert resp.status_code == 401
-        data = await resp.get_json()
-        assert data["ok"] is False
-
-    @patch("app._verify_admin_token", new_callable=AsyncMock)
-    async def test_password_reveal_with_valid_token(self, mock_verify, client):
-        backup_app.ensure_default_config()
-        mock_verify.return_value = True
-        resp = await client.get(
-            "/api/config/password",
-            headers={"Authorization": "Bearer valid-token"},
-        )
-        assert resp.status_code == 200
-        data = await resp.get_json()
-        assert data["ok"] is True
-        # Password is the auto-generated one from ensure_default_config.
-        assert data["password"]
-
-    @patch("app._verify_admin_token", new_callable=AsyncMock)
-    async def test_password_reveal_with_invalid_token(self, mock_verify, client):
-        mock_verify.return_value = False
-        resp = await client.get(
-            "/api/config/password",
-            headers={"Authorization": "Bearer bad-token"},
-        )
-        assert resp.status_code == 401
-
-
-class TestConfigRedactsRouterToken:
-    async def test_router_api_token_redacted(self, client):
-        # Seed a token directly.
-        backup_app.ensure_default_config()
-        conf = backup_app.load_config()
-        conf["router_api_token"] = "secret-router-token"
-        backup_app.save_config(conf)
-
-        resp = await client.get("/api/config")
-        data = await resp.get_json()
-        assert data["config"]["router_api_token"] == "***"
-        # Underlying storage still has the real value.
-        assert backup_app.load_config()["router_api_token"] == "secret-router-token"
 
 
 class TestPostConfigSensitiveWrites:
@@ -541,14 +507,17 @@ class TestPostConfigSensitiveWrites:
         # Token should NOT have been rotated.
         assert backup_app.load_config()["router_api_token"] == "existing"
 
-    async def test_set_repo_password_requires_auth(self, client):
+    async def test_set_repo_password_no_auth_required(self, client):
+        # The owner is the only caller (the app has no public paths), so
+        # writing repo_password is no longer gated.
         backup_app.ensure_default_config()
         resp = await client.post(
             "/api/config",
             data=json.dumps({"repo_password": "new-pw"}),
             headers={"Content-Type": "application/json"},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 200
+        assert backup_app.load_config()["repo_password"] == "new-pw"
 
     async def test_invalid_interval_seconds(self, client):
         backup_app.ensure_default_config()
@@ -719,6 +688,9 @@ class TestIndexRendersScope:
         This is the lockstep guarantee the scope summary makes — the
         UI shows exactly what restic will walk.
         """
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        backup_app.save_config(conf)
         resp = await client.get("/")
         body = (await resp.get_data()).decode()
         for root in backup_app.BACKUP_ROOTS:

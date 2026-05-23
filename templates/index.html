@@ -7,8 +7,9 @@
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
-        h1 { font-size: 1.5rem; margin-bottom: 0; }
-        h2 { font-size: 1.1rem; margin-bottom: 12px; color: #333; }
+        h1 { font-size: 2rem; margin-bottom: 0; }
+        h2 { font-size: 1.5rem; margin-bottom: 12px; color: #333; }
+        h3 { font-size: 1.0rem; margin-bottom: 12px; color: #333; }
         section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
         label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; color: #555; }
         input[type="text"], input[type="number"], input[type="password"] {
@@ -103,14 +104,20 @@
         <!-- Status -->
         <section>
             <h2>Status</h2>
-            {% if backend.type == "local" %}
+            {% if not config.repo %}
+            <div style="background:#f3f4f6;border:1px solid #d1d5db;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.85rem;color:#555;">
+                Backups are not configured yet. Set up a backend and password in the
+                configuration section below, then save to start automatic backups.
+            </div>
+            {% elif backend.type == "local" %}
             <div style="background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.85rem;color:#92400e;">
                 <strong>Warning:</strong> snapshots are stored on this instance's local
                 disk ({{ backend.location }}). If this instance is lost, the backups
                 are lost with it. Point the repository at a remote backend (S3, B2,
-                SFTP, etc.) in the Repository section below.
+                SFTP, etc.) in the configuration section below.
             </div>
             {% endif %}
+            {% if config.repo %}
             <dl>
                 <dt>State</dt>
                 <dd id="status-state">
@@ -127,7 +134,7 @@
                 <dt>Last backup</dt>
                 <dd id="status-last">{{ state.last_backup or "never" }}</dd>
                 <dt>Interval</dt>
-                <dd>{{ config.interval_seconds }}s</dd>
+                <dd>{% if config.interval_seconds %}{{ config.interval_seconds }}s{% else %}disabled{% endif %}</dd>
                 <dt>Backend</dt>
                 <dd id="status-backend">
                     {% if backend.remote %}
@@ -143,11 +150,7 @@
                     <span style="color:#888;font-size:0.85rem;">loading…</span>
                 </dd>
             </dl>
-            <div style="margin-top: 12px;">
-                <label>Backup name (optional)</label>
-                <input type="text" id="backup-name" placeholder="e.g. before-deploy, weekly" style="margin-bottom:8px;">
-            </div>
-            <div class="btn-row">
+            <div class="btn-row" style="margin-top:12px;">
                 <button class="btn-primary" id="btn-backup" onclick="triggerBackup()">Run backup now</button>
                 <button class="btn-secondary" id="btn-check" onclick="triggerCheck()">Run restic check</button>
             </div>
@@ -191,6 +194,7 @@
                     </dd>
                 </dl>
             </details>
+            {% endif %}
         </section>
 
         <!-- Snapshots -->
@@ -245,80 +249,48 @@
             <div id="manage-msg"></div>
         </section>
 
-        <!-- Repo config -->
+        <!-- Restic config -->
         <section>
-            <h2>Repository</h2>
-            <p class="info">
-                The backup app stores snapshots in a restic repository. By default it
-                points at a local path inside the backup app's own data directory. You
-                can change this to any restic-supported backend. For AWS S3, use the
-                <strong>region-specific</strong> endpoint matching your bucket's region,
-                e.g. <code>s3:s3.us-west-2.amazonaws.com/bucket/path</code> (using the
-                generic <code>s3.amazonaws.com</code> endpoint works but adds an extra
-                redirect on every request and can fail signature checks if
-                <code>AWS_DEFAULT_REGION</code> doesn't match the bucket). Other
-                examples: <code>b2:bucket:path</code>,
-                <code>sftp:user@host:/path</code>. Changing the repo URL does not
-                migrate existing data. The repo password is required to read or write
-                the repo — losing it makes backups unrecoverable.
-            </p>
-            <label>Repository URL</label>
-            <input type="text" id="conf-repo" value="{{ config.repo }}">
+            <h2>Restic configuration</h2>
             <label>Repository password</label>
-            <input type="password" id="conf-repo-password" placeholder="(unchanged)" autocomplete="off">
-            <div class="btn-row" style="margin-bottom:12px;">
-                <button class="btn-secondary" onclick="showPassword()">Show current password</button>
-                <span id="current-password-display" style="font-family:monospace;font-size:0.85rem;color:#444;"></span>
-            </div>
-            <label>Backup interval (seconds, minimum 60)</label>
-            <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="60">
-            <button class="btn-primary" onclick="saveConfig()">Save</button>
-            <div id="conf-msg"></div>
-        </section>
-
-        <!-- Backend credentials -->
-        <section>
-            <h2>Backend credentials</h2>
             <p class="info">
-                Credentials forwarded to <code>restic</code> as environment variables.
-                Fill these in when pointing at a remote backend (S3, B2, Azure, etc.).
-                Values are stored in <code>config.json</code> alongside the repo
-                password. Leave a field blank to leave the current value unchanged;
-                enter a single space to clear it.
+                The password used to encrypt the backup.
+                You will need this password to restore from your backups, so make sure to keep it safe.
             </p>
-            <div id="env-existing" style="font-size:0.85rem;color:#555;margin-bottom:12px;"></div>
+            <div style="display:flex;gap:8px;margin-bottom:12px;">
+                <input type="{{ 'password' if config.repo_password else 'text' }}" id="conf-repo-password" value="{{ config.repo_password or '' }}" autocomplete="off" style="margin-bottom:0;">
+                <button class="btn-secondary" onclick="generatePassword()" style="white-space:nowrap;">Generate</button>
+            </div>
+            <label>Backup interval (seconds, 0 = disabled, minimum 60 when enabled)</label>
+            <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="0">
 
-            <details style="margin-bottom:16px;">
-                <summary style="cursor:pointer;font-weight:600;font-size:0.9rem;color:#2563eb;">AWS S3 quick setup</summary>
-                <div style="margin-top:12px;">
-                    <label>Bucket (e.g. my-openhost-backups/andrew-1)</label>
-                    <input type="text" id="s3-bucket" placeholder="my-bucket/path">
-                    <label>Region</label>
-                    <input type="text" id="s3-region" value="us-east-1">
-                    <label>AWS_ACCESS_KEY_ID</label>
-                    <input type="text" id="s3-access-key" autocomplete="off" placeholder="AKIA...">
-                    <label>AWS_SECRET_ACCESS_KEY</label>
-                    <input type="password" id="s3-secret-key" autocomplete="off">
-                    <button class="btn-primary" onclick="setupS3()">Apply S3 config</button>
-                </div>
-            </details>
+            <h3>Backend configuration</h3>
+            <p class="info">
+                Configure where your snapshots are stored.<br>
+                See the <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a> for details on configuring the various backend options.<br>
+                Auth credentials are often provided via env vars; set those here also.
+            </p>
+            <p class="info">Examples:</p>
+            <ul class="info" style="margin-bottom:12px;padding-left:20px;font-size:0.85rem;color:#666;line-height:1.8;">
+                <li><strong>Local filesystem:</strong> <code>/data/app_data/backup/restic-repo</code></li>
+                <li><strong>AWS S3:</strong> URL: <code>s3:s3.us-west-2.amazonaws.com/bucket/</code>,
+                    env vars: <code>AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=...</code></li>
+            </ul>
+            <p class="info">
+                Changing the URL does not migrate existing data.
+            </p>
+            <label>Backend URL</label>
+            <input type="text" id="conf-repo" value="{{ config.repo }}">
+            <label>Environment variables (<code>KEY=value;KEY2=value2</code>)</label>
+            <input type="{{ 'password' if env_string else 'text' }}" id="conf-env" value="{{ env_string }}" placeholder="AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=..." autocomplete="off">
 
-            <details>
-                <summary style="cursor:pointer;font-weight:600;font-size:0.9rem;color:#2563eb;">Other backends (raw env vars)</summary>
-                <div style="margin-top:12px;">
-                    <p class="info">
-                        Any <code>restic</code>-recognised env var can be set here. See the
-                        <a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noopener">restic docs</a>
-                        for the right keys for your backend.
-                    </p>
-                    <label>Key</label>
-                    <input type="text" id="env-key" placeholder="B2_ACCOUNT_ID">
-                    <label>Value (blank = unchanged, single space = clear)</label>
-                    <input type="password" id="env-value" autocomplete="off">
-                    <button class="btn-secondary" onclick="setEnvKey()">Set</button>
-                </div>
-            </details>
-            <div id="env-msg"></div>
+            <div class="btn-row">
+                <button class="btn-secondary" onclick="toggleConfSecrets()" id="btn-show-secrets">Show secrets</button>
+                <button class="btn-secondary" onclick="testConnection()">Test</button>
+                <button class="btn-primary" onclick="saveConfig()">Save</button>
+            </div>
+            <div id="conf-msg"></div>
+            <div id="test-result"></div>
         </section>
 
     </div>
@@ -593,45 +565,120 @@
            Backup page
            ================================================================ */
 
-        async function saveConfig() {
-            const data = {
+        function parseEnvString(s) {
+            // KEY=value;KEY2=value2  →  {KEY: "value", KEY2: "value2"}
+            // Whitespace around keys is trimmed; values are kept verbatim
+            // (so secrets with trailing spaces aren't silently mangled).
+            // Empty segments are skipped.
+            const out = {};
+            for (const seg of (s || "").split(";")) {
+                if (!seg.trim()) continue;
+                const eq = seg.indexOf("=");
+                if (eq < 0) continue;
+                const k = seg.slice(0, eq).trim();
+                const v = seg.slice(eq + 1);
+                if (k) out[k] = v;
+            }
+            return out;
+        }
+
+        function configPayload() {
+            const interval = parseInt(document.getElementById("conf-interval").value, 10);
+            return {
                 repo: document.getElementById("conf-repo").value,
-                interval_seconds: parseInt(document.getElementById("conf-interval").value, 10),
+                repo_password: document.getElementById("conf-repo-password").value,
+                env: parseEnvString(document.getElementById("conf-env").value),
+                interval_seconds: isNaN(interval) ? 0 : interval,
             };
-            const pw = document.getElementById("conf-repo-password").value;
-            if (pw) data.repo_password = pw;
-            const res = await api("/api/config", { method: "POST", body: data });
+        }
+
+        async function saveConfig() {
+            const res = await api("/api/config", { method: "POST", body: configPayload() });
             if (res.ok) {
-                document.getElementById("conf-repo-password").value = "";
-                showMsg("conf-msg", "Saved", true);
+                location.reload();
             } else {
                 showMsg("conf-msg", res.error || "Error", false);
             }
         }
 
-        async function showPassword() {
-            // Password reveal requires an explicit Bearer token because the
-            // backup app can't tell, from inside its container, whether a
-            // caller is the owner in a browser vs. another app on the same
-            // Docker network. Prompt for the owner's OpenHost API token.
-            const token = prompt(
-                "Paste an OpenHost API token to reveal the restic repo password.\n\n" +
-                "You can generate one from the OpenHost dashboard → API Tokens. " +
-                "This token is not stored in your browser.");
-            if (!token) return;
-            const el = document.getElementById("current-password-display");
-            const r = await fetch(BASE + "/api/config/password", {
-                headers: { "Authorization": "Bearer " + token.trim() },
-            });
-            let body = {};
-            try { body = await r.json(); } catch {}
-            if (r.status === 401) {
-                el.textContent = "unauthorized — token rejected by router";
-            } else if (body.ok) {
-                el.textContent = body.password || "(empty)";
-            } else {
-                el.textContent = "error: " + (body.error || r.status);
+        async function testConnection() {
+            const resultEl = document.getElementById("test-result");
+            resultEl.innerHTML = '<div class="msg" style="color:#555;">Testing…</div>';
+            const res = await api("/api/repo/test", { method: "POST", body: configPayload() });
+            window._lastTestDebug = res.debug || null;
+            window._showSecrets = false;
+            renderTestResult(res);
+        }
+
+        function generatePassword() {
+            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            const arr = new Uint8Array(32);
+            crypto.getRandomValues(arr);
+            const pw = Array.from(arr, b => chars[b % chars.length]).join("");
+            const el = document.getElementById("conf-repo-password");
+            el.value = pw;
+            el.type = "text";
+        }
+
+        function toggleConfSecrets() {
+            const ids = ["conf-repo-password", "conf-env"];
+            const btn = document.getElementById("btn-show-secrets");
+            const anyHidden = ids.some(id => { const el = document.getElementById(id); return el && el.type === "password"; });
+            const newType = anyHidden ? "text" : "password";
+            ids.forEach(id => { const el = document.getElementById(id); if (el) el.type = newType; });
+            btn.textContent = anyHidden ? "Hide secrets" : "Show secrets";
+        }
+
+        function renderTestResult(res) {
+            const resultEl = document.getElementById("test-result");
+            const headerCls = res.ok ? "msg-ok" : "msg-err";
+            const headerText = res.message || (res.ok ? "Connection OK" : "Connection failed");
+            let html = '<div class="msg ' + headerCls + '">' + headerText + '</div>';
+            if (!res.ok) {
+                html +=
+                    '<div id="test-debug" style="margin-top:8px;"></div>' +
+                    '<div style="font-size:0.85rem;color:#666;margin-top:6px;margin-bottom:4px;">Restic output:</div>' +
+                    '<pre style="margin:0;padding:10px;background:#0b1020;color:#e2e8f0;border-radius:4px;font-size:0.78rem;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;">' +
+                    escapeHtml(res.output || "(no output)") +
+                    '</pre>';
             }
+            resultEl.innerHTML = html;
+            if (!res.ok) renderTestDebug();
+        }
+
+        function renderTestDebug() {
+            const el = document.getElementById("test-debug");
+            if (!el) return;
+            const debug = window._lastTestDebug;
+            if (!debug) { el.innerHTML = ""; return; }
+            const show = !!window._showSecrets;
+            const cmdLine = '<div style="margin-bottom:4px;color:#666;">$ ' + escapeHtml(debug.command) + '</div>';
+            const envLines = (debug.env || []).map(e => {
+                const v = e.value || "";
+                let displayed;
+                if (!v) {
+                    displayed = '<span style="color:#999;">(unset)</span>';
+                } else if (!show) {
+                    displayed = '<span style="color:#999;">*** (' + v.length + ' chars)</span>';
+                } else {
+                    displayed = escapeHtml(v);
+                }
+                return '<div>' + escapeHtml(e.key) + '=' + displayed + '</div>';
+            }).join("");
+            const hasValues = (debug.env || []).some(e => e.value);
+            const btn = hasValues
+                ? '<button class="btn-secondary" style="margin-top:8px;" onclick="toggleTestSecrets()">' +
+                  (show ? "Hide secrets" : "Show secrets") + '</button>'
+                : "";
+            el.innerHTML =
+                '<div style="padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;font-family:monospace;font-size:0.8rem;white-space:pre-wrap;word-break:break-all;">' +
+                cmdLine + envLines +
+                '</div>' + btn;
+        }
+
+        function toggleTestSecrets() {
+            window._showSecrets = !window._showSecrets;
+            renderTestDebug();
         }
 
         async function loadRepoStats() {
@@ -654,75 +701,12 @@
             el.innerHTML = escapeHtml(size) + ' <span style="color:#666;font-size:0.85rem;">(' + escapeHtml(String(snaps)) + ' snapshots' + escapeHtml(ratioNote) + ')</span>';
         }
 
-        async function loadEnvKeys() {
-            const res = await api("/api/config");
-            const el = document.getElementById("env-existing");
-            if (!el) return;
-            const keys = (res.config && res.config.env_keys) || [];
-            if (keys.length === 0) {
-                el.innerHTML = '<em style="color:#888;">No backend credentials set.</em>';
-            } else {
-                el.innerHTML = "Currently set: " + keys.map(k => '<code style="background:#f3f4f6;padding:1px 6px;border-radius:3px;margin-right:4px;">' + escapeHtml(k) + '</code>').join("");
-            }
-        }
-
-        async function setupS3() {
-            const bucket = document.getElementById("s3-bucket").value.trim();
-            const region = document.getElementById("s3-region").value.trim() || "us-east-1";
-            const accessKey = document.getElementById("s3-access-key").value.trim();
-            const secretKey = document.getElementById("s3-secret-key").value;
-            if (!bucket) { showMsg("env-msg", "Enter a bucket", false); return; }
-            if (!accessKey || !secretKey) { showMsg("env-msg", "Enter access + secret keys", false); return; }
-
-            const repoUrl = "s3:s3." + region + ".amazonaws.com/" + bucket;
-            // Apply repo URL + credentials together.
-            const payload = {
-                repo: repoUrl,
-                env: {
-                    AWS_ACCESS_KEY_ID: accessKey,
-                    AWS_SECRET_ACCESS_KEY: secretKey,
-                    AWS_DEFAULT_REGION: region,
-                },
-            };
-            const res = await api("/api/config", { method: "POST", body: payload });
-            if (res.ok) {
-                document.getElementById("s3-secret-key").value = "";
-                document.getElementById("conf-repo").value = repoUrl;
-                showMsg("env-msg", "S3 config applied. Run a backup to initialize the new repo.", true);
-                loadEnvKeys();
-            } else {
-                showMsg("env-msg", res.error || "Error", false);
-            }
-        }
-
-        async function setEnvKey() {
-            const key = document.getElementById("env-key").value.trim();
-            const val = document.getElementById("env-value").value;
-            if (!key) { showMsg("env-msg", "Enter a key", false); return; }
-            // Single space = clear (send empty string).
-            const sendVal = val === " " ? "" : val;
-            if (sendVal === "" && val !== " ") {
-                showMsg("env-msg", "Enter a value (or a single space to clear)", false);
-                return;
-            }
-            const res = await api("/api/config", { method: "POST", body: { env: { [key]: sendVal } } });
-            if (res.ok) {
-                document.getElementById("env-value").value = "";
-                showMsg("env-msg", sendVal === "" ? "Key cleared" : "Key set", true);
-                loadEnvKeys();
-            } else {
-                showMsg("env-msg", res.error || "Error", false);
-            }
-        }
-
         async function triggerBackup() {
             const btn = document.getElementById("btn-backup");
             btn.disabled = true;
             btn.textContent = "Starting...";
-            const name = document.getElementById("backup-name").value.trim() || undefined;
-            const res = await api("/api/backup", { method: "POST", body: { name } });
+            const res = await api("/api/backup", { method: "POST", body: {} });
             if (res.ok) {
-                document.getElementById("backup-name").value = "";
                 showMsg("backup-msg", "Backup started", true);
                 pollStatus();
             } else {
@@ -1244,10 +1228,11 @@
             poll();
         }
 
-        // Auto-load snapshots + env keys + repo stats on page load.
+        // Auto-load snapshots + repo stats on page load (only if configured).
+        {% if config.repo %}
         loadSnapshots();
-        loadEnvKeys();
         loadRepoStats();
+        {% endif %}
     </script>
 </body>
 </html>

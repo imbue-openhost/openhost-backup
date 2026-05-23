@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,41 +74,10 @@ DB_FILE = CONFIG_DIR / "backups.db"
 RESTIC_REPO_DIR = APP_DATA_DIR / "restic-repo"
 
 DEFAULT_CONFIG = {
-    "interval_seconds": 3600,
-    "repo": str(RESTIC_REPO_DIR),
-    # Password for the restic repo. Generated on first boot if missing.
+    "interval_seconds": 0,
+    "repo": "",
     "repo_password": "",
-    # Extra env vars forwarded to restic (e.g. AWS_ACCESS_KEY_ID,
-    # AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, B2_ACCOUNT_ID, etc.).
-    # This is where backend credentials live.
     "env": {},
-}
-
-# Env vars that restic / its backends recognise. We whitelist what we accept
-# from the API to avoid letting callers stuff arbitrary variables into the
-# subprocess environment.
-ALLOWED_ENV_KEYS = {
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_DEFAULT_REGION",
-    "AWS_REGION",
-    "B2_ACCOUNT_ID",
-    "B2_ACCOUNT_KEY",
-    "AZURE_ACCOUNT_NAME",
-    "AZURE_ACCOUNT_KEY",
-    "AZURE_ACCOUNT_SAS",
-    "GOOGLE_PROJECT_ID",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "ST_AUTH",
-    "ST_USER",
-    "ST_KEY",
-    "OS_AUTH_URL",
-    "OS_REGION_NAME",
-    "OS_USERNAME",
-    "OS_PASSWORD",
-    "OS_TENANT_ID",
-    "OS_TENANT_NAME",
 }
 
 # Snapshot IDs are hex strings; restic emits 8-char short IDs and 64-char long
@@ -478,6 +446,102 @@ async def _restic_unlock_if_stale(conf: dict) -> None:
         await _run_restic(["unlock"], conf, timeout=30)
     except Exception:
         logger.warning("restic unlock failed on startup", exc_info=True)
+
+
+
+async def test_restic_connection(
+    conf: dict, *, timeout: float = 10.0
+) -> tuple[bool, str, str]:
+    """Run ``restic cat config`` once with a short timeout, no retries.
+
+    Returns ``(ok, output)`` where ``output`` is the raw stderr restic
+    produced. We drain stderr incrementally in a background task so that
+    when we kill restic at the timeout, all the bytes it printed up to
+    that point — typically several ``retrying after Xs: <backend error>``
+    lines — are already in our buffer.
+    """
+    env = _restic_env(conf)
+    proc = await asyncio.create_subprocess_exec(
+        "restic", "cat", "config",
+        env=env,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    buf = bytearray()
+
+    async def drain() -> None:
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                return
+            buf.extend(chunk)
+
+    drain_task = asyncio.create_task(drain())
+    timed_out = False
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+    try:
+        await asyncio.wait_for(drain_task, timeout=2)
+    except asyncio.TimeoutError:
+        drain_task.cancel()
+
+    text = bytes(buf).decode(errors="replace")
+    if timed_out:
+        text = (text + f"\n\n[killed after {timeout:.0f}s — no retries]").lstrip()
+    return _classify_restic_test(proc.returncode, text, timed_out)
+
+
+def _classify_restic_test(
+    returncode: int | None, output: str, timed_out: bool
+) -> tuple[bool, str, str]:
+    """Decide whether a restic test should read as success or failure.
+
+    Exit 0 → success.
+    "repository does not exist" → success ("reachable, just no repo yet" —
+    a backup will create it). The bucket / path / creds all worked; the
+    only "missing" thing is the user hasn't initialized a repo there yet,
+    which is the expected state on first run.
+    Anything else → failure.
+    """
+    if returncode == 0 and not timed_out:
+        return True, "Connection OK", output or "(no output)"
+    if not timed_out and "repository does not exist" in output.lower():
+        return True, "Reachable — no repository at this location yet (a backup will create it)", output
+    return False, "Connection failed", output or f"restic exited with code {returncode}"
+
+
+def _build_restic_debug(conf: dict) -> dict:
+    """Return the restic command + env used for testing.
+
+    All values are included in plaintext — this app has no public routes,
+    so callers are already authed as the owner by the OpenHost router.
+    The UI hides the secret-looking values behind a 'Show secrets' button
+    purely as a shoulder-surfing guard.
+    """
+    env = _restic_env(conf)
+    # Only the keys restic actually reads from us, not the whole process env.
+    keys: list[str] = ["RESTIC_REPOSITORY", "RESTIC_PASSWORD"]
+    for k in (conf.get("env") or {}):
+        if k not in keys:
+            keys.append(k)
+    entries = []
+    for k in keys:
+        v = env.get(k, "")
+        entries.append({"key": k, "value": v})
+    return {
+        "command": "restic cat config",
+        "env": entries,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1067,6 +1131,10 @@ async def scheduler_loop():
         conf = load_config()
         interval = conf["interval_seconds"]
 
+        if not interval or not conf.get("repo"):
+            await asyncio.sleep(30)
+            continue
+
         if first_run:
             first_run = False
             last = get_last_backup()
@@ -1090,27 +1158,13 @@ async def scheduler_loop():
 
 
 def ensure_default_config():
-    """Make sure config.json exists and has a repo password.
+    """Make sure config.json exists with default values.
 
-    Generates a random password on first run if the user hasn't supplied one.
-    The password is stored in config.json (0600); losing it makes the repo
-    unreadable, so surface it prominently in the UI.
+    Does not auto-generate a password or set a repo — the user configures
+    those through the UI. Backups won't run until configured.
     """
-    conf = load_config()
-    dirty = False
     if not CONFIG_FILE.exists():
-        dirty = True
-    if not conf.get("repo_password"):
-        conf["repo_password"] = secrets.token_urlsafe(32)
-        dirty = True
-        logger.warning(
-            "Generated new restic repo password — back it up via the Backup UI"
-        )
-    if not conf.get("repo"):
-        conf["repo"] = str(RESTIC_REPO_DIR)
-        dirty = True
-    if dirty:
-        save_config(conf)
+        save_config(load_config())
 
 
 @app.before_serving
@@ -1169,10 +1223,14 @@ async def index():
         "last_error": last["error_message"] if last else None,
     }
     backend = classify_repo(conf.get("repo", ""))
+    env_pairs = conf.get("env") or {}
+    # Render env as "KEY=val;KEY2=val2" — same shape the input accepts on save.
+    env_string = ";".join(f"{k}={v}" for k, v in env_pairs.items())
     return await render_template(
         "index.html",
         base_path=BASE_PATH,
         config=conf,
+        env_string=env_string,
         state=state,
         backend=backend,
         scope=_backup_scope_summary(),
@@ -1244,77 +1302,33 @@ def _backup_scope_summary() -> dict:
 @route("/api/config", methods=["GET"])
 async def get_config():
     conf = load_config()
-    # Redact secrets: repo password, env values (backend credentials), and
-    # the router API token. Report which env keys exist so the UI can
-    # render them without leaking plaintext.
-    env = conf.get("env") or {}
-    env_keys = sorted(k for k, v in env.items() if v)
-    redacted = {
-        **conf,
-        "repo_password": "***" if conf.get("repo_password") else "",
-        "env": {k: "***" for k in env_keys},
-        "env_keys": env_keys,
-        "router_api_token": "***" if conf.get("router_api_token") else "",
-        "backend": classify_repo(conf.get("repo", "")),
-    }
-    return jsonify(config=redacted)
+    return jsonify(config={**conf, "backend": classify_repo(conf.get("repo", ""))})
 
 
 @route("/api/config", methods=["POST"])
 async def post_config():
     data = await request.get_json()
-    # Writing the repo password or router_api_token is a privileged
-    # operation — gate it on a valid router token so a co-located app
-    # on the same Docker network can't rotate these under us. Other
-    # fields (repo URL, interval, env without secrets...) are not
-    # gated so the UI's default flows still work unauthenticated within
-    # the router boundary.
     current_conf = load_config()
-    # Writing these fields is privileged — without a check, any app on
-    # the local Docker network could rotate them.
-    sensitive_write = "repo_password" in data or "router_api_token" in data
-    # Bootstrap exception: a fresh install has no router_api_token yet, so
-    # we let the user set one without authorization. Once set, future
-    # writes require an explicit Bearer token.
-    bootstrap_setting_token = (
-        "router_api_token" in data
-        and not current_conf.get("router_api_token")
-        and "repo_password" not in data
-    )
-    if sensitive_write and not bootstrap_setting_token:
-        # Explicit Bearer token in the header only — don't fall back to the
-        # app's stored router_api_token, since the point of this check is
-        # to stop a local caller from rotating these secrets.
-        supplied = _extract_bearer_token()
-        if not await _verify_admin_token(supplied):
+
+    # router_api_token is special: it lets this app call the OpenHost
+    # router. After it's been set once, require a Bearer token to rotate
+    # it so a co-located container can't quietly swap it for one they
+    # control.
+    if "router_api_token" in data and current_conf.get("router_api_token"):
+        if not await _verify_admin_token(_extract_bearer_token()):
             return jsonify(
                 ok=False,
-                error="Explicit Bearer token required to modify repo_password or router_api_token",
+                error="Bearer token required to rotate router_api_token",
             ), 401
 
     conf = current_conf
-    for key in ("interval_seconds", "repo", "repo_password", "router_api_token"):
-        if key in data and data[key] not in (None, "***"):
-            conf[key] = data[key]
-    # Handle env updates. `env` is a dict of key->value. Empty string means
-    # "clear this key". Any key not in ALLOWED_ENV_KEYS is rejected so a
-    # caller can't shove arbitrary vars into the subprocess env.
+    for key in ("repo", "repo_password", "router_api_token"):
+        if key in data:
+            conf[key] = data[key] or ""
     if "env" in data:
         if not isinstance(data["env"], dict):
             return jsonify(ok=False, error="'env' must be an object"), 400
-        current_env = dict(conf.get("env") or {})
-        for k, v in data["env"].items():
-            if k not in ALLOWED_ENV_KEYS:
-                return jsonify(
-                    ok=False,
-                    error=f"env key '{k}' not allowed. Allowed: "
-                    f"{', '.join(sorted(ALLOWED_ENV_KEYS))}",
-                ), 400
-            if v is None or v == "":
-                current_env.pop(k, None)
-            else:
-                current_env[k] = str(v)
-        conf["env"] = current_env
+        conf["env"] = {k: str(v) for k, v in data["env"].items() if v != "" and v is not None}
     if "interval_seconds" in data:
         try:
             interval = int(data["interval_seconds"])
@@ -1322,25 +1336,44 @@ async def post_config():
             return jsonify(
                 ok=False, error="interval_seconds must be an integer"
             ), 400
-        conf["interval_seconds"] = max(60, interval)
+        conf["interval_seconds"] = 0 if interval <= 0 else max(60, interval)
     save_config(conf)
     return jsonify(ok=True)
 
 
-@route("/api/config/password", methods=["GET"])
-async def reveal_password():
-    """Return the actual repo password.
+@route("/api/repo/test", methods=["POST"])
+async def api_repo_test():
+    """Test the restic connection once, no retries.
 
-    Gated on an explicit Bearer token in the ``Authorization`` header —
-    the password unlocks the entire backup archive, and without this
-    check any co-located app on the same Docker network could read it
-    from ``http://backup:8080/api/config/password``.
+    Body (all optional): ``repo``, ``repo_password`` — override the saved
+    values for the test, so the user can try a new URL/password before
+    committing them with Save. The saved ``env`` is always used.
     """
-    supplied = _extract_bearer_token()
-    if not await _verify_admin_token(supplied):
-        return jsonify(ok=False, error="Bearer token required"), 401
+    data = await request.get_json(silent=True) or {}
     conf = load_config()
-    return jsonify(ok=True, password=conf.get("repo_password", ""))
+    repo = (data.get("repo") or conf.get("repo") or "").strip()
+    if not repo:
+        return jsonify(ok=False, error="No repo URL configured"), 400
+    repo_password = data.get("repo_password") or conf.get("repo_password", "")
+    # Merge env overrides on top of saved env so the user can test credentials
+    # they've typed into the page (AWS quick setup, raw env setter) without
+    # having to Apply/Save first.
+    env_override = data.get("env") or {}
+    merged_env = {**(conf.get("env") or {})}
+    for k, v in env_override.items():
+        if v is None or v == "":
+            continue
+        merged_env[k] = v
+    test_conf = {
+        **conf,
+        "repo": repo,
+        "repo_password": repo_password,
+        "env": merged_env,
+    }
+
+    ok, message, output = await test_restic_connection(test_conf)
+    debug = _build_restic_debug(test_conf)
+    return jsonify(ok=ok, message=message, output=output, debug=debug)
 
 
 @route("/api/backup", methods=["POST"])
