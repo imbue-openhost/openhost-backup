@@ -20,6 +20,7 @@ class OpKind(Enum):
     BACKUP = "backup"
     RESTORE = "restore"
     MIGRATION = "migration"
+    CHECK = "check"
 
 
 @dataclass
@@ -75,3 +76,7 @@ class OperationLock:
     @property
     def migration_running(self) -> bool:
         return self._active == OpKind.MIGRATION
+
+    @property
+    def check_running(self) -> bool:
+        return self._active == OpKind.CHECK

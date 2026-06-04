@@ -129,7 +129,6 @@ restore_last_status = None
 check_last_status = None
 check_last_output = None
 check_last_at = None
-check_running = False
 
 scheduler_task = None
 
@@ -1062,17 +1061,21 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
 async def run_check() -> bool:
     """Run `restic check`. Updates module-level state.
 
-    Note: this coroutine doesn't take ``op_lock`` itself — callers (the
-    HTTP route) are expected to gate on both ``op_lock.busy`` and
-    ``check_running`` to avoid colliding with backup/restore or another
-    concurrent check. restic itself acquires its own repo-level lock.
+    Acquires ``op_lock`` for its entire duration so that backup, restore,
+    and check operations are mutually exclusive at the Python level — the
+    same way that ``run_backup`` and ``run_restore`` do.  This prevents
+    concurrent restic processes from racing to lock the same repository,
+    which was the root cause of "repo already locked" errors seen when a
+    check ran alongside a backup (or vice-versa).
     """
-    global check_last_status, check_last_output, check_last_at, check_running
-    # Set the flag inside the try so that any exception from load_config /
-    # _run_restic still runs the finally clause that clears it. Without
-    # this, a corrupt config.json would leave check_running=True forever.
+    global check_last_status, check_last_output, check_last_at
+
+    acquire_err = op_lock.try_acquire(OpKind.CHECK)
+    if acquire_err:
+        logger.warning("Skipping check: %s", acquire_err)
+        return False
+
     try:
-        check_running = True
         conf = load_config()
         if not conf.get("repo") or not conf.get("repo_password"):
             check_last_status = "error"
@@ -1117,7 +1120,7 @@ async def run_check() -> bool:
         logger.exception("restic check failed")
         return False
     finally:
-        check_running = False
+        op_lock.release(OpKind.CHECK)
 
 
 # ---------------------------------------------------------------------------
@@ -1483,13 +1486,14 @@ async def snapshot_delete():
 
 @route("/api/check", methods=["POST"])
 async def trigger_check():
-    # `restic check` is read-only from the data's perspective but it does
-    # acquire a repo lock, so don't run it on top of a backup/restore, and
-    # don't spawn a second check if one is already in flight.
+    # `restic check` acquires a repo lock and must not overlap with
+    # backup, restore, migration, or another concurrent check.  All of
+    # that mutual exclusion is now enforced by op_lock inside run_check
+    # itself (OpKind.CHECK), so we just need to report busy here for the
+    # immediate HTTP response — the task will silently no-op if the lock
+    # is taken by the time it runs.
     if op_lock.busy:
         return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
-    if check_running:
-        return jsonify(ok=False, error="check already running"), 409
     asyncio.create_task(run_check())
     return jsonify(ok=True, message="Check started")
 
@@ -1497,7 +1501,7 @@ async def trigger_check():
 @route("/api/check/status")
 async def check_status_endpoint():
     return jsonify(
-        running=check_running,
+        running=op_lock.check_running,
         last_status=check_last_status,
         last_output=check_last_output,
         last_at=check_last_at,
