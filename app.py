@@ -441,9 +441,25 @@ async def ensure_repo_initialized(
 
 
 async def _restic_unlock_if_stale(conf: dict) -> None:
-    """Best-effort remove a stale repo lock at startup."""
+    """Best-effort remove stale repo locks at startup.
+
+    Uses ``--remove-all`` so that locks left by a previous container
+    incarnation are cleared even if the hostname changed between restarts
+    (which is the normal case for Docker containers — each restart gets a
+    new random hostname, so plain ``restic unlock`` would only remove locks
+    matching the current hostname and silently leave the stale one behind).
+    """
     try:
-        await _run_restic(["unlock"], conf, timeout=30)
+        rc, stdout, stderr = await _run_restic(["unlock", "--remove-all"], conf, timeout=30)
+        if rc == 0:
+            out = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            if out:
+                logger.info("restic unlock --remove-all: %s", out)
+            else:
+                logger.info("restic unlock --remove-all: no stale locks found")
+        else:
+            err = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            logger.warning("restic unlock --remove-all failed (rc=%d): %s", rc, err)
     except Exception:
         logger.warning("restic unlock failed on startup", exc_info=True)
 
