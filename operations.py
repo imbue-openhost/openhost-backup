@@ -10,6 +10,7 @@ operation may run at a time**.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -33,6 +34,7 @@ class OperationLock:
     """
 
     _active: OpKind | None = field(default=None, init=False)
+    _last_activity: float | None = field(default=None, init=False)
 
     @property
     def active(self) -> OpKind | None:
@@ -52,6 +54,7 @@ class OperationLock:
         if self._active is not None:
             return f"{self._active.value} in progress"
         self._active = kind
+        self._last_activity = time.monotonic()
         return None
 
     def release(self, kind: OpKind) -> None:
@@ -61,6 +64,45 @@ class OperationLock:
                 "OperationLock.release(%s) but active was %s", kind, self._active
             )
         self._active = None
+        self._last_activity = None
+
+    def touch(self, *, now: float | None = None) -> None:
+        """Mark activity on the held operation, refreshing its staleness clock.
+
+        A migration streams data across many separate requests; calling this on
+        each one keeps a live transfer from looking abandoned to
+        ``release_if_stale``.  No-op when nothing is held.
+        """
+        if self._active is not None:
+            self._last_activity = time.monotonic() if now is None else now
+
+    def idle_seconds(self, *, now: float | None = None) -> float | None:
+        """Seconds since the last activity, or ``None`` if nothing is held."""
+        if self._last_activity is None:
+            return None
+        return (time.monotonic() if now is None else now) - self._last_activity
+
+    def release_if_stale(
+        self, kind: OpKind, max_idle_seconds: float, *, now: float | None = None
+    ) -> bool:
+        """Release the lock iff *kind* holds it and it has been idle too long.
+
+        Guards against an operation abandoned without releasing — most notably a
+        destination-side migration whose source died between ``receive_start``
+        and ``receive_finalize`` (issue #14).  Returns ``True`` if a stale lock
+        was cleared, ``False`` otherwise.
+        """
+        idle = self.idle_seconds(now=now)
+        if self._active == kind and idle is not None and idle > max_idle_seconds:
+            logger.warning(
+                "Releasing stale %s lock (idle %.0fs > %.0fs)",
+                kind.value,
+                idle,
+                max_idle_seconds,
+            )
+            self.release(kind)
+            return True
+        return False
 
     # Convenience read-only helpers so existing templates / status endpoints
     # can still ask "is a backup running?" etc.
