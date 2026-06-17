@@ -1035,6 +1035,15 @@ class TestReceiveFinalize:
 
 
 class TestRunDirectPush:
+    @pytest.fixture(autouse=True)
+    def _stub_repo_preflight(self):
+        # run_direct_push now pre-checks repo access (issue #16). Default to
+        # "all reachable" so these protocol tests don't shell out to git; the
+        # dedicated pre-flight test overrides the return value.
+        with patch("migration._git_ls_remote", new_callable=AsyncMock) as ls_remote:
+            ls_remote.return_value = (0, "")
+            yield ls_remote
+
     async def test_three_step_protocol(self, tmp_app_data, op_lock):
         """run_direct_push should follow the 3-step protocol: start, data, finalize."""
         op_lock.try_acquire(OpKind.MIGRATION)
@@ -1113,6 +1122,64 @@ class TestRunDirectPush:
             i for i, u in enumerate(posted_urls) if "/receive/finalize" in u
         )
         assert start_idx < data_idx < finalize_idx
+
+    async def test_aborts_before_wipe_when_repo_unreachable(
+        self, tmp_app_data, op_lock, _stub_repo_preflight
+    ):
+        """An unreachable repo must abort the push before the target is wiped."""
+        op_lock.try_acquire(OpKind.MIGRATION)
+        _stub_repo_preflight.return_value = (
+            128,
+            "fatal: Authentication failed for 'https://github.com/org/myapp.git'",
+        )
+
+        posted_urls: list[str] = []
+
+        async def mock_post(url, **kwargs):
+            posted_urls.append(url)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {"content-type": "application/json"}
+            resp.json.return_value = {"ok": True}
+            resp.text = "ok"
+            return resp
+
+        mock_client = AsyncMock()
+        mock_client.post = mock_post
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("migration.get_apps_metadata", new_callable=AsyncMock) as mock_meta,
+            patch("migration.httpx.AsyncClient") as MockClient,
+        ):
+            mock_meta.return_value = [
+                {
+                    "name": "myapp",
+                    "repo_url": "https://github.com/org/myapp.git",
+                    "status": "running",
+                },
+            ]
+            MockClient.return_value = mock_client
+
+            result = await run_direct_push(
+                target_url="https://target.example.com",
+                target_token="token",
+                selected_apps=None,
+                lock=op_lock,
+                all_app_data=tmp_app_data,
+                vm_data_dir=tmp_app_data.parent / "vm_data",
+                router_url="http://localhost:8080",
+                zone_domain="source.example.com",
+                router_token="src-token",
+            )
+
+        assert result is False
+        assert migration.status is not None
+        assert migration.status["phase"] == "error"
+        assert "Cannot access" in migration.status["error"]
+        # The destructive receive/start must never have been sent.
+        assert not any("/receive/start" in u for u in posted_urls)
 
     async def test_filters_backup_app(self, tmp_app_data, op_lock):
         """The 'backup' app should be excluded from migration."""

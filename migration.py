@@ -25,10 +25,14 @@ import tarfile
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from operations import OpKind, OperationLock
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +441,88 @@ async def _streaming_tar_generator(
     return queue
 
 
+# ---------------------------------------------------------------------------
+# Repo access pre-flight (issue #16)
+# ---------------------------------------------------------------------------
+# A direct push wipes the target's data in receive_start before re-cloning each
+# app from its git repo at finalize. If a repo's credentials are invalid the
+# clone fails *after* the wipe, leaving apps unable to start. Checking
+# reachability up front lets the source abort before touching the target.
+
+
+async def _git_ls_remote(repo_url: str, *, timeout: float = 20.0) -> tuple[int, str]:
+    """Run ``git ls-remote`` against *repo_url*; return ``(returncode, stderr)``.
+
+    Runs non-interactively (terminal and credential-helper prompts disabled) so
+    an invalid credential fails fast instead of hanging. Any credentials
+    embedded in the URL are used as-is.
+    """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "true"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "-c",
+            "credential.helper=",
+            "ls-remote",
+            repo_url,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except FileNotFoundError:
+        return 1, "git executable not found"
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.terminate()  # graceful SIGTERM; never SIGKILL
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        return 1, "timed out contacting the repository"
+    return proc.returncode or 0, stderr.decode("utf-8", "replace")
+
+
+def _summarize_git_error(stderr: str) -> str:
+    """Map ``git ls-remote`` stderr to a short, credential-free reason."""
+    low = (stderr or "").lower()
+    if (
+        "authentication failed" in low
+        or "could not read username" in low
+        or "invalid username or password" in low
+        or "terminal prompts disabled" in low
+        or "permission denied" in low
+    ):
+        return "authentication failed"
+    if "repository not found" in low or "not found" in low:
+        return "repository not found"
+    if "could not resolve host" in low or "timed out" in low or "connection" in low:
+        return "network error"
+    # Never echo raw stderr -- it can contain a credentialed URL.
+    return "could not access repository"
+
+
+async def check_repo_urls_reachable(
+    repo_urls: dict[str, str],
+    *,
+    checker: Callable[[str], Awaitable[tuple[int, str]]] | None = None,
+) -> dict[str, str]:
+    """Confirm each app's repo is reachable with its current (credentialed) URL.
+
+    Returns ``{app_name: reason}`` for any repo that can't be reached (empty if
+    all are OK), so a migration can fail loudly *before* wiping the target when
+    git credentials are invalid or expired (issue #16). ``checker`` is
+    injectable for tests.
+    """
+    check = checker or _git_ls_remote
+    failures: dict[str, str] = {}
+    for name, url in repo_urls.items():
+        returncode, stderr = await check(url)
+        if returncode != 0:
+            failures[name] = _summarize_git_error(stderr)
+    return failures
+
+
 async def run_direct_push(
     *,
     target_url: str,
@@ -476,6 +562,26 @@ async def run_direct_push(
 
         app_names = [a["name"] for a in apps]
         _log(f"Apps to migrate: {', '.join(app_names)}")
+
+        # 1b. Pre-flight repo access. The target wipes its data in
+        # receive_start before re-cloning each app, so verify every repo is
+        # reachable with current credentials now -- before anything destructive
+        # -- and abort with a clear error if not (issue #16).
+        _log("Checking repo access for all apps...")
+        status = {"phase": "checking_repos", "progress": 8}
+        repo_check_urls = {
+            a["name"]: a["repo_url"] for a in apps if a.get("repo_url")
+        }
+        unreachable = await check_repo_urls_reachable(repo_check_urls)
+        if unreachable:
+            detail = "; ".join(
+                f"{name} ({reason})" for name, reason in sorted(unreachable.items())
+            )
+            raise RuntimeError(
+                f"Cannot access {len(unreachable)} app repo(s) with current "
+                f"credentials: {detail}. Fix the credentials and retry; the "
+                f"target was left untouched."
+            )
 
         # 2. Build and send manifest to target
         _log("Sending manifest to target...")
