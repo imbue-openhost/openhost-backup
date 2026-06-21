@@ -121,6 +121,23 @@ def classify_repo(repo: str) -> dict:
 # Single lock for mutual exclusion across backup / restore / migration.
 op_lock = OperationLock()
 
+# A migration holds op_lock across many separate receive_* requests (start ->
+# chunks -> finalize). If the source dies mid-transfer the destination never
+# gets a finalize, so the lock would otherwise stay held until an app restart
+# (issue #14). Treat a migration idle this long as abandoned and reclaim it.
+MIGRATION_IDLE_TIMEOUT_SECONDS = 30 * 60
+
+
+def _reclaim_abandoned_migration() -> None:
+    """Release a migration lock orphaned by a dead/stopped source (issue #14).
+
+    Safe to call before starting any operation: it only clears a *migration*
+    lock idle past the timeout, so a live transfer (kept fresh via
+    ``op_lock.touch()`` on each receive) is never disturbed.
+    """
+    op_lock.release_if_stale(OpKind.MIGRATION, MIGRATION_IDLE_TIMEOUT_SECONDS)
+
+
 # Restore-specific status (not part of the lock itself).
 restore_last_snapshot = None
 restore_last_status = None
@@ -566,6 +583,7 @@ def _build_restic_debug(conf: dict) -> dict:
 
 
 async def run_backup(name: str | None = None) -> bool:
+    _reclaim_abandoned_migration()
     err = op_lock.try_acquire(OpKind.BACKUP)
     if err:
         logger.warning("Skipping backup: %s", err)
@@ -993,6 +1011,7 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
     """
     global restore_last_snapshot, restore_last_status
 
+    _reclaim_abandoned_migration()
     err = op_lock.try_acquire(OpKind.RESTORE)
     if err:
         logger.warning("Skipping restore: %s", err)
@@ -1720,8 +1739,11 @@ async def chown_app_data():
 
 @route("/api/migration/status")
 async def migration_status_endpoint():
+    idle = op_lock.idle_seconds() if op_lock.migration_running else None
     return jsonify(
         running=op_lock.migration_running,
+        stale=idle is not None and idle > MIGRATION_IDLE_TIMEOUT_SECONDS,
+        idle_seconds=round(idle) if idle is not None else None,
         status=migration.status,
         log=migration.log[-50:],
     )
@@ -1735,6 +1757,7 @@ async def migration_status_endpoint():
 @route("/api/migration/push", methods=["POST"])
 async def trigger_direct_push():
     """One-click migration: push all apps + data to another instance."""
+    _reclaim_abandoned_migration()
     err = op_lock.try_acquire(OpKind.MIGRATION)
     if err:
         return jsonify(ok=False, error=err), 409
@@ -1825,6 +1848,9 @@ async def receive_start():
     stops all non-backup apps, and deletes app data for migrated apps.
     The lock is held until receive_finalize completes.
     """
+    # A previous migration whose source died can leave the lock held; reclaim it
+    # so a retried migration proceeds without an app restart (issue #14).
+    _reclaim_abandoned_migration()
     err = op_lock.try_acquire(OpKind.MIGRATION)
     if err:
         return jsonify(ok=False, error=err), 409
@@ -1853,6 +1879,7 @@ async def receive_app(app_name):
     """Receive a tar.gz stream of a single app's data (backward compat)."""
     if not migration.validate_name(app_name):
         return jsonify(ok=False, error="Invalid app name"), 400
+    op_lock.touch()  # keep the migration lock fresh during a live transfer
     tar_data = await request.get_data()
     if not tar_data:
         return jsonify(ok=False, error="Empty request body"), 400
@@ -1866,6 +1893,7 @@ async def receive_chunk(app_name):
     """Receive one chunk of a large app's tar.gz data."""
     if not migration.validate_name(app_name):
         return jsonify(ok=False, error="Invalid app name"), 400
+    op_lock.touch()  # keep the migration lock fresh during a live transfer
     chunk_data = await request.get_data()
     if not chunk_data:
         return jsonify(ok=False, error="Empty chunk"), 400
@@ -1887,6 +1915,7 @@ async def receive_data():
     """
     import tempfile as _tempfile
 
+    op_lock.touch()  # keep the migration lock fresh during a live transfer
     # Stream request body to a temp file instead of buffering in memory.
     # Quart's request.get_data() would load everything into RAM; for
     # multi-GB archives that OOMs the container.
