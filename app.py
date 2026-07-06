@@ -863,7 +863,10 @@ async def _run_restic_streaming(
     try:
         await asyncio.wait_for(_pump_stdout(), timeout=timeout)
         await asyncio.wait_for(drain_task, timeout=5)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except BaseException:
+        # Any failure — timeout, cancellation, or an on_line callback raising —
+        # must still tear down the subprocess and drain task so we don't leak a
+        # restic process holding the repo lock. Then re-raise unchanged.
         drain_task.cancel()
         try:
             proc.kill()
@@ -899,17 +902,24 @@ async def _roots_from_snapshot_metadata(
         entries = json.loads(stdout.decode(errors="replace") or "[]")
     except json.JSONDecodeError:
         return None
-    if not entries:
+    if not isinstance(entries, list) or not entries:
         return None
     captured: set[str] = set()
     for e in entries:
+        if not isinstance(e, dict):
+            continue
         for p in e.get("paths", []) or []:
             captured.add(str(p).rstrip("/"))
-    return [
+    matched = [
         {"path": name, "size": 0, "is_dir": True, "mod_time": ""}
         for name, path in _ROOT_NAMES.items()
         if str(path).rstrip("/") in captured
     ]
+    # A real snapshot always captures at least one root, so an empty match
+    # means the metadata paths didn't line up as expected (e.g. a
+    # normalization difference). Defer to the authoritative ls probe rather
+    # than wrongly reporting "no roots".
+    return matched or None
 
 
 async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):

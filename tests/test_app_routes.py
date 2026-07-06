@@ -782,3 +782,21 @@ class TestSnapshotBrowsing:
         assert f1["is_dir"] is False and f1["size"] == 10
         d1 = next(f for f in files if f["path"] == "dir1")
         assert d1["is_dir"] is True
+
+    async def test_metadata_with_no_matching_roots_falls_back_to_ls(self, client):
+        # Metadata is readable but its paths don't match any known root — must
+        # defer to the authoritative ls probe, not report "no roots".
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            if args[0] == "snapshots":
+                return 0, json.dumps([{"id": "s" * 64, "paths": ["/other"]}]).encode(), b""
+            return 0, b"", b""  # ls probe: root present
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
+        assert any(a[0] == "ls" for a in calls)  # fell back to probing
