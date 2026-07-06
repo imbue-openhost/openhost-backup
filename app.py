@@ -815,13 +815,113 @@ _ROOT_NAMES = {
 }
 
 
+async def _run_restic_streaming(
+    args: list[str],
+    conf: dict,
+    timeout: float | None,
+    on_line,
+) -> tuple[int | None, bytes]:
+    """Run ``restic <args>`` and feed each stdout line to ``on_line`` as it
+    arrives, returning ``(returncode, stderr_bytes)``.
+
+    Unlike ``_run_restic`` (which buffers all of stdout via ``communicate``),
+    this reads stdout incrementally so a large ``restic ls`` doesn't
+    materialise the whole recursive listing in memory — the caller keeps only
+    what it needs. stderr is drained concurrently to avoid a pipe-buffer
+    deadlock, and the subprocess is killed on timeout/cancellation so we don't
+    leak a restic process holding the repo lock.
+    """
+    env = _restic_env(conf)
+    proc = await asyncio.create_subprocess_exec(
+        "restic",
+        *args,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=2**20,  # allow long JSON lines (default readline limit is 64K)
+    )
+    stderr_buf = bytearray()
+
+    async def _drain_stderr() -> None:
+        assert proc.stderr is not None
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                return
+            stderr_buf.extend(chunk)
+
+    async def _pump_stdout() -> None:
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            on_line(line.decode(errors="replace"))
+        await proc.wait()
+
+    drain_task = asyncio.create_task(_drain_stderr())
+    try:
+        await asyncio.wait_for(_pump_stdout(), timeout=timeout)
+        await asyncio.wait_for(drain_task, timeout=5)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        drain_task.cancel()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        raise
+    return proc.returncode, bytes(stderr_buf)
+
+
+async def _roots_from_snapshot_metadata(
+    snapshot_id: str, conf: dict
+) -> list[dict] | None:
+    """Which BACKUP_ROOTS a snapshot captured, read from its metadata.
+
+    A snapshot records the absolute paths it backed up, so a single
+    ``restic snapshots`` call tells us which roots are present — no recursive
+    ``ls`` walk needed. Returns the present-root entries, or ``None`` if the
+    metadata can't be read (the caller then falls back to probing).
+    """
+    try:
+        rc, stdout, _stderr = await _run_restic(
+            ["snapshots", "--json", snapshot_id], conf, timeout=60
+        )
+    except Exception:
+        return None
+    if rc != 0:
+        return None
+    try:
+        entries = json.loads(stdout.decode(errors="replace") or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not entries:
+        return None
+    captured: set[str] = set()
+    for e in entries:
+        for p in e.get("paths", []) or []:
+            captured.add(str(p).rstrip("/"))
+    return [
+        {"path": name, "size": 0, "is_dir": True, "mod_time": ""}
+        for name, path in _ROOT_NAMES.items()
+        if str(path).rstrip("/") in captured
+    ]
+
+
 async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):
     """Return the list of BACKUP_ROOTS actually present in this snapshot.
 
-    A snapshot only contains roots that existed on disk at backup time,
-    so we probe each one with ``restic ls`` to figure out which to show
-    as top-level entries in the browser.
+    A snapshot only contains roots that existed on disk at backup time. We
+    read which ones from the snapshot's own metadata (cheap); only if that
+    can't be read do we fall back to probing each root with ``restic ls``.
     """
+    roots = await _roots_from_snapshot_metadata(snapshot_id, conf)
+    if roots is not None:
+        return roots
     present: list[dict] = []
     for name, path in _ROOT_NAMES.items():
         args = ["ls", "--json", snapshot_id, str(path)]
@@ -872,37 +972,27 @@ async def list_snapshot_files(
         target_path = target_path.rstrip("/") + "/" + subpath
 
     args = ["ls", "--json", snapshot_id, target_path]
-    try:
-        rc, stdout, stderr = await _run_restic(args, conf, timeout=120)
-    except Exception as e:
-        return [], f"restic error: {e}"
-
-    if rc != 0:
-        err = stderr.decode(errors="replace").strip()
-        if "not found" in err.lower() or "no matching" in err.lower():
-            return [], "Snapshot or path not found"
-        return [], f"restic error: {err}"
-
     files: list[dict] = []
     target_norm = target_path.rstrip("/")
-    for raw in stdout.decode(errors="replace").splitlines():
+
+    def _collect(raw: str) -> None:
         raw = raw.strip()
         if not raw:
-            continue
+            return
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
-            continue
+            return
         if msg.get("struct_type") != "node":
-            continue
+            return
         path = msg.get("path", "")
         # Only immediate children of target_path.
         if not path.startswith(target_norm + "/"):
             # Could also be an exact match of the target (the dir itself) — skip.
-            continue
+            return
         rest = path[len(target_norm) + 1 :]
         if "/" in rest:
-            continue  # nested deeper, not a direct child
+            return  # nested deeper, not a direct child
         files.append(
             {
                 "path": rest,
@@ -911,6 +1001,20 @@ async def list_snapshot_files(
                 "mod_time": msg.get("mtime", ""),
             }
         )
+
+    # `restic ls` lists the whole subtree recursively; stream it line-by-line
+    # and keep only the direct children rather than buffering the entire
+    # listing (which can be huge/deep) in memory.
+    try:
+        rc, stderr = await _run_restic_streaming(args, conf, 120, _collect)
+    except Exception as e:
+        return [], f"restic error: {e}"
+
+    if rc != 0:
+        err = stderr.decode(errors="replace").strip()
+        if "not found" in err.lower() or "no matching" in err.lower():
+            return [], "Snapshot or path not found"
+        return [], f"restic error: {err}"
     return files, None
 
 
