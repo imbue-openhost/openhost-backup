@@ -579,7 +579,7 @@ class TestEnsureRepoInitialized:
         )
         assert initialized_now is True
         assert err is None
-        assert calls == [["cat", "config"], ["init"]]
+        assert calls == [["cat", "config", "--no-lock"], ["init"]]
 
     async def test_remote_does_not_auto_init_by_default(self, monkeypatch):
         calls = self._patch_run_restic(
@@ -593,7 +593,7 @@ class TestEnsureRepoInitialized:
         assert err is not None
         assert "not initialized" in err.lower()
         # Must NOT have invoked restic init.
-        assert calls == [["cat", "config"]]
+        assert calls == [["cat", "config", "--no-lock"]]
 
     async def test_remote_inits_when_explicitly_opted_in(self, monkeypatch):
         calls = self._patch_run_restic(
@@ -609,7 +609,7 @@ class TestEnsureRepoInitialized:
         )
         assert initialized_now is True
         assert err is None
-        assert calls == [["cat", "config"], ["init"]]
+        assert calls == [["cat", "config", "--no-lock"], ["init"]]
 
     async def test_auto_init_false_never_inits_local_either(
         self, monkeypatch, tmp_path
@@ -625,7 +625,7 @@ class TestEnsureRepoInitialized:
         assert initialized_now is False
         assert err is not None
         assert "not initialized" in err.lower()
-        assert calls == [["cat", "config"]]
+        assert calls == [["cat", "config", "--no-lock"]]
 
     async def test_non_init_error_passes_through(self, monkeypatch):
         # e.g. wrong password — must NOT auto-init regardless of mode.

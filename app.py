@@ -554,7 +554,9 @@ async def ensure_repo_initialized(
     async with _init_lock:
         # `cat config` is a cheap way to confirm the repo exists and the password
         # is correct. It returns non-zero on either missing repo or wrong password.
-        rc, _stdout, stderr = await _run_restic(["cat", "config"], conf, timeout=30)
+        rc, _stdout, stderr = await _run_restic(
+            ["cat", "config", "--no-lock"], conf, timeout=30
+        )
         if rc == 0:
             return False, None
 
@@ -637,6 +639,7 @@ async def test_restic_connection(
         "restic",
         "cat",
         "config",
+        "--no-lock",
         env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -906,7 +909,7 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         # written by this app. Backups are created with --tag openhost in
         # run_backup.
         rc, stdout, stderr = await _run_restic(
-            ["snapshots", "--json", "--tag", "openhost"], conf, timeout=60
+            ["snapshots", "--no-lock", "--json", "--tag", "openhost"], conf, timeout=60
         )
         if rc != 0:
             logger.error(
@@ -957,7 +960,7 @@ async def repo_stats() -> tuple[dict | None, str | None]:
         return None, init_err
     try:
         rc, stdout, stderr = await _run_restic(
-            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost"],
+            ["stats", "--no-lock", "--mode", "raw-data", "--json", "--tag", "openhost"],
             conf,
             timeout=60,
         )
@@ -1007,7 +1010,7 @@ async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):
     """
     present: list[dict] = []
     for name, path in _ROOT_NAMES.items():
-        args = ["ls", "--json", snapshot_id, str(path)]
+        args = ["ls", "--no-lock", "--json", snapshot_id, str(path)]
         try:
             rc, _stdout, _stderr = await _run_restic(args, conf, timeout=60)
         except Exception:
@@ -1054,7 +1057,7 @@ async def list_snapshot_files(
     if subpath:
         target_path = target_path.rstrip("/") + "/" + subpath
 
-    args = ["ls", "--json", snapshot_id, target_path]
+    args = ["ls", "--no-lock", "--json", snapshot_id, target_path]
     try:
         rc, stdout, stderr = await _run_restic(args, conf, timeout=120)
     except Exception as e:
