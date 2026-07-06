@@ -871,6 +871,7 @@ class TestRetention:
         args = captured["args"]
         assert args[0] == "backup"
         assert args[args.index("--host") + 1] == backup_app.BACKUP_HOST
+        assert args[args.index("--retry-lock") + 1] == backup_app.RETRY_LOCK
 
     async def test_run_retention_forgets_and_reconciles_db(self, client):
         backup_app.record_backup("t1", "success", snapshot_id="a" * 64)

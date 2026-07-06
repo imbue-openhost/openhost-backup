@@ -224,6 +224,8 @@ Timeouts for restic operations:
 
 If a restic process exceeds its timeout, it is killed and the operation is marked as failed.
 
+Read-only commands (`snapshots`, `stats`, `ls`, `cat config`) run with `--no-lock` so concurrent page loads don't contend on the repository lock or leave a stale lock behind if a request is aborted. Lock-taking commands (`backup`, `restore`, `check`, `forget`, `prune`) run with `--retry-lock 1m` so that if another operation is briefly holding the lock, restic waits and retries for up to a minute instead of failing immediately with "repository is already locked". (Both flags require restic ≥ 0.16.)
+
 Every restic invocation is logged (the command on start, exit code and elapsed time on completion), visible via `oh app logs backup`.
 
 ## Running tests

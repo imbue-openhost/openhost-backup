@@ -523,6 +523,13 @@ CHECK_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
 FORGET_TIMEOUT_SECONDS = 10 * 60  # 10 minutes — forget only rewrites metadata
 PRUNE_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours — prune repacks, can be slow on S3
 
+# Duration lock-taking commands wait for the repo lock before giving up
+# (restic `--retry-lock`, added in 0.16). Without it restic fails instantly if
+# anything else holds a lock; a short retry rides out the brief window where a
+# concurrent op is finishing, instead of surfacing "repository is already
+# locked" to the user. Read-only commands use `--no-lock` and don't need this.
+RETRY_LOCK = "1m"
+
 # Guard against concurrent `restic init` calls. When the UI loads, multiple
 # API endpoints (snapshots, stats, check) call ensure_repo_initialized at
 # the same time. Without this lock, two concurrent `restic init` invocations
@@ -778,7 +785,7 @@ async def run_backup(name: str | None = None) -> bool:
             logger.error(msg)
             return False
 
-        args = ["backup", "--json"]
+        args = ["backup", "--json", "--retry-lock", RETRY_LOCK]
         args += [str(p) for p in roots]
         # Pin the recorded hostname so every snapshot from this instance shares
         # one stable identity (see BACKUP_HOST) instead of the container's
@@ -1113,7 +1120,9 @@ async def delete_snapshot(snapshot_id: str) -> bool:
         return False
     try:
         rc, _out, stderr = await _run_restic(
-            ["forget", "--prune", snapshot_id], conf, timeout=30 * 60
+            ["forget", "--prune", "--retry-lock", RETRY_LOCK, snapshot_id],
+            conf,
+            timeout=30 * 60,
         )
         if rc != 0:
             logger.warning(
@@ -1205,7 +1214,17 @@ def _forget_args(conf: dict) -> list[str] | None:
             keeps += [flag, str(conf[key])]
     if not keeps:
         return None
-    return ["forget", "--json", "--tag", "openhost", "--group-by", "", *keeps]
+    return [
+        "forget",
+        "--json",
+        "--retry-lock",
+        RETRY_LOCK,
+        "--tag",
+        "openhost",
+        "--group-by",
+        "",
+        *keeps,
+    ]
 
 
 def _reconcile_snapshots_db(present_ids: set[str]) -> None:
@@ -1328,7 +1347,7 @@ async def _run_prune_locked() -> None:
         return
     try:
         rc, _out, stderr = await _run_restic(
-            ["prune"], conf, timeout=PRUNE_TIMEOUT_SECONDS
+            ["prune", "--retry-lock", RETRY_LOCK], conf, timeout=PRUNE_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
         logger.error("restic prune timed out after %ss", PRUNE_TIMEOUT_SECONDS)
@@ -1442,6 +1461,8 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
     try:
         args = [
             "restore",
+            "--retry-lock",
+            RETRY_LOCK,
             snapshot_id,
             "--target",
             "/",  # restic restores the absolute paths as they were captured
@@ -1521,7 +1542,9 @@ async def run_check() -> bool:
             return False
         try:
             rc, stdout, stderr = await _run_restic(
-                ["check"], conf, timeout=CHECK_TIMEOUT_SECONDS
+                ["check", "--retry-lock", RETRY_LOCK],
+                conf,
+                timeout=CHECK_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             check_last_status = "error"
