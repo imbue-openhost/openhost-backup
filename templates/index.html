@@ -132,7 +132,7 @@
                     {% endif %}
                 </dd>
                 <dt>Last backup</dt>
-                <dd id="status-last">{{ state.last_backup or "never" }}</dd>
+                <dd id="status-last" data-ts="{{ state.last_backup or '' }}">{{ state.last_backup or "never" }}</dd>
                 <dt>Interval</dt>
                 <dd>{% if config.interval_seconds %}{{ config.interval_seconds }}s{% else %}disabled{% endif %}</dd>
                 <dt>Backend</dt>
@@ -592,6 +592,25 @@
             return b.toFixed(i === 0 ? 0 : 2) + " " + units[i];
         }
 
+        // Render a backend timestamp in the viewer's own locale and timezone.
+        // Backend times are UTC; some (the backup `timestamp` field) carry no
+        // timezone marker, which JS would otherwise parse as local time — so we
+        // tag a bare ISO datetime as UTC before formatting. Returns the raw
+        // input unchanged if it isn't a parseable date.
+        function formatDateTime(s) {
+            if (!s) return "";
+            let str = String(s);
+            if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?(\.\d+)?$/.test(str)) {
+                str = str.replace(" ", "T") + "Z";
+            }
+            const d = new Date(str);
+            if (isNaN(d.getTime())) return String(s);
+            return new Intl.DateTimeFormat(undefined, {
+                dateStyle: "medium",
+                timeStyle: "short",
+            }).format(d);
+        }
+
         function escapeHtml(str) {
             const d = document.createElement("div");
             d.textContent = str == null ? "" : String(str);
@@ -782,7 +801,7 @@
                     } else {
                         stateEl.innerHTML = '<span class="status-badge status-none">no backups yet</span>';
                     }
-                    lastEl.textContent = res.last_backup || "never";
+                    lastEl.textContent = formatDateTime(res.last_backup) || "never";
                     btn.disabled = false;
                     btn.textContent = "Run backup now";
                     // Snapshots may have changed — refresh the list + repo size.
@@ -815,7 +834,7 @@
                     return;
                 }
                 if (s.last_status === "ok") {
-                    stateEl.innerHTML = '<span class="status-badge status-success">check ok</span> <span style="font-size:0.8rem;color:#666;margin-left:6px;">' + escapeHtml(s.last_at || "") + '</span>';
+                    stateEl.innerHTML = '<span class="status-badge status-success">check ok</span> <span style="font-size:0.8rem;color:#666;margin-left:6px;">' + escapeHtml(formatDateTime(s.last_at)) + '</span>';
                 } else if (s.last_status === "error") {
                     const msg = s.last_output ? '<div style="margin-top:6px;font-family:monospace;font-size:0.78rem;color:#991b1b;white-space:pre-wrap;">' + escapeHtml(s.last_output) + '</div>' : '';
                     stateEl.innerHTML = '<span class="status-badge status-error">check failed</span>' + msg;
@@ -914,7 +933,7 @@
                         : '<span class="name-label" style="color:#aaa;" onclick="event.stopPropagation(); renameBackup(' + rec.id + ', this)">-</span>')
                     : (name ? escapeHtml(name) : '<span style="color:#aaa;">-</span>');
                 tr.innerHTML =
-                    '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml((s.time || "").substring(0, 19)) + '</td>' +
+                    '<td style="padding:6px 8px;">' + escapeHtml(formatDateTime(s.time)) + '</td>' +
                     '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(s.short_id) + '</td>' +
                     '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
                     '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>';
@@ -1112,7 +1131,7 @@
 
                 const modTd = document.createElement("td");
                 modTd.style.cssText = "padding:6px 8px;font-size:0.8rem;color:#666;";
-                modTd.textContent = f.mod_time ? String(f.mod_time).substring(0, 19) : "";
+                modTd.textContent = formatDateTime(f.mod_time);
 
                 tr.appendChild(nameTd);
                 tr.appendChild(sizeTd);
@@ -1275,6 +1294,13 @@
             };
             poll();
         }
+
+        // Localize the server-rendered "Last backup" time (leaves "never" as-is
+        // when there is no timestamp to format).
+        (function () {
+            const el = document.getElementById("status-last");
+            if (el && el.dataset.ts) el.textContent = formatDateTime(el.dataset.ts);
+        })();
 
         // Auto-load snapshots + repo stats on page load (only if configured).
         {% if config.repo %}
