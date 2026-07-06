@@ -4,13 +4,14 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from quart import Quart, render_template, request, jsonify
+from quart import Quart, jsonify, render_template, request
 
 import migration
-from operations import OpKind, OperationLock
+from operations import OperationLock, OpKind
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -118,6 +119,7 @@ def classify_repo(repo: str) -> dict:
         repo_path = repo
     return {"type": "local", "remote": False, "location": repo_path}
 
+
 # Single lock for mutual exclusion across backup / restore / migration.
 op_lock = OperationLock()
 
@@ -184,6 +186,21 @@ def init_db():
         ("total_size_bytes", "ALTER TABLE backups ADD COLUMN total_size_bytes INTEGER"),
         ("file_count", "ALTER TABLE backups ADD COLUMN file_count INTEGER"),
         ("name", "ALTER TABLE backups ADD COLUMN name TEXT"),
+        ("repo_size_bytes", "ALTER TABLE backups ADD COLUMN repo_size_bytes INTEGER"),
+        (
+            "repo_uncompressed_bytes",
+            "ALTER TABLE backups ADD COLUMN repo_uncompressed_bytes INTEGER",
+        ),
+        ("repo_blob_count", "ALTER TABLE backups ADD COLUMN repo_blob_count INTEGER"),
+        (
+            "repo_snapshots_count",
+            "ALTER TABLE backups ADD COLUMN repo_snapshots_count INTEGER",
+        ),
+        (
+            "repo_compression_ratio",
+            "ALTER TABLE backups ADD COLUMN repo_compression_ratio REAL",
+        ),
+        ("repo_stats_at", "ALTER TABLE backups ADD COLUMN repo_stats_at TEXT"),
     ]:
         if col not in columns:
             conn.execute(ddl)
@@ -205,24 +222,60 @@ def record_backup(
     total_size_bytes=None,
     file_count=None,
     name=None,
+    repo_stats=None,
 ):
-    """Insert a backup record into the database."""
+    """Insert a backup record into the database.
+
+    When ``repo_stats`` (a dict from ``repo_stats()``) is supplied, the
+    repo-wide size cache is written into the *same* INSERT, so a successful
+    backup records both its per-run figures and the current repo footprint
+    in one row — no separate connection or ``MAX(id)`` update needed. The
+    delete path, which has no INSERT to piggyback on, instead re-stamps the
+    newest surviving row inline (see ``delete_snapshot``).
+    """
+    cols = [
+        "timestamp",
+        "status",
+        "error_message",
+        "snapshot_id",
+        "data_added_bytes",
+        "total_size_bytes",
+        "file_count",
+        "name",
+    ]
+    vals = [
+        timestamp,
+        status,
+        error_message,
+        snapshot_id,
+        data_added_bytes,
+        total_size_bytes,
+        file_count,
+        name,
+    ]
+    if repo_stats is not None:
+        cols += [
+            "repo_size_bytes",
+            "repo_uncompressed_bytes",
+            "repo_blob_count",
+            "repo_snapshots_count",
+            "repo_compression_ratio",
+            "repo_stats_at",
+        ]
+        vals += [
+            repo_stats.get("total_size_bytes"),
+            repo_stats.get("total_uncompressed_size_bytes"),
+            repo_stats.get("total_blob_count"),
+            repo_stats.get("snapshots_count"),
+            repo_stats.get("compression_ratio"),
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ]
+    placeholders = ", ".join(["?"] * len(vals))
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO backups (timestamp, status, error_message, snapshot_id, "
-            "data_added_bytes, total_size_bytes, file_count, name) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                timestamp,
-                status,
-                error_message,
-                snapshot_id,
-                data_added_bytes,
-                total_size_bytes,
-                file_count,
-                name,
-            ),
+            f"INSERT INTO backups ({', '.join(cols)}) VALUES ({placeholders})",
+            vals,
         )
         conn.commit()
     finally:
@@ -241,6 +294,39 @@ def get_last_backup():
         return None
     finally:
         conn.close()
+
+
+def load_repo_stats_cache() -> dict | None:
+    """Return the last cached repo stats (newest stamped row), or None.
+
+    The cache is written by whoever changes the repo footprint, folded into
+    that operation's own DB write — ``record_backup`` for a backup,
+    ``delete_snapshot`` for a prune — so there is no standalone writer here.
+    Keys mirror what ``repo_stats()`` returns so /api/repo/stats can serve
+    this verbatim, plus ``computed_at`` so the UI can show its age.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT repo_size_bytes, repo_uncompressed_bytes, repo_blob_count, "
+            "repo_snapshots_count, repo_compression_ratio, repo_stats_at "
+            "FROM backups WHERE repo_stats_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        logger.exception("Failed to read cached repo stats")
+        return None
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {
+        "total_size_bytes": row[0],
+        "total_uncompressed_size_bytes": row[1],
+        "total_blob_count": row[2],
+        "snapshots_count": row[3],
+        "compression_ratio": row[4],
+        "computed_at": row[5],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -312,10 +398,7 @@ async def _verify_admin_token(supplied: str | None) -> bool:
                 f"{ROUTER_URL}/api/apps",
                 headers={"Authorization": f"Bearer {supplied}"},
             )
-            return (
-                r.status_code == 200
-                and "json" in r.headers.get("content-type", "")
-            )
+            return r.status_code == 200 and "json" in r.headers.get("content-type", "")
     except Exception:
         logger.exception("Admin token verification failed")
         return False
@@ -350,8 +433,16 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
     Raises asyncio.TimeoutError if the subprocess exceeds ``timeout``. On
     either timeout OR task cancellation, the subprocess is killed so we
     don't leak a live restic process holding the repo lock.
+
+    Every invocation is logged at INFO (command on start, exit code +
+    elapsed time on completion) so the app's console — ``oh app logs
+    backup`` — shows exactly what restic ran. The args never carry secrets:
+    the repo URL and password go through the environment (see
+    ``_restic_env``), not argv.
     """
     env = _restic_env(conf)
+    logger.info("restic %s", " ".join(args))
+    started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         "restic",
         *args,
@@ -361,7 +452,13 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+        logger.warning(
+            "restic %s killed after %.1fs (%s)",
+            args[0] if args else "?",
+            time.monotonic() - started,
+            type(e).__name__,
+        )
         try:
             proc.kill()
         except ProcessLookupError:
@@ -372,6 +469,12 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
         except Exception:
             pass
         raise
+    logger.info(
+        "restic %s -> rc=%s (%.1fs)",
+        args[0] if args else "?",
+        proc.returncode,
+        time.monotonic() - started,
+    )
     return proc.returncode, stdout, stderr
 
 
@@ -452,7 +555,10 @@ async def ensure_repo_initialized(
                 Path(info["location"]).parent.mkdir(parents=True, exist_ok=True)
             rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
             if rc2 != 0:
-                return False, f"restic init failed: {err2.decode(errors='replace').strip()}"
+                return (
+                    False,
+                    f"restic init failed: {err2.decode(errors='replace').strip()}",
+                )
             return True, None
         return False, f"restic repo check failed: {err}"
 
@@ -467,19 +573,24 @@ async def _restic_unlock_if_stale(conf: dict) -> None:
     matching the current hostname and silently leave the stale one behind).
     """
     try:
-        rc, stdout, stderr = await _run_restic(["unlock", "--remove-all"], conf, timeout=30)
+        rc, stdout, stderr = await _run_restic(
+            ["unlock", "--remove-all"], conf, timeout=30
+        )
         if rc == 0:
-            out = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            out = (
+                stdout.decode(errors="replace") + stderr.decode(errors="replace")
+            ).strip()
             if out:
                 logger.info("restic unlock --remove-all: %s", out)
             else:
                 logger.info("restic unlock --remove-all: no stale locks found")
         else:
-            err = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            err = (
+                stdout.decode(errors="replace") + stderr.decode(errors="replace")
+            ).strip()
             logger.warning("restic unlock --remove-all failed (rc=%d): %s", rc, err)
     except Exception:
         logger.warning("restic unlock failed on startup", exc_info=True)
-
 
 
 async def test_restic_connection(
@@ -494,8 +605,11 @@ async def test_restic_connection(
     lines — are already in our buffer.
     """
     env = _restic_env(conf)
+    logger.info("restic cat config (connection test, timeout=%.0fs)", timeout)
     proc = await asyncio.create_subprocess_exec(
-        "restic", "cat", "config",
+        "restic",
+        "cat",
+        "config",
         env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -549,7 +663,11 @@ def _classify_restic_test(
     if returncode == 0 and not timed_out:
         return True, "Connection OK", output or "(no output)"
     if not timed_out and "repository does not exist" in output.lower():
-        return True, "Reachable — no repository at this location yet (a backup will create it)", output
+        return (
+            True,
+            "Reachable — no repository at this location yet (a backup will create it)",
+            output,
+        )
     return False, "Connection failed", output or f"restic exited with code {returncode}"
 
 
@@ -564,7 +682,7 @@ def _build_restic_debug(conf: dict) -> dict:
     env = _restic_env(conf)
     # Only the keys restic actually reads from us, not the whole process env.
     keys: list[str] = ["RESTIC_REPOSITORY", "RESTIC_PASSWORD"]
-    for k in (conf.get("env") or {}):
+    for k in conf.get("env") or {}:
         if k not in keys:
             keys.append(k)
     entries = []
@@ -622,9 +740,8 @@ async def run_backup(name: str | None = None) -> bool:
         # instances that only grant a subset of data permissions.
         roots = [p for p in BACKUP_ROOTS if p.is_dir()]
         if not roots:
-            msg = (
-                "No backup roots available — expected one of: "
-                + ", ".join(str(p) for p in BACKUP_ROOTS)
+            msg = "No backup roots available — expected one of: " + ", ".join(
+                str(p) for p in BACKUP_ROOTS
             )
             record_backup(timestamp, "error", msg, name=name)
             logger.error(msg)
@@ -645,7 +762,9 @@ async def run_backup(name: str | None = None) -> bool:
         # is generous for large instances but still finite — a wedged S3
         # connection would otherwise hold the op lock forever.
         try:
-            rc, stdout, stderr = await _run_restic(args, conf, timeout=BACKUP_TIMEOUT_SECONDS)
+            rc, stdout, stderr = await _run_restic(
+                args, conf, timeout=BACKUP_TIMEOUT_SECONDS
+            )
         except asyncio.TimeoutError:
             msg = f"restic backup timed out after {BACKUP_TIMEOUT_SECONDS}s"
             record_backup(timestamp, "error", msg, name=name)
@@ -665,28 +784,37 @@ async def run_backup(name: str | None = None) -> bool:
                 if line.strip():
                     logger.info("restic stderr: %s", line)
 
-        if rc == 0 and summary is not None:
+        if rc == 0:
+            # Backup succeeded. Compute the repo footprint now, while we
+            # still hold the op lock (so the stats read stays serialized),
+            # and fold it into the same row record_backup inserts — no
+            # second connection or MAX(id) update. repo_stats() is
+            # best-effort and never raises; on failure repo_stats_data is
+            # None and the row just carries no fresh cache (the reader falls
+            # back to the previous stamped row).
+            repo_stats_data, _ = await repo_stats()
             record_backup(
                 timestamp,
                 "success",
-                snapshot_id=summary.get("snapshot_id"),
-                data_added_bytes=summary.get("data_added"),
-                total_size_bytes=summary.get("total_bytes_processed"),
-                file_count=summary.get("total_files_processed"),
+                snapshot_id=summary.get("snapshot_id") if summary else None,
+                data_added_bytes=summary.get("data_added") if summary else None,
+                total_size_bytes=(
+                    summary.get("total_bytes_processed") if summary else None
+                ),
+                file_count=summary.get("total_files_processed") if summary else None,
                 name=name,
+                repo_stats=repo_stats_data,
             )
-            logger.info(
-                "Backup completed: snapshot=%s data_added=%s total=%s",
-                summary.get("snapshot_id", "?"),
-                summary.get("data_added", "?"),
-                summary.get("total_bytes_processed", "?"),
-            )
-            return True
-
-        if rc == 0:
-            # Succeeded but we somehow missed the summary line.
-            record_backup(timestamp, "success", name=name)
-            logger.info("Backup completed (no summary parsed)")
+            if summary is not None:
+                logger.info(
+                    "Backup completed: snapshot=%s data_added=%s total=%s",
+                    summary.get("snapshot_id", "?"),
+                    summary.get("data_added", "?"),
+                    summary.get("total_bytes_processed", "?"),
+                )
+            else:
+                # Succeeded but we somehow missed the summary line.
+                logger.info("Backup completed (no summary parsed)")
             return True
 
         error_msg = stderr.decode(errors="replace").strip() or f"restic exit code {rc}"
@@ -733,7 +861,9 @@ async def list_snapshots() -> tuple[list[dict], bool]:
             ["snapshots", "--json", "--tag", "openhost"], conf, timeout=60
         )
         if rc != 0:
-            logger.error("restic snapshots failed: %s", stderr.decode(errors="replace").strip())
+            logger.error(
+                "restic snapshots failed: %s", stderr.decode(errors="replace").strip()
+            )
             return [], False
         entries = json.loads(stdout.decode(errors="replace") or "[]")
         out = []
@@ -940,6 +1070,11 @@ async def delete_snapshot(snapshot_id: str) -> bool:
         logger.exception("restic forget failed")
         return False
 
+    # Prune reclaimed space, so the cached repo size is now stale. Recompute
+    # it here (best-effort, still off the request path — this runs in the
+    # delete task, not a /api/repo/stats request) and re-stamp it below.
+    repo_stats_data = (await repo_stats())[0]
+
     # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
     # that restic emits in its --json summary, so an exact match on the
     # user-supplied ID is sufficient when they pass a full ID. When they
@@ -948,13 +1083,30 @@ async def delete_snapshot(snapshot_id: str) -> bool:
     conn = get_db()
     try:
         if len(snapshot_id) >= 40:
-            conn.execute(
-                "DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,)
-            )
+            conn.execute("DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,))
         else:
             conn.execute(
                 "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
                 (len(snapshot_id), snapshot_id),
+            )
+        # Re-stamp the fresh size onto the newest *surviving* backup row, in
+        # the same connection as the delete. Unlike a backup (which folds its
+        # stats into its own INSERT), a delete has no row of its own, so
+        # MAX(id) is unavoidable here. No-op if no rows remain or stats failed.
+        if repo_stats_data is not None:
+            conn.execute(
+                "UPDATE backups SET repo_size_bytes = ?, repo_uncompressed_bytes = ?, "
+                "repo_blob_count = ?, repo_snapshots_count = ?, "
+                "repo_compression_ratio = ?, repo_stats_at = ? "
+                "WHERE id = (SELECT MAX(id) FROM backups)",
+                (
+                    repo_stats_data.get("total_size_bytes"),
+                    repo_stats_data.get("total_uncompressed_size_bytes"),
+                    repo_stats_data.get("total_blob_count"),
+                    repo_stats_data.get("snapshots_count"),
+                    repo_stats_data.get("compression_ratio"),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                ),
             )
         conn.commit()
     except sqlite3.Error:
@@ -1039,9 +1191,7 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
         op_lock.release(OpKind.RESTORE)
         return False
 
-    logger.info(
-        "Starting restic restore from %s (root=%s)", snapshot_id, root or "all"
-    )
+    logger.info("Starting restic restore from %s (root=%s)", snapshot_id, root or "all")
 
     try:
         args = [
@@ -1076,9 +1226,7 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
             restore_last_status = "success"
             logger.info("Restore completed successfully")
         else:
-            restore_last_status = (
-                f"error: {stderr.decode(errors='replace').strip() or f'restic exit {rc}'}"
-            )
+            restore_last_status = f"error: {stderr.decode(errors='replace').strip() or f'restic exit {rc}'}"
             logger.error("Restore failed: %s", restore_last_status)
     except Exception as e:
         restore_last_status = f"error: {e}"
@@ -1135,7 +1283,9 @@ async def run_check() -> bool:
             check_last_at = datetime.now(timezone.utc).isoformat()
             logger.error(check_last_output)
             return False
-        output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+        output = (
+            stdout.decode(errors="replace") + stderr.decode(errors="replace")
+        ).strip()
         check_last_output = output[-4000:]  # cap
         check_last_at = datetime.now(timezone.utc).isoformat()
         if rc == 0:
@@ -1363,14 +1513,14 @@ async def post_config():
     if "env" in data:
         if not isinstance(data["env"], dict):
             return jsonify(ok=False, error="'env' must be an object"), 400
-        conf["env"] = {k: str(v) for k, v in data["env"].items() if v != "" and v is not None}
+        conf["env"] = {
+            k: str(v) for k, v in data["env"].items() if v != "" and v is not None
+        }
     if "interval_seconds" in data:
         try:
             interval = int(data["interval_seconds"])
         except (TypeError, ValueError):
-            return jsonify(
-                ok=False, error="interval_seconds must be an integer"
-            ), 400
+            return jsonify(ok=False, error="interval_seconds must be an integer"), 400
         conf["interval_seconds"] = 0 if interval <= 0 else max(60, interval)
     save_config(conf)
     return jsonify(ok=True)
@@ -1446,10 +1596,22 @@ async def api_snapshots():
 
 @route("/api/repo/stats")
 async def api_repo_stats():
+    # Serve the cached value stamped by the last backup/delete — running
+    # `restic stats` on every request is slow enough to 504 behind the proxy
+    # on large repos. `?refresh=1` bypasses the cache for a one-off live read
+    # (used e.g. when the repo was changed out of band); it does not persist —
+    # the stored cache updates only on the next backup or delete.
+    force = request.args.get("refresh") in ("1", "true", "yes")
+    if not force:
+        cached = load_repo_stats_cache()
+        if cached is not None:
+            return jsonify(ok=True, stats=cached, cached=True)
+    # No cache yet (fresh install, or first load before any backup) or a
+    # forced refresh: compute live.
     stats, error = await repo_stats()
     if error:
         return jsonify(ok=False, error=error), 500
-    return jsonify(ok=True, stats=stats)
+    return jsonify(ok=True, stats=stats, cached=False)
 
 
 @route("/api/restore", methods=["POST"])
@@ -1690,7 +1852,12 @@ async def chown_app_data():
     target_uid = 1000
     target_gid = 1000
     app_data = str(ALL_APP_DATA)
-    logger.info("chown -R %s:%s %s (skipping subuid-mapped files)", target_uid, target_gid, app_data)
+    logger.info(
+        "chown -R %s:%s %s (skipping subuid-mapped files)",
+        target_uid,
+        target_gid,
+        app_data,
+    )
 
     count = 0
     skipped = 0
@@ -1721,7 +1888,9 @@ async def chown_app_data():
             _chown_one(os.path.join(root, name))
     _chown_one(app_data)
 
-    logger.info("chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors)
+    logger.info(
+        "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
+    )
     return jsonify(
         ok=True,
         message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid}); "

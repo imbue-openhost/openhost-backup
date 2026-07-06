@@ -695,3 +695,124 @@ class TestIndexRendersScope:
         body = (await resp.get_data()).decode()
         for root in backup_app.BACKUP_ROOTS:
             assert str(root) in body, f"missing BACKUP_ROOTS path {root}"
+
+
+class TestRepoStatsCache:
+    """The /api/repo/stats cache: stamped by backup/delete, served on read.
+
+    The cache is written by folding stats into each mutating path's own DB
+    write (``record_backup`` for a backup, ``delete_snapshot`` for a prune),
+    so there is no standalone save helper to test in isolation.
+    """
+
+    STATS = {
+        "total_size_bytes": 4_200_000_000,
+        "total_uncompressed_size_bytes": 8_800_000_000,
+        "total_blob_count": 12345,
+        "snapshots_count": 37,
+        "compression_ratio": 2.1,
+    }
+
+    def _record_backup(self, repo_stats=None, snapshot_id="a" * 64):
+        backup_app.record_backup(
+            "2026-01-01T00:00:00",
+            "success",
+            snapshot_id=snapshot_id,
+            name="t",
+            repo_stats=repo_stats,
+        )
+
+    def test_record_backup_folds_stats_into_row(self, client):
+        # The backup path stamps the cache in its own INSERT.
+        self._record_backup(repo_stats=self.STATS)
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded is not None
+        for k, v in self.STATS.items():
+            assert loaded[k] == v
+        assert loaded["computed_at"]  # timestamp stamped
+
+    def test_load_returns_none_without_stamp(self, client):
+        # A backup row exists but carried no repo stats.
+        self._record_backup()
+        assert backup_app.load_repo_stats_cache() is None
+
+    def test_load_returns_newest_stamped_row(self, client):
+        # An unstamped newer backup must not shadow the last known-good stats.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        self._record_backup(repo_stats=None, snapshot_id="b" * 64)
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded is not None
+        assert loaded["snapshots_count"] == 37
+
+    async def test_api_serves_cache_without_recompute(self, client):
+        self._record_backup(repo_stats=self.STATS)
+        with patch.object(backup_app, "repo_stats", new=AsyncMock()) as mock_stats:
+            resp = await client.get("/api/repo/stats")
+            body = await resp.get_json()
+        assert resp.status_code == 200
+        assert body["ok"] is True
+        assert body["cached"] is True
+        assert body["stats"]["total_size_bytes"] == self.STATS["total_size_bytes"]
+        mock_stats.assert_not_called()  # served from DB, restic never invoked
+
+    async def test_api_computes_live_when_no_cache(self, client):
+        self._record_backup(repo_stats=None)  # row exists but unstamped
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(self.STATS, None))
+        ) as mock_stats:
+            resp = await client.get("/api/repo/stats")
+            body = await resp.get_json()
+        assert resp.status_code == 200
+        assert body["cached"] is False
+        assert body["stats"]["snapshots_count"] == 37
+        mock_stats.assert_called_once()
+        # The live read is not persisted — cache updates only on backup/delete.
+        assert backup_app.load_repo_stats_cache() is None
+
+    async def test_api_refresh_bypasses_cache(self, client):
+        self._record_backup(repo_stats=self.STATS)
+        fresh = {**self.STATS, "total_size_bytes": 5_000_000_000, "snapshots_count": 38}
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(fresh, None))
+        ) as mock_stats:
+            resp = await client.get("/api/repo/stats?refresh=1")
+            body = await resp.get_json()
+        assert resp.status_code == 200
+        assert body["cached"] is False
+        assert body["stats"]["total_size_bytes"] == 5_000_000_000
+        mock_stats.assert_called_once()
+        # Bypass is one-off: the stored cache still holds the old value.
+        assert backup_app.load_repo_stats_cache()["total_size_bytes"] == (
+            self.STATS["total_size_bytes"]
+        )
+
+    async def test_api_error_when_no_cache_and_compute_fails(self, client):
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(None, "boom"))
+        ):
+            resp = await client.get("/api/repo/stats")
+            body = await resp.get_json()
+        assert resp.status_code == 500
+        assert body["ok"] is False
+        assert body["error"] == "boom"
+
+    async def test_delete_snapshot_restamps_surviving_row(self, client):
+        # Two stamped backups; deleting the newer must re-stamp the survivor
+        # with freshly recomputed stats (the delete path's inline UPDATE).
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        self._record_backup(repo_stats=self.STATS, snapshot_id="b" * 64)
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        after_prune = {**self.STATS, "total_size_bytes": 1_000_000_000, "snapshots_count": 1}
+        with patch.object(
+            backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+        ), patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(after_prune, None))
+        ):
+            ok = await backup_app.delete_snapshot("b" * 64)
+        assert ok is True
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == 1_000_000_000
+        assert loaded["snapshots_count"] == 1
