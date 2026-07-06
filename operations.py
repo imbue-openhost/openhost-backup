@@ -21,6 +21,7 @@ class OpKind(Enum):
     BACKUP = "backup"
     RESTORE = "restore"
     MIGRATION = "migration"
+    PRUNE = "prune"
 
 
 @dataclass

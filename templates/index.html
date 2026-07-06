@@ -264,6 +264,43 @@
             <label>Backup interval (seconds, 0 = disabled, minimum 60 when enabled)</label>
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="0">
 
+            <h3>Retention policy</h3>
+            <p class="info">
+                After each successful backup, old snapshots are expired using
+                restic's <a href="https://restic.readthedocs.io/en/stable/060_forget.html" target="_blank" rel="noopener">forget</a>
+                policy. A snapshot is kept if it matches <em>any</em> rule below.
+                Leave a field at 0 to disable that tier. If every field is 0,
+                nothing is expired (all snapshots are kept). The space freed by
+                expired snapshots is reclaimed by a prune that runs in the
+                background afterwards.
+            </p>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 12px;margin-bottom:12px;">
+                <div>
+                    <label style="font-size:0.85rem;" title="Keep the N most recent snapshots">Keep last</label>
+                    <input type="number" id="conf-keep-last" value="{{ config.keep_last }}" min="0" style="margin-bottom:0;">
+                </div>
+                <div>
+                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N hours that have one">Keep hourly</label>
+                    <input type="number" id="conf-keep-hourly" value="{{ config.keep_hourly }}" min="0" style="margin-bottom:0;">
+                </div>
+                <div>
+                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N days that have one">Keep daily</label>
+                    <input type="number" id="conf-keep-daily" value="{{ config.keep_daily }}" min="0" style="margin-bottom:0;">
+                </div>
+                <div>
+                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N weeks that have one">Keep weekly</label>
+                    <input type="number" id="conf-keep-weekly" value="{{ config.keep_weekly }}" min="0" style="margin-bottom:0;">
+                </div>
+                <div>
+                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N months that have one">Keep monthly</label>
+                    <input type="number" id="conf-keep-monthly" value="{{ config.keep_monthly }}" min="0" style="margin-bottom:0;">
+                </div>
+                <div>
+                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N years that have one">Keep yearly</label>
+                    <input type="number" id="conf-keep-yearly" value="{{ config.keep_yearly }}" min="0" style="margin-bottom:0;">
+                </div>
+            </div>
+
             <h3>Backend configuration</h3>
             <p class="info">
                 Configure where your snapshots are stored.<br>
@@ -582,6 +619,11 @@
             return out;
         }
 
+        function keepValue(id) {
+            const n = parseInt(document.getElementById(id).value, 10);
+            return isNaN(n) || n < 0 ? 0 : n;
+        }
+
         function configPayload() {
             const interval = parseInt(document.getElementById("conf-interval").value, 10);
             return {
@@ -589,6 +631,12 @@
                 repo_password: document.getElementById("conf-repo-password").value,
                 env: parseEnvString(document.getElementById("conf-env").value),
                 interval_seconds: isNaN(interval) ? 0 : interval,
+                keep_last: keepValue("conf-keep-last"),
+                keep_hourly: keepValue("conf-keep-hourly"),
+                keep_daily: keepValue("conf-keep-daily"),
+                keep_weekly: keepValue("conf-keep-weekly"),
+                keep_monthly: keepValue("conf-keep-monthly"),
+                keep_yearly: keepValue("conf-keep-yearly"),
             };
         }
 

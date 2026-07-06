@@ -79,6 +79,24 @@ DEFAULT_CONFIG = {
     "repo": "",
     "repo_password": "",
     "env": {},
+    # Retention policy (restic `forget` keep-* flags). 0 = tier unset. When
+    # every tier is 0 no retention runs, so the default is "keep everything".
+    "keep_last": 0,
+    "keep_hourly": 0,
+    "keep_daily": 0,
+    "keep_weekly": 0,
+    "keep_monthly": 0,
+    "keep_yearly": 0,
+}
+
+# Config key -> restic forget flag. Order is cosmetic (matches restic docs).
+KEEP_FLAGS = {
+    "keep_last": "--keep-last",
+    "keep_hourly": "--keep-hourly",
+    "keep_daily": "--keep-daily",
+    "keep_weekly": "--keep-weekly",
+    "keep_monthly": "--keep-monthly",
+    "keep_yearly": "--keep-yearly",
 }
 
 # Snapshot IDs are hex strings; restic emits 8-char short IDs and 64-char long
@@ -495,6 +513,8 @@ def _parse_ndjson(data: bytes):
 BACKUP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
 RESTORE_TIMEOUT_SECONDS = 12 * 60 * 60  # 12 hours
 CHECK_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hours
+FORGET_TIMEOUT_SECONDS = 10 * 60  # 10 minutes — forget only rewrites metadata
+PRUNE_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours — prune repacks, can be slow on S3
 
 # Guard against concurrent `restic init` calls. When the UI loads, multiple
 # API endpoints (snapshots, stats, check) call ensure_repo_initialized at
@@ -722,6 +742,7 @@ async def run_backup(name: str | None = None) -> bool:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     logger.info("Starting restic backup to %s", conf["repo"])
 
+    removed = 0
     try:
         # Backup always creates the repo if missing — that's the operation
         # users opt into knowing it'll write to the configured location.
@@ -785,13 +806,23 @@ async def run_backup(name: str | None = None) -> bool:
                     logger.info("restic stderr: %s", line)
 
         if rc == 0:
-            # Backup succeeded. Compute the repo footprint now, while we
-            # still hold the op lock (so the stats read stays serialized),
-            # and fold it into the same row record_backup inserts — no
-            # second connection or MAX(id) update. repo_stats() is
-            # best-effort and never raises; on failure repo_stats_data is
-            # None and the row just carries no fresh cache (the reader falls
-            # back to the previous stamped row).
+            # Backup succeeded. Apply the retention policy first (forget only,
+            # under the lock) so the footprint we stamp reflects the
+            # post-retention snapshot set. Best-effort — a retention failure
+            # must not fail the backup itself.
+            try:
+                removed = await run_retention(conf)
+            except Exception:
+                logger.exception("Retention failed")
+
+            # Compute the repo footprint now, while we still hold the op lock
+            # (so the stats read stays serialized), and fold it into the same
+            # row record_backup inserts — no second connection or MAX(id)
+            # update. repo_stats() is best-effort and never raises; on failure
+            # repo_stats_data is None and the row just carries no fresh cache
+            # (the reader falls back to the previous stamped row). The size is
+            # still pre-prune here; the background prune re-stamps it once it
+            # reclaims space.
             repo_stats_data, _ = await repo_stats()
             record_backup(
                 timestamp,
@@ -827,6 +858,12 @@ async def run_backup(name: str | None = None) -> bool:
         return False
     finally:
         op_lock.release(OpKind.BACKUP)
+        # Retention forgot snapshots but didn't prune — reclaim the space in
+        # the background so it doesn't extend the backup or hold the lock for
+        # prune's full duration. Scheduled after the lock is released so the
+        # worker can acquire it.
+        if removed:
+            schedule_prune()
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +917,11 @@ async def list_snapshots() -> tuple[list[dict], bool]:
             )
         # Newest first
         out.sort(key=lambda x: x["time"], reverse=True)
+        # Reconcile the history DB against reality: this listing just
+        # succeeded, so any backups row whose snapshot isn't here (retention
+        # forgot it, or it was deleted out of band) is stale. Reuses this
+        # call's result — no extra restic invocation.
+        _reconcile_snapshots_db({e["id"] for e in out if e.get("id")})
         return out, True
     except Exception:
         logger.exception("Failed to list snapshots")
@@ -1116,6 +1158,190 @@ async def delete_snapshot(snapshot_id: str) -> bool:
         conn.close()
     logger.info("Deleted snapshot %s", snapshot_id)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Retention (restic forget) + background prune
+# ---------------------------------------------------------------------------
+
+
+def _forget_args(conf: dict) -> list[str] | None:
+    """Build ``restic forget`` args from the configured keep-* policy.
+
+    Returns None when no tier is set — meaning "keep everything", so no
+    forget runs. This is also the safety floor: we never issue a forget with
+    zero keep flags, which would delete every snapshot. Scoped to
+    ``--tag openhost`` and forced into a single group so snapshots with
+    differing path sets (e.g. an instance missing vm_data) aren't thinned
+    independently. ``--prune`` is intentionally omitted — it runs in the
+    background afterwards (see ``schedule_prune``).
+
+    Values are stored as validated ints by ``post_config`` and seeded by
+    ``DEFAULT_CONFIG``, so we can read them directly.
+    """
+    keeps: list[str] = []
+    for key, flag in KEEP_FLAGS.items():
+        if conf.get(key):
+            keeps += [flag, str(conf[key])]
+    if not keeps:
+        return None
+    return ["forget", "--json", "--tag", "openhost", "--group-by", "host", *keeps]
+
+
+def _reconcile_snapshots_db(present_ids: set[str]) -> None:
+    """Drop history rows whose snapshot no longer exists in the repo.
+
+    The backstop that keeps the ``backups`` table a subset of restic reality
+    — covers retention's forgotten snapshots plus anything deleted out of
+    band. Rows with no ``snapshot_id`` (successful backups whose summary was
+    missing) are left alone. Only call with the ids from a *successful*
+    listing: an empty set from a failed list would wipe every row.
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, snapshot_id FROM backups WHERE snapshot_id IS NOT NULL"
+        ).fetchall()
+        stale = [(r[0],) for r in rows if r[1] not in present_ids]
+        if stale:
+            conn.executemany("DELETE FROM backups WHERE id = ?", stale)
+            conn.commit()
+            logger.info("Reconciled DB: removed %d stale backup row(s)", len(stale))
+    except sqlite3.Error:
+        logger.exception("Snapshot DB reconcile failed")
+    finally:
+        conn.close()
+
+
+async def run_retention(conf: dict) -> int:
+    """Apply the keep-* policy via ``restic forget`` and reconcile the DB.
+
+    Returns the number of snapshots forgotten. Prune (the expensive step
+    that reclaims space) is deliberately NOT run here — the caller schedules
+    it in the background only when this returns > 0. Must be called while
+    holding the operation lock.
+    """
+    args = _forget_args(conf)
+    if args is None:
+        return 0
+    try:
+        rc, stdout, stderr = await _run_restic(
+            args, conf, timeout=FORGET_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.error("restic forget timed out after %ss", FORGET_TIMEOUT_SECONDS)
+        return 0
+    if rc != 0:
+        logger.error(
+            "restic forget failed: %s", stderr.decode(errors="replace").strip()
+        )
+        return 0
+
+    # forget --json returns one object per group, each with a "remove" list of
+    # snapshot objects (absent/empty when nothing was removed).
+    removed_ids: list[str] = []
+    try:
+        for group in json.loads(stdout.decode(errors="replace") or "[]"):
+            for snap in group.get("remove") or []:
+                sid = snap.get("id")
+                if sid:
+                    removed_ids.append(sid)
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning("Could not parse restic forget --json output")
+
+    if removed_ids:
+        conn = get_db()
+        try:
+            conn.executemany(
+                "DELETE FROM backups WHERE snapshot_id = ?",
+                [(sid,) for sid in removed_ids],
+            )
+            conn.commit()
+        except sqlite3.Error:
+            logger.exception("DB cleanup after forget failed")
+        finally:
+            conn.close()
+        logger.info("Retention forgot %d snapshot(s)", len(removed_ids))
+    return len(removed_ids)
+
+
+# Background prune coordination. restic prune reclaims the space freed by
+# forget; it's slow (repacks pack files) so we run it off the backup path as a
+# single coalesced worker. _prune_needed lets a forget that lands while a prune
+# is already running request a follow-up pass.
+_prune_needed = False
+_prune_task: "asyncio.Task | None" = None
+
+
+def schedule_prune() -> None:
+    """Request a background prune. Coalesces: at most one worker runs at once."""
+    global _prune_needed, _prune_task
+    _prune_needed = True
+    if _prune_task is None or _prune_task.done():
+        _prune_task = asyncio.create_task(_prune_worker())
+
+
+async def _prune_worker() -> None:
+    global _prune_needed
+    while _prune_needed:
+        _prune_needed = False
+        # A prune must not run concurrently with a backup/restore/migration —
+        # restic takes an exclusive repo lock — so wait for the operation lock.
+        waited = 0.0
+        while op_lock.try_acquire(OpKind.PRUNE) is not None:
+            if waited >= PRUNE_TIMEOUT_SECONDS:
+                logger.warning("Prune gave up waiting for the operation lock")
+                _prune_needed = True  # retry on the next schedule_prune
+                return
+            await asyncio.sleep(5)
+            waited += 5
+        try:
+            await _run_prune_locked()
+        finally:
+            op_lock.release(OpKind.PRUNE)
+
+
+async def _run_prune_locked() -> None:
+    """Run ``restic prune`` and re-stamp the repo-size cache. Lock held by caller."""
+    conf = load_config()
+    if not conf.get("repo") or not conf.get("repo_password"):
+        return
+    try:
+        rc, _out, stderr = await _run_restic(
+            ["prune"], conf, timeout=PRUNE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        logger.error("restic prune timed out after %ss", PRUNE_TIMEOUT_SECONDS)
+        return
+    if rc != 0:
+        logger.error("restic prune failed: %s", stderr.decode(errors="replace").strip())
+        return
+    logger.info("Prune completed")
+    # Prune reclaimed space, so the cached repo size is stale — recompute and
+    # re-stamp the newest surviving backup row.
+    stats = (await repo_stats())[0]
+    if stats is not None:
+        conn = get_db()
+        try:
+            conn.execute(
+                "UPDATE backups SET repo_size_bytes = ?, repo_uncompressed_bytes = ?, "
+                "repo_blob_count = ?, repo_snapshots_count = ?, "
+                "repo_compression_ratio = ?, repo_stats_at = ? "
+                "WHERE id = (SELECT MAX(id) FROM backups)",
+                (
+                    stats.get("total_size_bytes"),
+                    stats.get("total_uncompressed_size_bytes"),
+                    stats.get("total_blob_count"),
+                    stats.get("snapshots_count"),
+                    stats.get("compression_ratio"),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                ),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            logger.exception("Failed to re-stamp repo stats after prune")
+        finally:
+            conn.close()
 
 
 def get_backup_history(limit=20, offset=0):
@@ -1522,6 +1748,16 @@ async def post_config():
         except (TypeError, ValueError):
             return jsonify(ok=False, error="interval_seconds must be an integer"), 400
         conf["interval_seconds"] = 0 if interval <= 0 else max(60, interval)
+    # Retention policy (restic forget keep-* tiers). Each is a non-negative
+    # int; 0 = tier unset. Stored as ints so _forget_args can read them
+    # directly.
+    for key in KEEP_FLAGS:
+        if key in data:
+            try:
+                n = int(data[key])
+            except (TypeError, ValueError):
+                return jsonify(ok=False, error=f"{key} must be an integer"), 400
+            conf[key] = max(0, n)
     save_config(conf)
     return jsonify(ok=True)
 

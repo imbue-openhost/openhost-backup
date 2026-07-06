@@ -816,3 +816,110 @@ class TestRepoStatsCache:
         loaded = backup_app.load_repo_stats_cache()
         assert loaded["total_size_bytes"] == 1_000_000_000
         assert loaded["snapshots_count"] == 1
+
+
+class TestRetention:
+    """Retention policy: forget arg building, DB reconcile, prune restamp."""
+
+    def test_forget_args_none_when_all_unset(self, client):
+        assert backup_app._forget_args(dict(backup_app.DEFAULT_CONFIG)) is None
+
+    def test_forget_args_builds_flags_and_scoping(self, client):
+        conf = {**backup_app.DEFAULT_CONFIG, "keep_last": 5, "keep_daily": 7}
+        args = backup_app._forget_args(conf)
+        assert args[0] == "forget"
+        assert "--json" in args
+        # scoped to our snapshots, single group
+        assert args[args.index("--tag") + 1] == "openhost"
+        assert args[args.index("--group-by") + 1] == "host"
+        # set tiers present, unset omitted, never --prune
+        assert args[args.index("--keep-last") + 1] == "5"
+        assert args[args.index("--keep-daily") + 1] == "7"
+        assert "--keep-hourly" not in args
+        assert "--prune" not in args
+
+    async def test_run_retention_forgets_and_reconciles_db(self, client):
+        backup_app.record_backup("t1", "success", snapshot_id="a" * 64)
+        backup_app.record_backup("t2", "success", snapshot_id="b" * 64)
+        forget_json = json.dumps([{"remove": [{"id": "a" * 64}]}]).encode()
+        conf = {**backup_app.DEFAULT_CONFIG, "repo": "r", "repo_password": "p", "keep_last": 1}
+        with patch.object(
+            backup_app, "_run_restic", new=AsyncMock(return_value=(0, forget_json, b""))
+        ):
+            count = await backup_app.run_retention(conf)
+        assert count == 1
+        hist, _ = backup_app.get_backup_history(limit=10)
+        ids = [h["snapshot_id"] for h in hist]
+        assert ("a" * 64) not in ids  # forgotten row reconciled away
+        assert ("b" * 64) in ids
+
+    async def test_run_retention_noop_without_policy(self, client):
+        conf = {**backup_app.DEFAULT_CONFIG, "repo": "r", "repo_password": "p"}
+        with patch.object(backup_app, "_run_restic", new=AsyncMock()) as mock_restic:
+            count = await backup_app.run_retention(conf)
+        assert count == 0
+        mock_restic.assert_not_called()  # no forget issued at all
+
+    async def test_run_retention_handles_forget_failure(self, client):
+        conf = {**backup_app.DEFAULT_CONFIG, "keep_last": 1, "repo": "r", "repo_password": "p"}
+        with patch.object(
+            backup_app, "_run_restic", new=AsyncMock(return_value=(1, b"", b"boom"))
+        ):
+            count = await backup_app.run_retention(conf)
+        assert count == 0
+
+    def test_reconcile_removes_stale_keeps_present_and_nullid(self, client):
+        backup_app.record_backup("t1", "success", snapshot_id="a" * 64)
+        backup_app.record_backup("t2", "success", snapshot_id="b" * 64)
+        backup_app.record_backup("t3", "success", snapshot_id=None)
+        backup_app._reconcile_snapshots_db({"b" * 64})
+        hist, _ = backup_app.get_backup_history(limit=10)
+        ids = [h["snapshot_id"] for h in hist]
+        assert ("a" * 64) not in ids  # gone from restic -> row removed
+        assert ("b" * 64) in ids  # still present -> kept
+        assert None in ids  # no snapshot_id -> never reconciled away
+
+    async def test_prune_restamps_repo_size_cache(self, client):
+        backup_app.record_backup("t1", "success", snapshot_id="a" * 64)
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        after = {
+            "total_size_bytes": 900_000_000,
+            "total_uncompressed_size_bytes": 1_800_000_000,
+            "total_blob_count": 10,
+            "snapshots_count": 3,
+            "compression_ratio": 2.0,
+        }
+        with patch.object(
+            backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+        ), patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(after, None))
+        ):
+            await backup_app._run_prune_locked()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == 900_000_000
+        assert loaded["snapshots_count"] == 3
+
+    async def test_post_config_accepts_keep_fields(self, client):
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"keep_last": 5, "keep_daily": 7}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        conf = backup_app.load_config()
+        assert conf["keep_last"] == 5
+        assert conf["keep_daily"] == 7
+
+    async def test_post_config_rejects_noninteger_keep(self, client):
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"keep_last": "abc"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+        body = await resp.get_json()
+        assert body["ok"] is False
+        assert "keep_last" in body["error"]
