@@ -831,12 +831,46 @@ class TestRetention:
         assert "--json" in args
         # scoped to our snapshots, single group
         assert args[args.index("--tag") + 1] == "openhost"
-        assert args[args.index("--group-by") + 1] == "host"
+        assert args[args.index("--group-by") + 1] == ""  # single universal group
         # set tiers present, unset omitted, never --prune
         assert args[args.index("--keep-last") + 1] == "5"
         assert args[args.index("--keep-daily") + 1] == "7"
         assert "--keep-hourly" not in args
         assert "--prune" not in args
+
+    async def test_backup_pins_host(self, client, monkeypatch):
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        backup_app.op_lock._active = None
+        # Point BACKUP_ROOTS at a dir that exists in the test sandbox.
+        monkeypatch.setattr(backup_app, "BACKUP_ROOTS", [backup_app.ALL_APP_DATA])
+        monkeypatch.setattr(
+            backup_app, "ensure_repo_initialized", AsyncMock(return_value=(True, None))
+        )
+        monkeypatch.setattr(backup_app, "repo_stats", AsyncMock(return_value=(None, None)))
+        captured = {}
+
+        async def fake_run_restic(args, conf, timeout=None):
+            captured["args"] = args
+            summary = json.dumps(
+                {
+                    "message_type": "summary",
+                    "snapshot_id": "s" * 64,
+                    "data_added": 1,
+                    "total_bytes_processed": 2,
+                    "total_files_processed": 3,
+                }
+            )
+            return 0, (summary + "\n").encode(), b""
+
+        monkeypatch.setattr(backup_app, "_run_restic", fake_run_restic)
+        ok = await backup_app.run_backup()
+        assert ok is True
+        args = captured["args"]
+        assert args[0] == "backup"
+        assert args[args.index("--host") + 1] == backup_app.BACKUP_HOST
 
     async def test_run_retention_forgets_and_reconciles_db(self, client):
         backup_app.record_backup("t1", "success", snapshot_id="a" * 64)

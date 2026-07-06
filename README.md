@@ -60,6 +60,25 @@ Set an interval (in seconds) in the configuration. The scheduler runs in the bac
 
 Set the interval to 0 (or leave it blank) to disable automatic backups.
 
+## Retention (expiring old backups)
+
+After each successful backup, old snapshots are expired according to a retention policy you set in the UI (the **Retention policy** section of the configuration). It maps directly onto restic's [`forget`](https://restic.readthedocs.io/en/stable/060_forget.html) keep-* rules:
+
+| Field | restic flag | Meaning |
+|-------|-------------|---------|
+| Keep last | `--keep-last` | The N most recent snapshots, regardless of time |
+| Keep hourly | `--keep-hourly` | The newest snapshot from each of the last N hours that have one |
+| Keep daily | `--keep-daily` | The newest snapshot from each of the last N days that have one |
+| Keep weekly | `--keep-weekly` | The newest snapshot from each of the last N weeks that have one |
+| Keep monthly | `--keep-monthly` | The newest snapshot from each of the last N months that have one |
+| Keep yearly | `--keep-yearly` | The newest snapshot from each of the last N years that have one |
+
+A snapshot is kept if it matches **any** rule (the rules are OR'd), so tiers combine additively — e.g. `keep_last=5, keep_daily=7, keep_weekly=4` keeps the 5 most recent plus one per day for 7 days plus one per week for 4 weeks, deduplicated where they overlap. Set a field to 0 to disable that tier. **If every field is 0, nothing is expired** — the safety floor means the app never issues a `forget` with zero keep rules (which would delete everything).
+
+The policy is applied across all `openhost`-tagged snapshots as a single group (`--group-by ''`), which assumes one instance per repository. Every snapshot is recorded with a stable host (`--host`, set to the zone domain) so its identity doesn't change when the backup container is redeployed.
+
+Retention runs `forget` inline after the backup (fast — it only rewrites metadata) and reconciles the backup history database to match. The actual space is reclaimed by a `restic prune`, which runs **in the background** and only when snapshots were actually expired, so it never delays the backup or blocks the UI.
+
 ## Snapshots
 
 Each successful backup creates a restic snapshot tagged with `openhost`. The UI lists snapshots newest-first and lets you:
@@ -68,6 +87,8 @@ Each successful backup creates a restic snapshot tagged with `openhost`. The UI 
 - Restore a snapshot (to all data roots, or to a specific root)
 - Delete a snapshot (runs `restic forget --prune` to reclaim space)
 - Name or rename a snapshot for easier identification
+
+The Status panel shows the **repo size** — the deduplicated, compressed on-disk footprint (`restic stats --mode raw-data`). Because computing it is slow on large/remote repos, the value is cached: it is recomputed and stored after each backup and after a snapshot delete/prune, and served from the cache on page load so it never blocks (or times out) a request. The backup history database is reconciled against restic on every snapshot listing, so rows for snapshots that no longer exist (expired by retention, or removed out of band) are cleaned up automatically.
 
 ## Restoring
 
@@ -111,6 +132,7 @@ Configuration is stored in `/data/app_data/backup/config.json` with permissions 
 | `repo_password` | Restic repository encryption password |
 | `env` | Backend credential environment variables (e.g., AWS keys) |
 | `interval_seconds` | Automatic backup interval (0 = disabled) |
+| `keep_last` / `keep_hourly` / `keep_daily` / `keep_weekly` / `keep_monthly` / `keep_yearly` | Retention policy tiers (0 = tier disabled; all 0 = keep everything) |
 | `router_api_token` | OpenHost router API token (needed for migration) |
 
 The config API (`POST /api/config`) requires a valid Bearer token to rotate the `router_api_token` after it has been set, preventing co-located containers from silently replacing it.
@@ -166,7 +188,7 @@ All routes are registered at both `/path` and `/backup/path` to handle the OpenH
 | File | Description |
 |------|-------------|
 | `app.py` | Quart web application: routes, restic wrappers, scheduler, config management |
-| `operations.py` | Mutual-exclusion lock ensuring only one backup, restore, or migration runs at a time |
+| `operations.py` | Mutual-exclusion lock ensuring only one backup, restore, migration, or prune runs at a time |
 | `migration.py` | Cross-instance migration logic (direct push protocol, tar streaming, app deployment) |
 | `Dockerfile` | Python 3.12 Alpine image with restic and uv |
 | `openhost.toml` | OpenHost manifest (2048 MB memory, 1000 millicores CPU, `access_all_data = true`) |
@@ -186,7 +208,7 @@ All persistent state lives in `$OPENHOST_APP_DATA_DIR` (defaults to `/data/app_d
 
 ## Concurrency and timeouts
 
-Only one destructive operation (backup, restore, or migration) can run at a time. The `OperationLock` in `operations.py` enforces this. `restic check` is also serialized against these operations since it acquires a repository lock.
+Only one destructive operation (backup, restore, migration, or the background retention prune) can run at a time. The `OperationLock` in `operations.py` enforces this. `restic check` is also serialized against these operations since it acquires a repository lock. The background prune waits for the lock before running, so it never collides with an in-progress backup or restore.
 
 Timeouts for restic operations:
 
@@ -196,9 +218,13 @@ Timeouts for restic operations:
 | Restore | 12 hours |
 | Check | 2 hours |
 | Connection test | 10 seconds |
-| Snapshot forget/prune | 30 minutes |
+| Retention forget | 10 minutes |
+| Prune | 6 hours |
+| Snapshot forget/prune (manual delete) | 30 minutes |
 
 If a restic process exceeds its timeout, it is killed and the operation is marked as failed.
+
+Every restic invocation is logged (the command on start, exit code and elapsed time on completion), visible via `oh app logs backup`.
 
 ## Running tests
 

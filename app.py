@@ -61,6 +61,13 @@ BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
 BACKUP_EXCLUDES = (ALL_APP_DATA / "backup", APP_ARCHIVE)
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
+# Hostname recorded on every snapshot (`restic backup --host`). The container's
+# own hostname is random and changes on each restart/redeploy, which would
+# fragment `restic forget --group-by host` into per-container groups. Pinning it
+# to the (stable) zone domain gives every snapshot from this instance one
+# identity — and, in a shared repo, keeps instances distinguishable. Falls back
+# to a constant when the zone domain isn't set so we never pass an empty --host.
+BACKUP_HOST = ZONE_DOMAIN or "openhost"
 # Router API token — the backup app needs this to call the local router API.
 # The OPENHOST_APP_TOKEN is for cross-app service communication and does NOT
 # grant access to router management endpoints (/api/apps, /reload_app, etc.).
@@ -770,6 +777,10 @@ async def run_backup(name: str | None = None) -> bool:
 
         args = ["backup", "--json"]
         args += [str(p) for p in roots]
+        # Pin the recorded hostname so every snapshot from this instance shares
+        # one stable identity (see BACKUP_HOST) instead of the container's
+        # random per-restart hostname.
+        args += ["--host", BACKUP_HOST]
         # Exclude our own restic repo (avoid self-inclusion + infinite
         # growth) and ``/data/app_archive`` (rationale documented at the
         # BACKUP_EXCLUDES definition).
@@ -1170,11 +1181,17 @@ def _forget_args(conf: dict) -> list[str] | None:
 
     Returns None when no tier is set — meaning "keep everything", so no
     forget runs. This is also the safety floor: we never issue a forget with
-    zero keep flags, which would delete every snapshot. Scoped to
-    ``--tag openhost`` and forced into a single group so snapshots with
-    differing path sets (e.g. an instance missing vm_data) aren't thinned
-    independently. ``--prune`` is intentionally omitted — it runs in the
-    background afterwards (see ``schedule_prune``).
+    zero keep flags, which would delete every snapshot. ``--prune`` is
+    intentionally omitted — it runs in the background afterwards (see
+    ``schedule_prune``).
+
+    Scoping: ``--tag openhost`` selects our snapshots and ``--group-by ''``
+    (empty) treats them all as ONE group so the policy applies across the
+    whole set. We assume a single instance per repo, so no per-host/paths
+    grouping is needed — and grouping would only fragment retention (paths
+    vary when a root like vm_data is absent; host varied on older snapshots
+    before we began pinning ``--host BACKUP_HOST``). Backups are pinned to
+    the zone host from now on for a stable snapshot identity.
 
     Values are stored as validated ints by ``post_config`` and seeded by
     ``DEFAULT_CONFIG``, so we can read them directly.
@@ -1185,7 +1202,7 @@ def _forget_args(conf: dict) -> list[str] | None:
             keeps += [flag, str(conf[key])]
     if not keeps:
         return None
-    return ["forget", "--json", "--tag", "openhost", "--group-by", "host", *keeps]
+    return ["forget", "--json", "--tag", "openhost", "--group-by", "", *keeps]
 
 
 def _reconcile_snapshots_db(present_ids: set[str]) -> None:
