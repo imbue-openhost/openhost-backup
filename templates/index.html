@@ -91,6 +91,12 @@
 <body>
     <h1>Backup</h1>
 
+    <!-- Permanent operation banner. Reflects op_lock state from /api/status
+         (backup / restore / migration) so the user always sees when the repo
+         is busy and that other operations are paused. Populated by
+         pollLockBanner(); hidden while idle. -->
+    <div id="lock-banner" role="status" aria-live="polite" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.9rem;color:#92400e;font-weight:500;"></div>
+
     <div class="tab-bar">
         <button class="tab-btn active" onclick="showPage('backup')">Backups</button>
         <button class="tab-btn" onclick="showPage('migrate')">Migrate</button>
@@ -1141,12 +1147,11 @@
             btn.textContent = "Delete";
 
             if (res.ok) {
-                showMsg("manage-msg", "Snapshot deleted", true);
+                showMsg("manage-msg", "Delete started — progress shows in the banner above; the list refreshes when it finishes.", true);
                 selectedSnapshotId = null;
                 document.getElementById("action-panel").style.display = "none";
                 document.getElementById("browse-container").style.display = "none";
-                loadSnapshots();
-                loadRepoStats();
+                refreshLockStatusNow();  // reflect the delete immediately (SSE also pushes it)
             } else {
                 showMsg("manage-msg", res.error || "Delete failed", false);
             }
@@ -1227,6 +1232,51 @@
             };
             poll();
         }
+
+        // Permanent operation banner. Reflects whatever operation currently
+        // holds the shared lock, so the user always sees when the repo is busy
+        // and that other operations are paused. Updated instantly by the SSE
+        // stream below (server pushes on every lock change); a slow poll is a
+        // fallback for when SSE is unavailable or buffered by a proxy.
+        let lockWasBusy = false;
+        function applyLockStatus(status) {
+            const el = document.getElementById("lock-banner");
+            if (!el) return;
+            const busy = !!(status && status.busy);
+            if (busy) {
+                el.textContent = "⏳ " + (status.busy_message
+                    || "An operation is in progress — other operations are paused until it finishes.");
+                el.style.display = "block";
+            } else {
+                el.style.display = "none";
+                // Busy -> idle edge: refresh views a finished op may have changed.
+                if (lockWasBusy) { loadSnapshots(); loadRepoStats(); }
+            }
+            lockWasBusy = busy;
+        }
+
+        async function refreshLockStatusNow() {
+            try { applyLockStatus(await api("/api/status")); } catch (e) {}
+        }
+
+        async function pollLockBanner() {   // initial paint + fallback
+            await refreshLockStatusNow();
+            setTimeout(pollLockBanner, 10000);
+        }
+
+        function connectStatusStream() {
+            if (!window.EventSource) return;  // slow poll covers this
+            let es;
+            try { es = new EventSource(BASE + "/api/events"); }
+            catch (e) { return; }
+            es.onmessage = (e) => {
+                try { applyLockStatus(JSON.parse(e.data)); } catch (_) {}
+            };
+            // On error the browser auto-reconnects; the poll is the backstop.
+        }
+
+        pollLockBanner();
+        connectStatusStream();
 
         // Auto-load snapshots + repo stats on page load (only if configured).
         {% if config.repo %}

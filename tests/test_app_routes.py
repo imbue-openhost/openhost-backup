@@ -6,6 +6,7 @@ Quart test client.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -579,7 +580,7 @@ class TestEnsureRepoInitialized:
         )
         assert initialized_now is True
         assert err is None
-        assert calls == [["cat", "config"], ["init"]]
+        assert calls == [["cat", "config", "--no-lock"], ["init"]]
 
     async def test_remote_does_not_auto_init_by_default(self, monkeypatch):
         calls = self._patch_run_restic(
@@ -593,7 +594,7 @@ class TestEnsureRepoInitialized:
         assert err is not None
         assert "not initialized" in err.lower()
         # Must NOT have invoked restic init.
-        assert calls == [["cat", "config"]]
+        assert calls == [["cat", "config", "--no-lock"]]
 
     async def test_remote_inits_when_explicitly_opted_in(self, monkeypatch):
         calls = self._patch_run_restic(
@@ -609,7 +610,7 @@ class TestEnsureRepoInitialized:
         )
         assert initialized_now is True
         assert err is None
-        assert calls == [["cat", "config"], ["init"]]
+        assert calls == [["cat", "config", "--no-lock"], ["init"]]
 
     async def test_auto_init_false_never_inits_local_either(
         self, monkeypatch, tmp_path
@@ -625,7 +626,7 @@ class TestEnsureRepoInitialized:
         assert initialized_now is False
         assert err is not None
         assert "not initialized" in err.lower()
-        assert calls == [["cat", "config"]]
+        assert calls == [["cat", "config", "--no-lock"]]
 
     async def test_non_init_error_passes_through(self, monkeypatch):
         # e.g. wrong password — must NOT auto-init regardless of mode.
@@ -695,6 +696,343 @@ class TestIndexRendersScope:
         body = (await resp.get_data()).decode()
         for root in backup_app.BACKUP_ROOTS:
             assert str(root) in body, f"missing BACKUP_ROOTS path {root}"
+
+
+class TestRepoStatsCache:
+    """The /api/repo/stats cache: stamped by backup/delete, served on read.
+
+    The cache is written by folding stats into each mutating path's own DB
+    write (``record_backup`` for a backup, ``delete_snapshot`` for a prune),
+    so there is no standalone save helper to test in isolation.
+    """
+
+    STATS = {
+        "total_size_bytes": 4_200_000_000,
+        "total_uncompressed_size_bytes": 8_800_000_000,
+        "total_blob_count": 12345,
+        "snapshots_count": 37,
+        "compression_ratio": 2.1,
+    }
+
+    def _record_backup(self, repo_stats=None, snapshot_id="a" * 64):
+        backup_app.record_backup(
+            "2026-01-01T00:00:00",
+            "success",
+            snapshot_id=snapshot_id,
+            name="t",
+            repo_stats=repo_stats,
+        )
+
+    def test_record_backup_folds_stats_into_row(self, client):
+        # The backup path stamps the cache in its own INSERT.
+        self._record_backup(repo_stats=self.STATS)
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded is not None
+        for k, v in self.STATS.items():
+            assert loaded[k] == v
+        assert loaded["computed_at"]  # timestamp stamped
+
+    def test_load_returns_none_without_stamp(self, client):
+        # A backup row exists but carried no repo stats.
+        self._record_backup()
+        assert backup_app.load_repo_stats_cache() is None
+
+    async def test_config_repo_change_invalidates_cache(self, client):
+        # Changing the repo URL must drop the cache (it described the old repo).
+        conf = backup_app.load_config()
+        conf["repo"] = "s3:old"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        self._record_backup(repo_stats=self.STATS)
+        assert backup_app.load_repo_stats_cache() is not None
+        resp = await client.post("/api/config", json={"repo": "s3:new"})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is None
+
+    async def test_config_non_repo_change_keeps_cache(self, client):
+        # Changing a non-repo field leaves the cache intact.
+        conf = backup_app.load_config()
+        conf["repo"] = "s3:same"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        self._record_backup(repo_stats=self.STATS)
+        resp = await client.post("/api/config", json={"interval_seconds": 120})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is not None
+        # Re-saving the same repo URL is a no-op for the cache too.
+        resp = await client.post("/api/config", json={"repo": "s3:same"})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is not None
+
+    def test_load_returns_newest_stamped_row(self, client):
+        # An unstamped newer backup must not shadow the last known-good stats.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        self._record_backup(repo_stats=None, snapshot_id="b" * 64)
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded is not None
+        assert loaded["snapshots_count"] == 37
+
+    async def test_api_serves_cache_without_recompute(self, client):
+        self._record_backup(repo_stats=self.STATS)
+        with patch.object(backup_app, "repo_stats", new=AsyncMock()) as mock_stats:
+            resp = await client.get("/api/repo/stats")
+            body = await resp.get_json()
+        assert resp.status_code == 200
+        assert body["ok"] is True
+        assert body["cached"] is True
+        assert body["stats"]["total_size_bytes"] == self.STATS["total_size_bytes"]
+        mock_stats.assert_not_called()  # served from DB, restic never invoked
+
+    async def test_api_computes_live_when_no_cache(self, client):
+        self._record_backup(repo_stats=None)  # row exists but unstamped
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(self.STATS, None))
+        ) as mock_stats:
+            resp = await client.get("/api/repo/stats")
+            body = await resp.get_json()
+        assert resp.status_code == 200
+        assert body["cached"] is False
+        assert body["stats"]["snapshots_count"] == 37
+        mock_stats.assert_called_once()
+        # The live read is not persisted — cache updates only on backup/delete.
+        assert backup_app.load_repo_stats_cache() is None
+
+    async def test_api_refresh_bypasses_cache(self, client):
+        self._record_backup(repo_stats=self.STATS)
+        fresh = {**self.STATS, "total_size_bytes": 5_000_000_000, "snapshots_count": 38}
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(fresh, None))
+        ) as mock_stats:
+            resp = await client.get("/api/repo/stats?refresh=1")
+            body = await resp.get_json()
+        assert resp.status_code == 200
+        assert body["cached"] is False
+        assert body["stats"]["total_size_bytes"] == 5_000_000_000
+        mock_stats.assert_called_once()
+        # Bypass is one-off: the stored cache still holds the old value.
+        assert backup_app.load_repo_stats_cache()["total_size_bytes"] == (
+            self.STATS["total_size_bytes"]
+        )
+
+    async def test_api_error_when_no_cache_and_compute_fails(self, client):
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(None, "boom"))
+        ):
+            resp = await client.get("/api/repo/stats")
+            body = await resp.get_json()
+        assert resp.status_code == 500
+        assert body["ok"] is False
+        assert body["error"] == "boom"
+
+    async def test_delete_snapshot_restamps_surviving_row(self, client):
+        # Two stamped backups; deleting the newer removes its row and re-stamps
+        # the survivor with freshly recomputed stats (refresh awaited inline
+        # under the DELETE lock). delete_snapshot must also leave op_lock free.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        self._record_backup(repo_stats=self.STATS, snapshot_id="b" * 64)
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        after_prune = {**self.STATS, "total_size_bytes": 1_000_000_000, "snapshots_count": 1}
+        with patch.object(
+            backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+        ), patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(after_prune, None))
+        ):
+            ok = await backup_app.delete_snapshot("b" * 64)
+        assert ok is True
+        assert not backup_app.op_lock.busy  # lock released after the delete
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == 1_000_000_000
+        assert loaded["snapshots_count"] == 1
+
+    async def test_delete_snapshot_rejected_when_busy(self, client):
+        # A delete must not proceed while another operation holds op_lock.
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            with patch.object(
+                backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+            ) as mock_restic:
+                ok = await backup_app.delete_snapshot("a" * 64)
+            assert ok is False
+            mock_restic.assert_not_called()  # never ran the prune
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+    async def test_refresh_repo_stats_cache_restamps_newest(self, client):
+        # The background helper on its own: recompute + re-stamp the newest row.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        fresh = {**self.STATS, "total_size_bytes": 1_000_000_000, "snapshots_count": 1}
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(fresh, None))
+        ):
+            await backup_app._refresh_repo_stats_cache()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == 1_000_000_000
+        assert loaded["snapshots_count"] == 1
+
+    async def test_refresh_repo_stats_cache_noop_on_failure(self, client):
+        # If stats can't be computed, the previous stamp is left untouched.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(None, "boom"))
+        ):
+            await backup_app._refresh_repo_stats_cache()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == self.STATS["total_size_bytes"]
+
+
+class TestCheckDoesNotLock:
+    """`restic check` is a read-only scan run with --no-lock, so it takes no
+    restic lock and must NOT claim op_lock — otherwise a long check would block
+    scheduled backups. Mutual exclusion at *start* is enforced by the route."""
+
+    def _configure(self):
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+
+    async def test_check_uses_no_lock_and_never_claims_op_lock(self, client):
+        self._configure()
+        seen = {}
+
+        async def fake_run(args, conf, timeout=None):
+            # cat config probe -> repo exists; check -> record args + lock state.
+            if args and args[0] == "check":
+                seen["args"] = args
+                seen["active"] = backup_app.op_lock.active
+            return 0, b"", b""
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            ok = await backup_app.run_check()
+        assert ok is True
+        assert "--no-lock" in seen["args"]  # takes no restic lock
+        assert seen["active"] is None  # op_lock never claimed during the check
+        assert not backup_app.op_lock.busy
+
+    async def test_check_runs_even_while_op_lock_held(self, client):
+        # run_check itself doesn't gate on op_lock (the route does); it must
+        # still run to completion if invoked while another op holds the lock.
+        self._configure()
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            with patch.object(
+                backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+            ) as mock_restic:
+                ok = await backup_app.run_check()
+            assert ok is True
+            assert mock_restic.called  # not blocked by op_lock
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+    async def test_check_route_rejected_when_busy(self, client):
+        # The *route* refuses to start a check while another op is modifying.
+        self._configure()
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            resp = await client.post("/api/check")
+            assert resp.status_code == 409
+            body = await resp.get_json()
+            assert "backup" in body["error"]
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+
+class TestStatusPush:
+    """The SSE push mechanism behind the live status banner."""
+
+    def test_lock_status_reflects_op_lock(self, client):
+        assert backup_app._lock_status()["busy"] is False
+        backup_app.op_lock.try_acquire(backup_app.OpKind.DELETE)
+        try:
+            s = backup_app._lock_status()
+            assert s["busy"] is True
+            assert s["active_op"] == "delete"
+            assert "delete" in s["busy_message"]
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.DELETE)
+
+    def test_notify_wakes_subscribers(self, client):
+        q: asyncio.Queue = asyncio.Queue()
+        backup_app._status_subscribers.add(q)
+        try:
+            backup_app._notify_status_change()
+            assert q.qsize() == 1
+        finally:
+            backup_app._status_subscribers.discard(q)
+
+    def test_notify_tolerates_full_subscriber_queue(self, client):
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        q.put_nowait(None)  # already full
+        backup_app._status_subscribers.add(q)
+        try:
+            backup_app._notify_status_change()  # must not raise
+            assert q.qsize() == 1
+        finally:
+            backup_app._status_subscribers.discard(q)
+
+
+class TestZoneTagging:
+    """Backups carry openhost + zone:<domain>; the snapshot list keeps this
+    zone's snapshots plus legacy (zone-less) ones and hides other zones'.
+    Falls back to openhost-only when OPENHOST_ZONE_DOMAIN is unset."""
+
+    ZONE = "samuel.selfhost.imbue.com"
+
+    def test_backup_tags_include_zone_when_set(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        assert backup_app._backup_tags() == ["openhost", f"zone:{self.ZONE}"]
+        assert backup_app._backup_tags("nightly") == [
+            "openhost",
+            f"zone:{self.ZONE}",
+            "name:nightly",
+        ]
+
+    def test_in_scope_keeps_mine_and_legacy_hides_foreign(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        assert backup_app._snapshot_in_scope(["openhost", f"zone:{self.ZONE}"])  # mine
+        assert backup_app._snapshot_in_scope(["openhost"])  # legacy, no zone tag
+        assert not backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
+
+    def test_backup_tags_and_scope_fall_back_when_zone_unset(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", "")
+        assert backup_app._backup_tags("nightly") == ["openhost", "name:nightly"]
+        # No zone identity -> everything openhost is in scope.
+        assert backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
+
+    async def test_list_snapshots_includes_legacy_excludes_foreign(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/r"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        snaps = [
+            {"id": "a" * 64, "short_id": "a", "time": "2026-01-03T00:00:00Z",
+             "tags": ["openhost", f"zone:{self.ZONE}"]},          # mine
+            {"id": "b" * 64, "short_id": "b", "time": "2026-01-02T00:00:00Z",
+             "tags": ["openhost"]},                                # legacy
+            {"id": "c" * 64, "short_id": "c", "time": "2026-01-01T00:00:00Z",
+             "tags": ["openhost", "zone:other.example.com"]},      # foreign
+        ]
+
+        async def fake_run(args, conf, timeout=None):
+            if args and args[0] == "snapshots":
+                return 0, json.dumps(snaps).encode(), b""
+            return 0, b"", b""  # cat config probe -> repo exists
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            out, ok = await backup_app.list_snapshots()
+        assert ok is True
+        ids = {s["short_id"] for s in out}
+        assert ids == {"a", "b"}  # mine + legacy, foreign excluded
 
 
 class TestSnapshotBrowsing:

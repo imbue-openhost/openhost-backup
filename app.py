@@ -4,13 +4,14 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from quart import Quart, render_template, request, jsonify
+from quart import Quart, Response, jsonify, render_template, request
 
 import migration
-from operations import OpKind, OperationLock
+from operations import OperationLock, OpKind
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -85,6 +86,46 @@ DEFAULT_CONFIG = {
 SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
+# Backups are tagged ``openhost`` (this app) plus ``zone:<domain>`` so that when
+# several zones share one restic repo, each zone's snapshots — and its repo-size
+# totals — stay distinguishable. When OPENHOST_ZONE_DOMAIN isn't set (local dev,
+# tests) the zone tag is omitted and behaviour matches the old openhost-only
+# scheme.
+def _zone_tag() -> str | None:
+    return f"zone:{ZONE_DOMAIN}" if ZONE_DOMAIN else None
+
+
+def _backup_tags(name: str | None = None) -> list[str]:
+    """Tags applied to a new snapshot: always ``openhost``, plus the zone tag
+    (when known) and an optional ``name:<name>``."""
+    tags = ["openhost"]
+    zone = _zone_tag()
+    if zone:
+        tags.append(zone)
+    if name:
+        tags.append(f"name:{name}")
+    return tags
+
+
+def _snapshot_in_scope(tags: list[str]) -> bool:
+    """Whether a snapshot belongs to this zone's view.
+
+    In scope if it carries this zone's tag, OR carries no zone tag at all —
+    the latter covers *legacy* snapshots written before zone tagging existed
+    (and any run where OPENHOST_ZONE_DOMAIN wasn't set). Only snapshots tagged
+    for a *different* zone are hidden. With no zone configured here, everything
+    is in scope.
+
+    restic ``--tag`` can't express "has no zone tag", so callers filter
+    ``--tag openhost`` at restic and narrow with this in Python.
+    """
+    zone = _zone_tag()
+    if zone is None:
+        return True
+    snapshot_zones = [t for t in tags if t.startswith("zone:")]
+    return not snapshot_zones or zone in snapshot_zones
+
+
 def classify_repo(repo: str) -> dict:
     """Return ``{"type": <label>, "remote": bool, "location": <display>}``.
 
@@ -118,6 +159,7 @@ def classify_repo(repo: str) -> dict:
         repo_path = repo
     return {"type": "local", "remote": False, "location": repo_path}
 
+
 # Single lock for mutual exclusion across backup / restore / migration.
 op_lock = OperationLock()
 
@@ -149,6 +191,57 @@ check_last_at = None
 check_running = False
 
 scheduler_task = None
+
+# Fire-and-forget background tasks (e.g. the post-delete repo-stats refresh).
+# We keep a strong reference until each finishes — asyncio only holds a weak
+# reference to running tasks, so without this a task can be garbage-collected
+# mid-flight and silently cancelled. Each removes itself on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Live operation-status push (Server-Sent Events)
+# ---------------------------------------------------------------------------
+# The status banner reflects op_lock state. Rather than relying only on the
+# UI's slow poll, each connected browser holds an SSE stream (/api/events);
+# op_lock's on_change callback wakes every stream so the banner updates the
+# instant an operation starts or finishes.
+
+# One queue per connected SSE client. A notification pushes a sentinel into
+# each; the stream coroutine wakes, reads the current status, and emits it.
+_status_subscribers: set[asyncio.Queue] = set()
+
+
+def _lock_status() -> dict:
+    """Current op_lock state — the payload the banner needs. Shared by
+    /api/status and the SSE stream so the two never disagree."""
+    active = op_lock.active
+    return {
+        "busy": op_lock.busy,
+        "active_op": active.value if active else None,
+        "busy_message": op_lock.busy_message(),
+    }
+
+
+def _notify_status_change() -> None:
+    """Wake every SSE subscriber so it pushes the new status immediately.
+
+    Runs synchronously from op_lock.try_acquire/release (same event-loop
+    thread), so a non-blocking put_nowait is safe. A full queue already has a
+    pending wake-up, so dropping the extra is fine.
+    """
+    for q in list(_status_subscribers):
+        try:
+            q.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +277,21 @@ def init_db():
         ("total_size_bytes", "ALTER TABLE backups ADD COLUMN total_size_bytes INTEGER"),
         ("file_count", "ALTER TABLE backups ADD COLUMN file_count INTEGER"),
         ("name", "ALTER TABLE backups ADD COLUMN name TEXT"),
+        ("repo_size_bytes", "ALTER TABLE backups ADD COLUMN repo_size_bytes INTEGER"),
+        (
+            "repo_uncompressed_bytes",
+            "ALTER TABLE backups ADD COLUMN repo_uncompressed_bytes INTEGER",
+        ),
+        ("repo_blob_count", "ALTER TABLE backups ADD COLUMN repo_blob_count INTEGER"),
+        (
+            "repo_snapshots_count",
+            "ALTER TABLE backups ADD COLUMN repo_snapshots_count INTEGER",
+        ),
+        (
+            "repo_compression_ratio",
+            "ALTER TABLE backups ADD COLUMN repo_compression_ratio REAL",
+        ),
+        ("repo_stats_at", "ALTER TABLE backups ADD COLUMN repo_stats_at TEXT"),
     ]:
         if col not in columns:
             conn.execute(ddl)
@@ -205,24 +313,60 @@ def record_backup(
     total_size_bytes=None,
     file_count=None,
     name=None,
+    repo_stats=None,
 ):
-    """Insert a backup record into the database."""
+    """Insert a backup record into the database.
+
+    When ``repo_stats`` (a dict from ``repo_stats()``) is supplied, the
+    repo-wide size cache is written into the *same* INSERT, so a successful
+    backup records both its per-run figures and the current repo footprint
+    in one row — no separate connection or ``MAX(id)`` update needed. The
+    delete path, which has no INSERT to piggyback on, instead re-stamps the
+    newest surviving row inline (see ``delete_snapshot``).
+    """
+    cols = [
+        "timestamp",
+        "status",
+        "error_message",
+        "snapshot_id",
+        "data_added_bytes",
+        "total_size_bytes",
+        "file_count",
+        "name",
+    ]
+    vals = [
+        timestamp,
+        status,
+        error_message,
+        snapshot_id,
+        data_added_bytes,
+        total_size_bytes,
+        file_count,
+        name,
+    ]
+    if repo_stats is not None:
+        cols += [
+            "repo_size_bytes",
+            "repo_uncompressed_bytes",
+            "repo_blob_count",
+            "repo_snapshots_count",
+            "repo_compression_ratio",
+            "repo_stats_at",
+        ]
+        vals += [
+            repo_stats.get("total_size_bytes"),
+            repo_stats.get("total_uncompressed_size_bytes"),
+            repo_stats.get("total_blob_count"),
+            repo_stats.get("snapshots_count"),
+            repo_stats.get("compression_ratio"),
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ]
+    placeholders = ", ".join(["?"] * len(vals))
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO backups (timestamp, status, error_message, snapshot_id, "
-            "data_added_bytes, total_size_bytes, file_count, name) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                timestamp,
-                status,
-                error_message,
-                snapshot_id,
-                data_added_bytes,
-                total_size_bytes,
-                file_count,
-                name,
-            ),
+            f"INSERT INTO backups ({', '.join(cols)}) VALUES ({placeholders})",
+            vals,
         )
         conn.commit()
     finally:
@@ -239,6 +383,63 @@ def get_last_backup():
         if row:
             return {"timestamp": row[0], "status": row[1], "error_message": row[2]}
         return None
+    finally:
+        conn.close()
+
+
+def load_repo_stats_cache() -> dict | None:
+    """Return the last cached repo stats (newest stamped row), or None.
+
+    The cache is written by whoever changes the repo footprint, folded into
+    that operation's own DB write — ``record_backup`` for a backup,
+    ``delete_snapshot`` for a prune — so there is no standalone writer here.
+    Keys mirror what ``repo_stats()`` returns so /api/repo/stats can serve
+    this verbatim, plus ``computed_at`` so the UI can show its age.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT repo_size_bytes, repo_uncompressed_bytes, repo_blob_count, "
+            "repo_snapshots_count, repo_compression_ratio, repo_stats_at "
+            "FROM backups WHERE repo_stats_at IS NOT NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        logger.exception("Failed to read cached repo stats")
+        return None
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {
+        "total_size_bytes": row[0],
+        "total_uncompressed_size_bytes": row[1],
+        "total_blob_count": row[2],
+        "snapshots_count": row[3],
+        "compression_ratio": row[4],
+        "computed_at": row[5],
+    }
+
+
+def invalidate_repo_stats_cache() -> None:
+    """Drop the cached repo-size stamp from every backup row.
+
+    The cache describes a specific repository; call this when the configured
+    repo changes so ``load_repo_stats_cache`` returns ``None`` and the next
+    ``/api/repo/stats`` read computes live against the new repo instead of
+    serving the old repo's size. Leaves the backup history itself untouched —
+    only the auxiliary ``repo_stats_*`` columns are cleared.
+    """
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE backups SET repo_size_bytes = NULL, "
+            "repo_uncompressed_bytes = NULL, repo_blob_count = NULL, "
+            "repo_snapshots_count = NULL, repo_compression_ratio = NULL, "
+            "repo_stats_at = NULL WHERE repo_stats_at IS NOT NULL"
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Failed to invalidate repo stats cache")
     finally:
         conn.close()
 
@@ -312,10 +513,7 @@ async def _verify_admin_token(supplied: str | None) -> bool:
                 f"{ROUTER_URL}/api/apps",
                 headers={"Authorization": f"Bearer {supplied}"},
             )
-            return (
-                r.status_code == 200
-                and "json" in r.headers.get("content-type", "")
-            )
+            return r.status_code == 200 and "json" in r.headers.get("content-type", "")
     except Exception:
         logger.exception("Admin token verification failed")
         return False
@@ -350,8 +548,16 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
     Raises asyncio.TimeoutError if the subprocess exceeds ``timeout``. On
     either timeout OR task cancellation, the subprocess is killed so we
     don't leak a live restic process holding the repo lock.
+
+    Every invocation is logged at INFO (command on start, exit code +
+    elapsed time on completion) so the app's console — ``oh app logs
+    backup`` — shows exactly what restic ran. The args never carry secrets:
+    the repo URL and password go through the environment (see
+    ``_restic_env``), not argv.
     """
     env = _restic_env(conf)
+    logger.info("restic %s", " ".join(args))
+    started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         "restic",
         *args,
@@ -361,7 +567,13 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
+    except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+        logger.warning(
+            "restic %s killed after %.1fs (%s)",
+            args[0] if args else "?",
+            time.monotonic() - started,
+            type(e).__name__,
+        )
         try:
             proc.kill()
         except ProcessLookupError:
@@ -372,6 +584,12 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
         except Exception:
             pass
         raise
+    logger.info(
+        "restic %s -> rc=%s (%.1fs)",
+        args[0] if args else "?",
+        proc.returncode,
+        time.monotonic() - started,
+    )
     return proc.returncode, stdout, stderr
 
 
@@ -424,7 +642,13 @@ async def ensure_repo_initialized(
     async with _init_lock:
         # `cat config` is a cheap way to confirm the repo exists and the password
         # is correct. It returns non-zero on either missing repo or wrong password.
-        rc, _stdout, stderr = await _run_restic(["cat", "config"], conf, timeout=30)
+        # --no-lock: this is a pure read (existence/password probe), so it must
+        # not take a restic repo lock — that keeps the invariant "op_lock is
+        # held whenever a restic lock is held" true without gating this behind
+        # op_lock, and lets it run even while a prune holds the exclusive lock.
+        rc, _stdout, stderr = await _run_restic(
+            ["cat", "config", "--no-lock"], conf, timeout=30
+        )
         if rc == 0:
             return False, None
 
@@ -452,7 +676,10 @@ async def ensure_repo_initialized(
                 Path(info["location"]).parent.mkdir(parents=True, exist_ok=True)
             rc2, _out2, err2 = await _run_restic(["init"], conf, timeout=60)
             if rc2 != 0:
-                return False, f"restic init failed: {err2.decode(errors='replace').strip()}"
+                return (
+                    False,
+                    f"restic init failed: {err2.decode(errors='replace').strip()}",
+                )
             return True, None
         return False, f"restic repo check failed: {err}"
 
@@ -467,19 +694,24 @@ async def _restic_unlock_if_stale(conf: dict) -> None:
     matching the current hostname and silently leave the stale one behind).
     """
     try:
-        rc, stdout, stderr = await _run_restic(["unlock", "--remove-all"], conf, timeout=30)
+        rc, stdout, stderr = await _run_restic(
+            ["unlock", "--remove-all"], conf, timeout=30
+        )
         if rc == 0:
-            out = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            out = (
+                stdout.decode(errors="replace") + stderr.decode(errors="replace")
+            ).strip()
             if out:
                 logger.info("restic unlock --remove-all: %s", out)
             else:
                 logger.info("restic unlock --remove-all: no stale locks found")
         else:
-            err = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+            err = (
+                stdout.decode(errors="replace") + stderr.decode(errors="replace")
+            ).strip()
             logger.warning("restic unlock --remove-all failed (rc=%d): %s", rc, err)
     except Exception:
         logger.warning("restic unlock failed on startup", exc_info=True)
-
 
 
 async def test_restic_connection(
@@ -494,8 +726,12 @@ async def test_restic_connection(
     lines — are already in our buffer.
     """
     env = _restic_env(conf)
+    logger.info("restic cat config (connection test, timeout=%.0fs)", timeout)
     proc = await asyncio.create_subprocess_exec(
-        "restic", "cat", "config",
+        "restic",
+        "cat",
+        "config",
+        "--no-lock",  # pure read: never take a restic repo lock (see invariant)
         env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -549,7 +785,11 @@ def _classify_restic_test(
     if returncode == 0 and not timed_out:
         return True, "Connection OK", output or "(no output)"
     if not timed_out and "repository does not exist" in output.lower():
-        return True, "Reachable — no repository at this location yet (a backup will create it)", output
+        return (
+            True,
+            "Reachable — no repository at this location yet (a backup will create it)",
+            output,
+        )
     return False, "Connection failed", output or f"restic exited with code {returncode}"
 
 
@@ -564,7 +804,7 @@ def _build_restic_debug(conf: dict) -> dict:
     env = _restic_env(conf)
     # Only the keys restic actually reads from us, not the whole process env.
     keys: list[str] = ["RESTIC_REPOSITORY", "RESTIC_PASSWORD"]
-    for k in (conf.get("env") or {}):
+    for k in conf.get("env") or {}:
         if k not in keys:
             keys.append(k)
     entries = []
@@ -613,18 +853,15 @@ async def run_backup(name: str | None = None) -> bool:
             logger.error("Backup failed: %s", init_err)
             return False
 
-        tags = ["openhost"]
-        if name:
-            tags.append(f"name:{name}")
+        tags = _backup_tags(name)
 
         # Back up every mounted root (app_data, app_temp_data, vm_data).
         # Skip ones that aren't present — this keeps the app usable on
         # instances that only grant a subset of data permissions.
         roots = [p for p in BACKUP_ROOTS if p.is_dir()]
         if not roots:
-            msg = (
-                "No backup roots available — expected one of: "
-                + ", ".join(str(p) for p in BACKUP_ROOTS)
+            msg = "No backup roots available — expected one of: " + ", ".join(
+                str(p) for p in BACKUP_ROOTS
             )
             record_backup(timestamp, "error", msg, name=name)
             logger.error(msg)
@@ -645,7 +882,9 @@ async def run_backup(name: str | None = None) -> bool:
         # is generous for large instances but still finite — a wedged S3
         # connection would otherwise hold the op lock forever.
         try:
-            rc, stdout, stderr = await _run_restic(args, conf, timeout=BACKUP_TIMEOUT_SECONDS)
+            rc, stdout, stderr = await _run_restic(
+                args, conf, timeout=BACKUP_TIMEOUT_SECONDS
+            )
         except asyncio.TimeoutError:
             msg = f"restic backup timed out after {BACKUP_TIMEOUT_SECONDS}s"
             record_backup(timestamp, "error", msg, name=name)
@@ -665,28 +904,37 @@ async def run_backup(name: str | None = None) -> bool:
                 if line.strip():
                     logger.info("restic stderr: %s", line)
 
-        if rc == 0 and summary is not None:
+        if rc == 0:
+            # Backup succeeded. Compute the repo footprint now, while we
+            # still hold the op lock (so the stats read stays serialized),
+            # and fold it into the same row record_backup inserts — no
+            # second connection or MAX(id) update. repo_stats() is
+            # best-effort and never raises; on failure repo_stats_data is
+            # None and the row just carries no fresh cache (the reader falls
+            # back to the previous stamped row).
+            repo_stats_data, _ = await repo_stats()
             record_backup(
                 timestamp,
                 "success",
-                snapshot_id=summary.get("snapshot_id"),
-                data_added_bytes=summary.get("data_added"),
-                total_size_bytes=summary.get("total_bytes_processed"),
-                file_count=summary.get("total_files_processed"),
+                snapshot_id=summary.get("snapshot_id") if summary else None,
+                data_added_bytes=summary.get("data_added") if summary else None,
+                total_size_bytes=(
+                    summary.get("total_bytes_processed") if summary else None
+                ),
+                file_count=summary.get("total_files_processed") if summary else None,
                 name=name,
+                repo_stats=repo_stats_data,
             )
-            logger.info(
-                "Backup completed: snapshot=%s data_added=%s total=%s",
-                summary.get("snapshot_id", "?"),
-                summary.get("data_added", "?"),
-                summary.get("total_bytes_processed", "?"),
-            )
-            return True
-
-        if rc == 0:
-            # Succeeded but we somehow missed the summary line.
-            record_backup(timestamp, "success", name=name)
-            logger.info("Backup completed (no summary parsed)")
+            if summary is not None:
+                logger.info(
+                    "Backup completed: snapshot=%s data_added=%s total=%s",
+                    summary.get("snapshot_id", "?"),
+                    summary.get("data_added", "?"),
+                    summary.get("total_bytes_processed", "?"),
+                )
+            else:
+                # Succeeded but we somehow missed the summary line.
+                logger.info("Backup completed (no summary parsed)")
             return True
 
         error_msg = stderr.decode(errors="replace").strip() or f"restic exit code {rc}"
@@ -725,26 +973,34 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         logger.info("list_snapshots: %s", init_err)
         return [], False
     try:
-        # Scope to the "openhost" tag so, if the user points this app at a
-        # repo shared with other hosts/projects, we only surface snapshots
-        # written by this app. Backups are created with --tag openhost in
-        # run_backup.
+        # Filter to this app's snapshots (openhost) at restic, then narrow to
+        # this zone in Python: keep this zone's snapshots plus legacy ones with
+        # no zone tag, and drop snapshots belonging to a *different* zone. This
+        # keeps pre-zone-tag snapshots readable while still isolating zones that
+        # share a repo. See _snapshot_in_scope.
         rc, stdout, stderr = await _run_restic(
-            ["snapshots", "--json", "--tag", "openhost"], conf, timeout=60
+            ["snapshots", "--json", "--tag", "openhost", "--no-lock"],
+            conf,
+            timeout=60,
         )
         if rc != 0:
-            logger.error("restic snapshots failed: %s", stderr.decode(errors="replace").strip())
+            logger.error(
+                "restic snapshots failed: %s", stderr.decode(errors="replace").strip()
+            )
             return [], False
         entries = json.loads(stdout.decode(errors="replace") or "[]")
         out = []
         for e in entries:
+            tags = e.get("tags", []) or []
+            if not _snapshot_in_scope(tags):
+                continue
             out.append(
                 {
                     "id": e.get("id", ""),
                     "short_id": e.get("short_id", ""),
                     "time": e.get("time", ""),
                     "paths": e.get("paths", []),
-                    "tags": e.get("tags", []) or [],
+                    "tags": tags,
                     "hostname": e.get("hostname", ""),
                 }
             )
@@ -760,31 +1016,30 @@ async def repo_stats() -> tuple[dict | None, str | None]:
     """Return (stats, error) — how much space the restic repo is using.
 
     Uses ``restic stats --mode raw-data`` which reports the deduplicated /
-    compressed on-disk footprint of the repository (this is the number
-    that matters for S3 cost / local disk usage). Also scopes to the
-    openhost tag so a shared repo isn't double-counted with unrelated
-    snapshots.
+    compressed on-disk footprint of the repository (this is the number that
+    matters for S3 cost / local disk usage). Scopes to the ``openhost`` tag —
+    the *total* app footprint across zones. We intentionally don't narrow to a
+    single zone here: restic dedups blobs across all snapshots, so per-zone
+    size attribution is ill-defined, and the cost-relevant number is the whole
+    openhost footprint (which also naturally includes legacy snapshots).
     """
-    conf = load_config()
-    if not conf.get("repo") or not conf.get("repo_password"):
-        return None, "Restic repo not configured"
-    # Auto-init only for local repos (see list_snapshots for the rationale).
-    init_err = (await ensure_repo_initialized(conf))[1]
-    if init_err:
-        return None, init_err
     try:
+        conf = load_config()
+        if not conf.get("repo") or not conf.get("repo_password"):
+            return None, "Restic repo not configured"
+        # Auto-init only for local repos (see list_snapshots for the rationale).
+        init_err = (await ensure_repo_initialized(conf))[1]
+        if init_err:
+            return None, init_err
         rc, stdout, stderr = await _run_restic(
-            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost"],
+            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost", "--no-lock"],
             conf,
             timeout=60,
         )
         if rc != 0:
             return None, stderr.decode(errors="replace").strip() or f"restic exit {rc}"
         data = json.loads(stdout.decode(errors="replace") or "{}")
-        # raw-data mode returns total_size / total_blob_count / snapshots_count
-        # and compression stats. It does NOT return total_file_count (that
-        # only exists for restore-size / files-by-contents). We surface
-        # total_size because that's the actual on-disk / S3 footprint.
+        # Returns stats on compressed binary blobs, not original content
         return {
             "total_size_bytes": data.get("total_size", 0),
             "total_uncompressed_size_bytes": data.get("total_uncompressed_size", 0),
@@ -892,7 +1147,7 @@ async def _roots_from_snapshot_metadata(
     """
     try:
         rc, stdout, _stderr = await _run_restic(
-            ["snapshots", "--json", snapshot_id], conf, timeout=60
+            ["snapshots", "--json", snapshot_id, "--no-lock"], conf, timeout=60
         )
     except Exception:
         return None
@@ -934,7 +1189,7 @@ async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):
         return roots
     present: list[dict] = []
     for name, path in _ROOT_NAMES.items():
-        args = ["ls", "--json", snapshot_id, str(path)]
+        args = ["ls", "--json", snapshot_id, str(path), "--no-lock"]
         try:
             rc, _stdout, _stderr = await _run_restic(args, conf, timeout=60)
         except Exception:
@@ -981,7 +1236,8 @@ async def list_snapshot_files(
     if subpath:
         target_path = target_path.rstrip("/") + "/" + subpath
 
-    args = ["ls", "--json", snapshot_id, target_path]
+    args = ["ls", "--json", snapshot_id, target_path, "--no-lock"]
+
     files: list[dict] = []
     target_norm = target_path.rstrip("/")
 
@@ -1035,49 +1291,106 @@ async def delete_snapshot(snapshot_id: str) -> bool:
     immediately. Prune on a large repo can be slow (several minutes on an
     S3 repo with a lot of data) — we set a generous but bounded timeout so
     a wedged prune can't permanently hold the UI.
+
+    Holds ``op_lock`` for its whole span (prune + DB cleanup + stats refresh)
+    so a delete is a first-class operation: it shows in the status banner and
+    mutually excludes backup/restore/migration. The route fires this via
+    ``_spawn_background`` and returns immediately, so the prune runs in the
+    background and the user tracks it through the banner.
     """
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return False
-    try:
-        rc, _out, stderr = await _run_restic(
-            ["forget", "--prune", snapshot_id], conf, timeout=30 * 60
-        )
-        if rc != 0:
-            logger.warning(
-                "restic forget failed for %s: %s",
-                snapshot_id,
-                stderr.decode(errors="replace").strip(),
-            )
-            return False
-    except Exception:
-        logger.exception("restic forget failed")
-        return False
 
-    # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
-    # that restic emits in its --json summary, so an exact match on the
-    # user-supplied ID is sufficient when they pass a full ID. When they
-    # pass a short (8-char) ID, match by prefix with length >= 8 to avoid
-    # accidental matches on arbitrary substrings.
+    err = op_lock.try_acquire(OpKind.DELETE)
+    if err:
+        logger.warning("Skipping delete: %s", err)
+        return False
+    try:
+        try:
+            rc, _out, stderr = await _run_restic(
+                ["forget", "--prune", snapshot_id], conf, timeout=30 * 60
+            )
+            if rc != 0:
+                logger.warning(
+                    "restic forget failed for %s: %s",
+                    snapshot_id,
+                    stderr.decode(errors="replace").strip(),
+                )
+                return False
+        except Exception:
+            logger.exception("restic forget failed")
+            return False
+
+        # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
+        # that restic emits in its --json summary, so an exact match on the
+        # user-supplied ID is sufficient when they pass a full ID. When they
+        # pass a short (8-char) ID, match by prefix with length >= 8 to avoid
+        # accidental matches on arbitrary substrings.
+        conn = get_db()
+        try:
+            if len(snapshot_id) >= 40:
+                conn.execute(
+                    "DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,)
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
+                    (len(snapshot_id), snapshot_id),
+                )
+            conn.commit()
+        except sqlite3.Error:
+            # The restic forget already succeeded; don't fail the operation.
+            logger.exception("DB cleanup failed for snapshot %s", snapshot_id)
+        finally:
+            conn.close()
+
+        # The prune reclaimed space, so the cached repo size is now stale.
+        # Awaited inline (we hold the lock and the request has already
+        # returned) so the banner stays up until the size is current.
+        await _refresh_repo_stats_cache()
+
+        logger.info("Deleted snapshot %s", snapshot_id)
+        return True
+    finally:
+        op_lock.release(OpKind.DELETE)
+
+
+async def _refresh_repo_stats_cache() -> None:
+    """Recompute the repo footprint and re-stamp it onto the newest backup row.
+
+    Runs as a background task after a delete/prune so the expensive
+    ``restic stats`` read stays off the request path. Best-effort: on any
+    failure (stats unavailable, no rows to stamp, DB error) the cache simply
+    isn't refreshed and readers fall back to the previous stamped row.
+
+    Unlike a backup (which folds its stats into its own INSERT), a delete has
+    no row of its own, so we re-stamp the newest *surviving* row via MAX(id).
+    """
+    repo_stats_data = (await repo_stats())[0]
+    if repo_stats_data is None:
+        return
     conn = get_db()
     try:
-        if len(snapshot_id) >= 40:
-            conn.execute(
-                "DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,)
-            )
-        else:
-            conn.execute(
-                "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
-                (len(snapshot_id), snapshot_id),
-            )
+        conn.execute(
+            "UPDATE backups SET repo_size_bytes = ?, repo_uncompressed_bytes = ?, "
+            "repo_blob_count = ?, repo_snapshots_count = ?, "
+            "repo_compression_ratio = ?, repo_stats_at = ? "
+            "WHERE id = (SELECT MAX(id) FROM backups)",
+            (
+                repo_stats_data.get("total_size_bytes"),
+                repo_stats_data.get("total_uncompressed_size_bytes"),
+                repo_stats_data.get("total_blob_count"),
+                repo_stats_data.get("snapshots_count"),
+                repo_stats_data.get("compression_ratio"),
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+        )
         conn.commit()
     except sqlite3.Error:
-        # The restic forget already succeeded; don't fail the operation.
-        logger.exception("DB cleanup failed for snapshot %s", snapshot_id)
+        logger.exception("Failed to re-stamp repo stats cache after delete")
     finally:
         conn.close()
-    logger.info("Deleted snapshot %s", snapshot_id)
-    return True
 
 
 def get_backup_history(limit=20, offset=0):
@@ -1153,9 +1466,7 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
         op_lock.release(OpKind.RESTORE)
         return False
 
-    logger.info(
-        "Starting restic restore from %s (root=%s)", snapshot_id, root or "all"
-    )
+    logger.info("Starting restic restore from %s (root=%s)", snapshot_id, root or "all")
 
     try:
         args = [
@@ -1190,9 +1501,7 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
             restore_last_status = "success"
             logger.info("Restore completed successfully")
         else:
-            restore_last_status = (
-                f"error: {stderr.decode(errors='replace').strip() or f'restic exit {rc}'}"
-            )
+            restore_last_status = f"error: {stderr.decode(errors='replace').strip() or f'restic exit {rc}'}"
             logger.error("Restore failed: %s", restore_last_status)
     except Exception as e:
         restore_last_status = f"error: {e}"
@@ -1211,10 +1520,14 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
 async def run_check() -> bool:
     """Run `restic check`. Updates module-level state.
 
-    Note: this coroutine doesn't take ``op_lock`` itself — callers (the
-    HTTP route) are expected to gate on both ``op_lock.busy`` and
-    ``check_running`` to avoid colliding with backup/restore or another
-    concurrent check. restic itself acquires its own repo-level lock.
+    Runs with ``--no-lock`` so the check takes no restic repo lock — it's a
+    read-only integrity scan and can be long (up to 2h), so claiming the
+    exclusive ``op_lock`` would needlessly block scheduled backups (which
+    restic itself would let run concurrently). Because it holds no restic lock,
+    the "op_lock held whenever a restic lock is held" invariant is satisfied
+    without op_lock. Mutual exclusion is handled by the caller: the /api/check
+    route rejects a check while another operation holds op_lock, and
+    ``check_running`` prevents two checks at once.
     """
     global check_last_status, check_last_output, check_last_at, check_running
     # Set the flag inside the try so that any exception from load_config /
@@ -1241,7 +1554,7 @@ async def run_check() -> bool:
             return False
         try:
             rc, stdout, stderr = await _run_restic(
-                ["check"], conf, timeout=CHECK_TIMEOUT_SECONDS
+                ["check", "--no-lock"], conf, timeout=CHECK_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
             check_last_status = "error"
@@ -1249,7 +1562,9 @@ async def run_check() -> bool:
             check_last_at = datetime.now(timezone.utc).isoformat()
             logger.error(check_last_output)
             return False
-        output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+        output = (
+            stdout.decode(errors="replace") + stderr.decode(errors="replace")
+        ).strip()
         check_last_output = output[-4000:]  # cap
         check_last_at = datetime.now(timezone.utc).isoformat()
         if rc == 0:
@@ -1321,6 +1636,9 @@ async def startup():
     global scheduler_task
     init_db()
     ensure_default_config()
+    # Push op_lock transitions to connected SSE clients so the status banner
+    # updates the instant an operation starts or finishes.
+    op_lock.set_on_change(_notify_status_change)
     # Best-effort unlock in case a previous run died mid-operation.
     try:
         conf = load_config()
@@ -1470,6 +1788,11 @@ async def post_config():
                 error="Bearer token required to rotate router_api_token",
             ), 401
 
+    # The cached repo size describes whatever repo was configured. If the repo
+    # URL changes, that figure belongs to the old repo, so remember the old
+    # value now (before we overwrite it) to invalidate the cache below.
+    old_repo = current_conf.get("repo", "")
+
     conf = current_conf
     for key in ("repo", "repo_password", "router_api_token"):
         if key in data:
@@ -1477,16 +1800,20 @@ async def post_config():
     if "env" in data:
         if not isinstance(data["env"], dict):
             return jsonify(ok=False, error="'env' must be an object"), 400
-        conf["env"] = {k: str(v) for k, v in data["env"].items() if v != "" and v is not None}
+        conf["env"] = {
+            k: str(v) for k, v in data["env"].items() if v != "" and v is not None
+        }
     if "interval_seconds" in data:
         try:
             interval = int(data["interval_seconds"])
         except (TypeError, ValueError):
-            return jsonify(
-                ok=False, error="interval_seconds must be an integer"
-            ), 400
+            return jsonify(ok=False, error="interval_seconds must be an integer"), 400
         conf["interval_seconds"] = 0 if interval <= 0 else max(60, interval)
     save_config(conf)
+    # Pointing at a different repo makes the cached size stale — drop it so the
+    # next /api/repo/stats read computes live against the new repo.
+    if conf.get("repo", "") != old_repo:
+        invalidate_repo_stats_cache()
     return jsonify(ok=True)
 
 
@@ -1528,7 +1855,7 @@ async def api_repo_test():
 @route("/api/backup", methods=["POST"])
 async def trigger_backup():
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     data = await request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip() or None
     asyncio.create_task(run_backup(name=name))
@@ -1543,12 +1870,55 @@ async def status():
         running=op_lock.backup_running,
         migration_running=op_lock.migration_running,
         restore_running=op_lock.restore_running,
+        delete_running=op_lock.delete_running,
+        # Generic lock state so the UI can render one always-on banner for
+        # whatever operation currently holds op_lock, without knowing each kind.
+        **_lock_status(),
         last_backup=last["timestamp"] if last else None,
         last_status=last["status"] if last else None,
         last_error=last["error_message"] if last else None,
         interval_seconds=conf["interval_seconds"],
         repo=conf.get("repo", ""),
         backend=classify_repo(conf.get("repo", "")),
+    )
+
+
+@route("/api/events")
+async def events():
+    """Server-Sent Events stream of op_lock state.
+
+    Emits the current status on connect, then again on every lock transition
+    (pushed via ``_notify_status_change``), with a periodic comment keepalive
+    so idle connections survive proxies. The UI uses this to update the banner
+    instantly; its slow poll is only a fallback.
+    """
+
+    async def stream():
+        q: asyncio.Queue = asyncio.Queue()
+        _status_subscribers.add(q)
+        try:
+            yield f"data: {json.dumps(_lock_status())}\n\n"
+            while True:
+                try:
+                    await asyncio.wait_for(q.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                # Coalesce a burst of notifications into one status emit.
+                while not q.empty():
+                    q.get_nowait()
+                yield f"data: {json.dumps(_lock_status())}\n\n"
+        finally:
+            _status_subscribers.discard(q)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Disable proxy buffering (nginx) so events aren't held back.
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -1560,16 +1930,28 @@ async def api_snapshots():
 
 @route("/api/repo/stats")
 async def api_repo_stats():
+    # Serve the cached value stamped by the last backup/delete — running
+    # `restic stats` on every request is slow enough to 504 behind the proxy
+    # on large repos. `?refresh=1` bypasses the cache for a one-off live read
+    # (used e.g. when the repo was changed out of band); it does not persist —
+    # the stored cache updates only on the next backup or delete.
+    force = request.args.get("refresh") in ("1", "true", "yes")
+    if not force:
+        cached = load_repo_stats_cache()
+        if cached is not None:
+            return jsonify(ok=True, stats=cached, cached=True)
+    # No cache yet (fresh install, or first load before any backup) or a
+    # forced refresh: compute live.
     stats, error = await repo_stats()
     if error:
         return jsonify(ok=False, error=error), 500
-    return jsonify(ok=True, stats=stats)
+    return jsonify(ok=True, stats=stats, cached=False)
 
 
 @route("/api/restore", methods=["POST"])
 async def trigger_restore():
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     data = await request.get_json()
     snapshot_id = data.get("snapshot", "")
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
@@ -1621,22 +2003,21 @@ async def snapshot_delete():
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
         return jsonify(ok=False, error="Invalid snapshot id"), 400
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
-    try:
-        ok = await delete_snapshot(snapshot_id)
-        return jsonify(ok=ok)
-    except Exception as e:
-        logger.exception("Failed to delete snapshot")
-        return jsonify(ok=False, error=str(e)), 500
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
+    # Run the prune in the background (it can take minutes) and return
+    # immediately. delete_snapshot acquires op_lock(DELETE), so the status
+    # banner reflects it and other operations get a clean busy rejection; the
+    # UI watches the banner and refreshes the snapshot list when it clears.
+    _spawn_background(delete_snapshot(snapshot_id))
+    return jsonify(ok=True, message="Delete started")
 
 
 @route("/api/check", methods=["POST"])
 async def trigger_check():
-    # `restic check` is read-only from the data's perspective but it does
-    # acquire a repo lock, so don't run it on top of a backup/restore, and
-    # don't spawn a second check if one is already in flight.
+    # run_check runs `restic check --no-lock`, so it holds no repo lock and
+    # doesn't claim op_lock
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     if check_running:
         return jsonify(ok=False, error="check already running"), 409
     asyncio.create_task(run_check())
@@ -1804,7 +2185,12 @@ async def chown_app_data():
     target_uid = 1000
     target_gid = 1000
     app_data = str(ALL_APP_DATA)
-    logger.info("chown -R %s:%s %s (skipping subuid-mapped files)", target_uid, target_gid, app_data)
+    logger.info(
+        "chown -R %s:%s %s (skipping subuid-mapped files)",
+        target_uid,
+        target_gid,
+        app_data,
+    )
 
     count = 0
     skipped = 0
@@ -1835,7 +2221,9 @@ async def chown_app_data():
             _chown_one(os.path.join(root, name))
     _chown_one(app_data)
 
-    logger.info("chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors)
+    logger.info(
+        "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
+    )
     return jsonify(
         ok=True,
         message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid}); "
