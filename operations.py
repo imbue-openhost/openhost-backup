@@ -45,6 +45,20 @@ class OperationLock:
     def busy(self) -> bool:
         return self._active is not None
 
+    def busy_message(self) -> str | None:
+        """User-facing explanation of the current operation, or ``None`` if idle.
+
+        Single source of the wording used both by the UI status banner and by
+        routes that reject a request because another operation holds the lock,
+        so the two never drift.
+        """
+        if self._active is None:
+            return None
+        return (
+            f"A {self._active.value} is in progress — other operations "
+            f"are paused until it finishes."
+        )
+
     def try_acquire(self, kind: OpKind) -> str | None:
         """Try to start *kind*.
 
@@ -52,7 +66,7 @@ class OperationLock:
         error-message string explaining why it couldn't be acquired.
         """
         if self._active is not None:
-            return f"{self._active.value} in progress"
+            return self.busy_message()
         self._active = kind
         self._last_activity = time.monotonic()
         return None

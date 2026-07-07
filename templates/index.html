@@ -91,6 +91,12 @@
 <body>
     <h1>Backup</h1>
 
+    <!-- Permanent operation banner. Reflects op_lock state from /api/status
+         (backup / restore / migration) so the user always sees when the repo
+         is busy and that other operations are paused. Populated by
+         pollLockBanner(); hidden while idle. -->
+    <div id="lock-banner" role="status" aria-live="polite" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.9rem;color:#92400e;font-weight:500;"></div>
+
     <div class="tab-bar">
         <button class="tab-btn active" onclick="showPage('backup')">Backups</button>
         <button class="tab-btn" onclick="showPage('migrate')">Migrate</button>
@@ -1227,6 +1233,40 @@
             };
             poll();
         }
+
+        // Permanent operation banner. Polls /api/status and reflects whatever
+        // operation currently holds the shared lock, so the user always sees
+        // when the repo is busy and that other operations are paused. Polls
+        // faster while busy; on the busy -> idle edge it refreshes the views
+        // that a just-finished operation may have changed.
+        async function pollLockBanner() {
+            const el = document.getElementById("lock-banner");
+            if (!el) return;
+            let wasBusy = false;
+            const tick = async () => {
+                let busy = false;
+                let msg = "";
+                try {
+                    const res = await api("/api/status");
+                    busy = !!res.busy;
+                    msg = res.busy_message
+                        || "An operation is in progress — other operations are paused until it finishes.";
+                } catch (e) {
+                    busy = false;
+                }
+                if (busy) {
+                    el.textContent = "⏳ " + msg;
+                    el.style.display = "block";
+                } else {
+                    el.style.display = "none";
+                    if (wasBusy) { loadSnapshots(); loadRepoStats(); }
+                }
+                wasBusy = busy;
+                setTimeout(tick, busy ? 2000 : 6000);
+            };
+            tick();
+        }
+        pollLockBanner();
 
         // Auto-load snapshots + repo stats on page load (only if configured).
         {% if config.repo %}

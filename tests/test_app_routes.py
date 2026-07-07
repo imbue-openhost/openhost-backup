@@ -6,6 +6,7 @@ Quart test client.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -797,8 +798,10 @@ class TestRepoStatsCache:
         assert body["error"] == "boom"
 
     async def test_delete_snapshot_restamps_surviving_row(self, client):
-        # Two stamped backups; deleting the newer must re-stamp the survivor
-        # with freshly recomputed stats (the delete path's inline UPDATE).
+        # Two stamped backups; deleting the newer removes its row and spawns a
+        # background refresh that re-stamps the survivor with freshly recomputed
+        # stats. delete_snapshot returns before the refresh runs (it's off the
+        # request path now), so we await the spawned task before asserting.
         self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
         self._record_backup(repo_stats=self.STATS, snapshot_id="b" * 64)
         conf = backup_app.load_config()
@@ -812,7 +815,31 @@ class TestRepoStatsCache:
             backup_app, "repo_stats", new=AsyncMock(return_value=(after_prune, None))
         ):
             ok = await backup_app.delete_snapshot("b" * 64)
+            # The refresh runs in a tracked background task; drain it.
+            await asyncio.gather(*backup_app._background_tasks)
         assert ok is True
         loaded = backup_app.load_repo_stats_cache()
         assert loaded["total_size_bytes"] == 1_000_000_000
         assert loaded["snapshots_count"] == 1
+
+    async def test_refresh_repo_stats_cache_restamps_newest(self, client):
+        # The background helper on its own: recompute + re-stamp the newest row.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        fresh = {**self.STATS, "total_size_bytes": 1_000_000_000, "snapshots_count": 1}
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(fresh, None))
+        ):
+            await backup_app._refresh_repo_stats_cache()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == 1_000_000_000
+        assert loaded["snapshots_count"] == 1
+
+    async def test_refresh_repo_stats_cache_noop_on_failure(self, client):
+        # If stats can't be computed, the previous stamp is left untouched.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(None, "boom"))
+        ):
+            await backup_app._refresh_repo_stats_cache()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == self.STATS["total_size_bytes"]

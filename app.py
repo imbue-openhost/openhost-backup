@@ -152,6 +152,19 @@ check_running = False
 
 scheduler_task = None
 
+# Fire-and-forget background tasks (e.g. the post-delete repo-stats refresh).
+# We keep a strong reference until each finishes — asyncio only holds a weak
+# reference to running tasks, so without this a task can be garbage-collected
+# mid-flight and silently cancelled. Each removes itself on completion.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -1067,11 +1080,6 @@ async def delete_snapshot(snapshot_id: str) -> bool:
         logger.exception("restic forget failed")
         return False
 
-    # Prune reclaimed space, so the cached repo size is now stale. Recompute
-    # it here (best-effort, still off the request path — this runs in the
-    # delete task, not a /api/repo/stats request) and re-stamp it below.
-    repo_stats_data = (await repo_stats())[0]
-
     # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
     # that restic emits in its --json summary, so an exact match on the
     # user-supplied ID is sufficient when they pass a full ID. When they
@@ -1086,33 +1094,59 @@ async def delete_snapshot(snapshot_id: str) -> bool:
                 "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
                 (len(snapshot_id), snapshot_id),
             )
-        # Re-stamp the fresh size onto the newest *surviving* backup row, in
-        # the same connection as the delete. Unlike a backup (which folds its
-        # stats into its own INSERT), a delete has no row of its own, so
-        # MAX(id) is unavoidable here. No-op if no rows remain or stats failed.
-        if repo_stats_data is not None:
-            conn.execute(
-                "UPDATE backups SET repo_size_bytes = ?, repo_uncompressed_bytes = ?, "
-                "repo_blob_count = ?, repo_snapshots_count = ?, "
-                "repo_compression_ratio = ?, repo_stats_at = ? "
-                "WHERE id = (SELECT MAX(id) FROM backups)",
-                (
-                    repo_stats_data.get("total_size_bytes"),
-                    repo_stats_data.get("total_uncompressed_size_bytes"),
-                    repo_stats_data.get("total_blob_count"),
-                    repo_stats_data.get("snapshots_count"),
-                    repo_stats_data.get("compression_ratio"),
-                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                ),
-            )
         conn.commit()
     except sqlite3.Error:
         # The restic forget already succeeded; don't fail the operation.
         logger.exception("DB cleanup failed for snapshot %s", snapshot_id)
     finally:
         conn.close()
+
+    # The prune reclaimed space, so the cached repo size is now stale. Refresh
+    # it in the background: `restic stats` is slow (tens of seconds on a large
+    # repo) and delete_snapshot is awaited inline in the /api/snapshot/delete
+    # request, so recomputing here would block the HTTP response. The delete
+    # itself is already done and durable; the cache refresh is best-effort.
+    _spawn_background(_refresh_repo_stats_cache())
+
     logger.info("Deleted snapshot %s", snapshot_id)
     return True
+
+
+async def _refresh_repo_stats_cache() -> None:
+    """Recompute the repo footprint and re-stamp it onto the newest backup row.
+
+    Runs as a background task after a delete/prune so the expensive
+    ``restic stats`` read stays off the request path. Best-effort: on any
+    failure (stats unavailable, no rows to stamp, DB error) the cache simply
+    isn't refreshed and readers fall back to the previous stamped row.
+
+    Unlike a backup (which folds its stats into its own INSERT), a delete has
+    no row of its own, so we re-stamp the newest *surviving* row via MAX(id).
+    """
+    repo_stats_data = (await repo_stats())[0]
+    if repo_stats_data is None:
+        return
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE backups SET repo_size_bytes = ?, repo_uncompressed_bytes = ?, "
+            "repo_blob_count = ?, repo_snapshots_count = ?, "
+            "repo_compression_ratio = ?, repo_stats_at = ? "
+            "WHERE id = (SELECT MAX(id) FROM backups)",
+            (
+                repo_stats_data.get("total_size_bytes"),
+                repo_stats_data.get("total_uncompressed_size_bytes"),
+                repo_stats_data.get("total_blob_count"),
+                repo_stats_data.get("snapshots_count"),
+                repo_stats_data.get("compression_ratio"),
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Failed to re-stamp repo stats cache after delete")
+    finally:
+        conn.close()
 
 
 def get_backup_history(limit=20, offset=0):
@@ -1561,7 +1595,7 @@ async def api_repo_test():
 @route("/api/backup", methods=["POST"])
 async def trigger_backup():
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     data = await request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip() or None
     asyncio.create_task(run_backup(name=name))
@@ -1572,10 +1606,16 @@ async def trigger_backup():
 async def status():
     conf = load_config()
     last = get_last_backup()
+    active = op_lock.active
     return jsonify(
         running=op_lock.backup_running,
         migration_running=op_lock.migration_running,
         restore_running=op_lock.restore_running,
+        # Generic lock state so the UI can render one always-on banner for
+        # whatever operation currently holds op_lock, without knowing each kind.
+        busy=op_lock.busy,
+        active_op=active.value if active else None,
+        busy_message=op_lock.busy_message(),
         last_backup=last["timestamp"] if last else None,
         last_status=last["status"] if last else None,
         last_error=last["error_message"] if last else None,
@@ -1614,7 +1654,7 @@ async def api_repo_stats():
 @route("/api/restore", methods=["POST"])
 async def trigger_restore():
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     data = await request.get_json()
     snapshot_id = data.get("snapshot", "")
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
@@ -1666,7 +1706,7 @@ async def snapshot_delete():
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
         return jsonify(ok=False, error="Invalid snapshot id"), 400
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     try:
         ok = await delete_snapshot(snapshot_id)
         return jsonify(ok=ok)
@@ -1681,7 +1721,7 @@ async def trigger_check():
     # acquire a repo lock, so don't run it on top of a backup/restore, and
     # don't spawn a second check if one is already in flight.
     if op_lock.busy:
-        return jsonify(ok=False, error=f"{op_lock.active.value} in progress"), 409
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
     if check_running:
         return jsonify(ok=False, error="check already running"), 409
     asyncio.create_task(run_check())
