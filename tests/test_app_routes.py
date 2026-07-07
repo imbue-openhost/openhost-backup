@@ -887,10 +887,10 @@ class TestRepoStatsCache:
         assert loaded["total_size_bytes"] == self.STATS["total_size_bytes"]
 
 
-class TestCheckHoldsLock:
-    """`restic check` takes a repo lock, so run_check must hold op_lock(CHECK)
-    for its duration — upholding the invariant that op_lock is held whenever a
-    restic lock is held."""
+class TestCheckDoesNotLock:
+    """`restic check` is a read-only scan run with --no-lock, so it takes no
+    restic lock and must NOT claim op_lock — otherwise a long check would block
+    scheduled backups. Mutual exclusion at *start* is enforced by the route."""
 
     def _configure(self):
         conf = backup_app.load_config()
@@ -898,7 +898,27 @@ class TestCheckHoldsLock:
         conf["repo_password"] = "p"
         backup_app.save_config(conf)
 
-    async def test_check_rejected_when_busy(self, client):
+    async def test_check_uses_no_lock_and_never_claims_op_lock(self, client):
+        self._configure()
+        seen = {}
+
+        async def fake_run(args, conf, timeout=None):
+            # cat config probe -> repo exists; check -> record args + lock state.
+            if args and args[0] == "check":
+                seen["args"] = args
+                seen["active"] = backup_app.op_lock.active
+            return 0, b"", b""
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            ok = await backup_app.run_check()
+        assert ok is True
+        assert "--no-lock" in seen["args"]  # takes no restic lock
+        assert seen["active"] is None  # op_lock never claimed during the check
+        assert not backup_app.op_lock.busy
+
+    async def test_check_runs_even_while_op_lock_held(self, client):
+        # run_check itself doesn't gate on op_lock (the route does); it must
+        # still run to completion if invoked while another op holds the lock.
         self._configure()
         backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
         try:
@@ -906,27 +926,22 @@ class TestCheckHoldsLock:
                 backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
             ) as mock_restic:
                 ok = await backup_app.run_check()
-            assert ok is False
-            assert backup_app.check_last_status == "error"
-            mock_restic.assert_not_called()  # never ran restic check
+            assert ok is True
+            assert mock_restic.called  # not blocked by op_lock
         finally:
             backup_app.op_lock.release(backup_app.OpKind.BACKUP)
 
-    async def test_check_holds_lock_then_releases(self, client):
+    async def test_check_route_rejected_when_busy(self, client):
+        # The *route* refuses to start a check while another op is modifying.
         self._configure()
-        seen = {}
-
-        async def fake_run(args, conf, timeout=None):
-            # cat config probe -> repo exists; check -> record the active op.
-            if args and args[0] == "check":
-                seen["active"] = backup_app.op_lock.active
-            return 0, b"", b""
-
-        with patch.object(backup_app, "_run_restic", new=fake_run):
-            ok = await backup_app.run_check()
-        assert ok is True
-        assert seen["active"] == backup_app.OpKind.CHECK  # held during the check
-        assert not backup_app.op_lock.busy  # released afterward
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            resp = await client.post("/api/check")
+            assert resp.status_code == 409
+            body = await resp.get_json()
+            assert "backup" in body["error"]
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
 
 
 class TestStatusPush:

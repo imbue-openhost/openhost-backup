@@ -1359,21 +1359,16 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
 async def run_check() -> bool:
     """Run `restic check`. Updates module-level state.
 
-    ``restic check`` takes a restic repo lock, so this holds ``op_lock(CHECK)``
-    for its duration — that upholds the invariant "op_lock is held whenever a
-    restic lock is held", surfaces the check in the status banner, and makes a
-    backup/restore/delete attempted meanwhile get a clean "check in progress"
-    rejection. ``check_running`` remains as the flag the /api/check/status
-    endpoint reports.
+    Runs with ``--no-lock`` so the check takes no restic repo lock — it's a
+    read-only integrity scan and can be long (up to 2h), so claiming the
+    exclusive ``op_lock`` would needlessly block scheduled backups (which
+    restic itself would let run concurrently). Because it holds no restic lock,
+    the "op_lock held whenever a restic lock is held" invariant is satisfied
+    without op_lock. Mutual exclusion is handled by the caller: the /api/check
+    route rejects a check while another operation holds op_lock, and
+    ``check_running`` prevents two checks at once.
     """
     global check_last_status, check_last_output, check_last_at, check_running
-    err = op_lock.try_acquire(OpKind.CHECK)
-    if err:
-        check_last_status = "error"
-        check_last_output = err
-        check_last_at = datetime.now(timezone.utc).isoformat()
-        logger.warning("Skipping check: %s", err)
-        return False
     # Set the flag inside the try so that any exception from load_config /
     # _run_restic still runs the finally clause that clears it. Without
     # this, a corrupt config.json would leave check_running=True forever.
@@ -1398,7 +1393,7 @@ async def run_check() -> bool:
             return False
         try:
             rc, stdout, stderr = await _run_restic(
-                ["check"], conf, timeout=CHECK_TIMEOUT_SECONDS
+                ["check", "--no-lock"], conf, timeout=CHECK_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
             check_last_status = "error"
@@ -1426,7 +1421,6 @@ async def run_check() -> bool:
         return False
     finally:
         check_running = False
-        op_lock.release(OpKind.CHECK)
 
 
 # ---------------------------------------------------------------------------
@@ -1859,9 +1853,8 @@ async def snapshot_delete():
 
 @route("/api/check", methods=["POST"])
 async def trigger_check():
-    # `restic check` is read-only from the data's perspective but it does
-    # acquire a repo lock, so don't run it on top of a backup/restore, and
-    # don't spawn a second check if one is already in flight.
+    # run_check runs `restic check --no-lock`, so it holds no repo lock and
+    # doesn't claim op_lock
     if op_lock.busy:
         return jsonify(ok=False, error=op_lock.busy_message()), 409
     if check_running:

@@ -23,7 +23,6 @@ class OpKind(Enum):
     RESTORE = "restore"
     MIGRATION = "migration"
     DELETE = "delete"
-    CHECK = "check"
 
 
 @dataclass
