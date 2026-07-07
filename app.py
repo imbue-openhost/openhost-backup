@@ -86,6 +86,46 @@ DEFAULT_CONFIG = {
 SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
+# Backups are tagged ``openhost`` (this app) plus ``zone:<domain>`` so that when
+# several zones share one restic repo, each zone's snapshots — and its repo-size
+# totals — stay distinguishable. When OPENHOST_ZONE_DOMAIN isn't set (local dev,
+# tests) the zone tag is omitted and behaviour matches the old openhost-only
+# scheme.
+def _zone_tag() -> str | None:
+    return f"zone:{ZONE_DOMAIN}" if ZONE_DOMAIN else None
+
+
+def _backup_tags(name: str | None = None) -> list[str]:
+    """Tags applied to a new snapshot: always ``openhost``, plus the zone tag
+    (when known) and an optional ``name:<name>``."""
+    tags = ["openhost"]
+    zone = _zone_tag()
+    if zone:
+        tags.append(zone)
+    if name:
+        tags.append(f"name:{name}")
+    return tags
+
+
+def _snapshot_in_scope(tags: list[str]) -> bool:
+    """Whether a snapshot belongs to this zone's view.
+
+    In scope if it carries this zone's tag, OR carries no zone tag at all —
+    the latter covers *legacy* snapshots written before zone tagging existed
+    (and any run where OPENHOST_ZONE_DOMAIN wasn't set). Only snapshots tagged
+    for a *different* zone are hidden. With no zone configured here, everything
+    is in scope.
+
+    restic ``--tag`` can't express "has no zone tag", so callers filter
+    ``--tag openhost`` at restic and narrow with this in Python.
+    """
+    zone = _zone_tag()
+    if zone is None:
+        return True
+    snapshot_zones = [t for t in tags if t.startswith("zone:")]
+    return not snapshot_zones or zone in snapshot_zones
+
+
 def classify_repo(repo: str) -> dict:
     """Return ``{"type": <label>, "remote": bool, "location": <display>}``.
 
@@ -813,9 +853,7 @@ async def run_backup(name: str | None = None) -> bool:
             logger.error("Backup failed: %s", init_err)
             return False
 
-        tags = ["openhost"]
-        if name:
-            tags.append(f"name:{name}")
+        tags = _backup_tags(name)
 
         # Back up every mounted root (app_data, app_temp_data, vm_data).
         # Skip ones that aren't present — this keeps the app usable on
@@ -935,12 +973,15 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         logger.info("list_snapshots: %s", init_err)
         return [], False
     try:
-        # Scope to the "openhost" tag so, if the user points this app at a
-        # repo shared with other hosts/projects, we only surface snapshots
-        # written by this app. Backups are created with --tag openhost in
-        # run_backup.
+        # Filter to this app's snapshots (openhost) at restic, then narrow to
+        # this zone in Python: keep this zone's snapshots plus legacy ones with
+        # no zone tag, and drop snapshots belonging to a *different* zone. This
+        # keeps pre-zone-tag snapshots readable while still isolating zones that
+        # share a repo. See _snapshot_in_scope.
         rc, stdout, stderr = await _run_restic(
-            ["snapshots", "--json", "--tag", "openhost", "--no-lock"], conf, timeout=60
+            ["snapshots", "--json", "--tag", "openhost", "--no-lock"],
+            conf,
+            timeout=60,
         )
         if rc != 0:
             logger.error(
@@ -950,13 +991,16 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         entries = json.loads(stdout.decode(errors="replace") or "[]")
         out = []
         for e in entries:
+            tags = e.get("tags", []) or []
+            if not _snapshot_in_scope(tags):
+                continue
             out.append(
                 {
                     "id": e.get("id", ""),
                     "short_id": e.get("short_id", ""),
                     "time": e.get("time", ""),
                     "paths": e.get("paths", []),
-                    "tags": e.get("tags", []) or [],
+                    "tags": tags,
                     "hostname": e.get("hostname", ""),
                 }
             )
@@ -972,10 +1016,12 @@ async def repo_stats() -> tuple[dict | None, str | None]:
     """Return (stats, error) — how much space the restic repo is using.
 
     Uses ``restic stats --mode raw-data`` which reports the deduplicated /
-    compressed on-disk footprint of the repository (this is the number
-    that matters for S3 cost / local disk usage). Also scopes to the
-    openhost tag so a shared repo isn't double-counted with unrelated
-    snapshots.
+    compressed on-disk footprint of the repository (this is the number that
+    matters for S3 cost / local disk usage). Scopes to the ``openhost`` tag —
+    the *total* app footprint across zones. We intentionally don't narrow to a
+    single zone here: restic dedups blobs across all snapshots, so per-zone
+    size attribution is ill-defined, and the cost-relevant number is the whole
+    openhost footprint (which also naturally includes legacy snapshots).
     """
     try:
         conf = load_config()

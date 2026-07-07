@@ -976,3 +976,60 @@ class TestStatusPush:
             assert q.qsize() == 1
         finally:
             backup_app._status_subscribers.discard(q)
+
+
+class TestZoneTagging:
+    """Backups carry openhost + zone:<domain>; the snapshot list keeps this
+    zone's snapshots plus legacy (zone-less) ones and hides other zones'.
+    Falls back to openhost-only when OPENHOST_ZONE_DOMAIN is unset."""
+
+    ZONE = "samuel.selfhost.imbue.com"
+
+    def test_backup_tags_include_zone_when_set(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        assert backup_app._backup_tags() == ["openhost", f"zone:{self.ZONE}"]
+        assert backup_app._backup_tags("nightly") == [
+            "openhost",
+            f"zone:{self.ZONE}",
+            "name:nightly",
+        ]
+
+    def test_in_scope_keeps_mine_and_legacy_hides_foreign(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        assert backup_app._snapshot_in_scope(["openhost", f"zone:{self.ZONE}"])  # mine
+        assert backup_app._snapshot_in_scope(["openhost"])  # legacy, no zone tag
+        assert not backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
+
+    def test_backup_tags_and_scope_fall_back_when_zone_unset(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", "")
+        assert backup_app._backup_tags("nightly") == ["openhost", "name:nightly"]
+        # No zone identity -> everything openhost is in scope.
+        assert backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
+
+    async def test_list_snapshots_includes_legacy_excludes_foreign(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/r"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        snaps = [
+            {"id": "a" * 64, "short_id": "a", "time": "2026-01-03T00:00:00Z",
+             "tags": ["openhost", f"zone:{self.ZONE}"]},          # mine
+            {"id": "b" * 64, "short_id": "b", "time": "2026-01-02T00:00:00Z",
+             "tags": ["openhost"]},                                # legacy
+            {"id": "c" * 64, "short_id": "c", "time": "2026-01-01T00:00:00Z",
+             "tags": ["openhost", "zone:other.example.com"]},      # foreign
+        ]
+
+        async def fake_run(args, conf, timeout=None):
+            if args and args[0] == "snapshots":
+                return 0, json.dumps(snaps).encode(), b""
+            return 0, b"", b""  # cat config probe -> repo exists
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            out, ok = await backup_app.list_snapshots()
+        assert ok is True
+        ids = {s["short_id"] for s in out}
+        assert ids == {"a", "b"}  # mine + legacy, foreign excluded
