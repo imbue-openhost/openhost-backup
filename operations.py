@@ -21,6 +21,8 @@ class OpKind(Enum):
     BACKUP = "backup"
     RESTORE = "restore"
     MIGRATION = "migration"
+    DELETE = "delete"
+    CHECK = "check"
 
 
 @dataclass
@@ -131,3 +133,7 @@ class OperationLock:
     @property
     def migration_running(self) -> bool:
         return self._active == OpKind.MIGRATION
+
+    @property
+    def delete_running(self) -> bool:
+        return self._active == OpKind.DELETE

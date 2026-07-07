@@ -1147,12 +1147,11 @@
             btn.textContent = "Delete";
 
             if (res.ok) {
-                showMsg("manage-msg", "Snapshot deleted", true);
+                showMsg("manage-msg", "Delete started — progress shows in the banner above; the list refreshes when it finishes.", true);
                 selectedSnapshotId = null;
                 document.getElementById("action-panel").style.display = "none";
                 document.getElementById("browse-container").style.display = "none";
-                loadSnapshots();
-                loadRepoStats();
+                tickLockBanner();  // show the delete-in-progress banner promptly
             } else {
                 showMsg("manage-msg", res.error || "Delete failed", false);
             }
@@ -1239,34 +1238,36 @@
         // when the repo is busy and that other operations are paused. Polls
         // faster while busy; on the busy -> idle edge it refreshes the views
         // that a just-finished operation may have changed.
-        async function pollLockBanner() {
+        let lockBannerTimer = null;
+        let lockBannerWasBusy = false;
+        async function tickLockBanner() {
             const el = document.getElementById("lock-banner");
             if (!el) return;
-            let wasBusy = false;
-            const tick = async () => {
-                let busy = false;
-                let msg = "";
-                try {
-                    const res = await api("/api/status");
-                    busy = !!res.busy;
-                    msg = res.busy_message
-                        || "An operation is in progress — other operations are paused until it finishes.";
-                } catch (e) {
-                    busy = false;
-                }
-                if (busy) {
-                    el.textContent = "⏳ " + msg;
-                    el.style.display = "block";
-                } else {
-                    el.style.display = "none";
-                    if (wasBusy) { loadSnapshots(); loadRepoStats(); }
-                }
-                wasBusy = busy;
-                setTimeout(tick, busy ? 2000 : 6000);
-            };
-            tick();
+            // Collapse any pending tick so callers can force an immediate poll
+            // (e.g. right after starting a delete) without stacking timers.
+            if (lockBannerTimer) { clearTimeout(lockBannerTimer); lockBannerTimer = null; }
+            let busy = false;
+            let msg = "";
+            try {
+                const res = await api("/api/status");
+                busy = !!res.busy;
+                msg = res.busy_message
+                    || "An operation is in progress — other operations are paused until it finishes.";
+            } catch (e) {
+                busy = false;
+            }
+            if (busy) {
+                el.textContent = "⏳ " + msg;
+                el.style.display = "block";
+            } else {
+                el.style.display = "none";
+                // Busy -> idle edge: refresh views a finished op may have changed.
+                if (lockBannerWasBusy) { loadSnapshots(); loadRepoStats(); }
+            }
+            lockBannerWasBusy = busy;
+            lockBannerTimer = setTimeout(tickLockBanner, busy ? 2000 : 6000);
         }
-        pollLockBanner();
+        tickLockBanner();
 
         // Auto-load snapshots + repo stats on page load (only if configured).
         {% if config.repo %}

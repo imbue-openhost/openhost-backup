@@ -580,7 +580,7 @@ class TestEnsureRepoInitialized:
         )
         assert initialized_now is True
         assert err is None
-        assert calls == [["cat", "config"], ["init"]]
+        assert calls == [["cat", "config", "--no-lock"], ["init"]]
 
     async def test_remote_does_not_auto_init_by_default(self, monkeypatch):
         calls = self._patch_run_restic(
@@ -594,7 +594,7 @@ class TestEnsureRepoInitialized:
         assert err is not None
         assert "not initialized" in err.lower()
         # Must NOT have invoked restic init.
-        assert calls == [["cat", "config"]]
+        assert calls == [["cat", "config", "--no-lock"]]
 
     async def test_remote_inits_when_explicitly_opted_in(self, monkeypatch):
         calls = self._patch_run_restic(
@@ -610,7 +610,7 @@ class TestEnsureRepoInitialized:
         )
         assert initialized_now is True
         assert err is None
-        assert calls == [["cat", "config"], ["init"]]
+        assert calls == [["cat", "config", "--no-lock"], ["init"]]
 
     async def test_auto_init_false_never_inits_local_either(
         self, monkeypatch, tmp_path
@@ -626,7 +626,7 @@ class TestEnsureRepoInitialized:
         assert initialized_now is False
         assert err is not None
         assert "not initialized" in err.lower()
-        assert calls == [["cat", "config"]]
+        assert calls == [["cat", "config", "--no-lock"]]
 
     async def test_non_init_error_passes_through(self, monkeypatch):
         # e.g. wrong password — must NOT auto-init regardless of mode.
@@ -798,10 +798,9 @@ class TestRepoStatsCache:
         assert body["error"] == "boom"
 
     async def test_delete_snapshot_restamps_surviving_row(self, client):
-        # Two stamped backups; deleting the newer removes its row and spawns a
-        # background refresh that re-stamps the survivor with freshly recomputed
-        # stats. delete_snapshot returns before the refresh runs (it's off the
-        # request path now), so we await the spawned task before asserting.
+        # Two stamped backups; deleting the newer removes its row and re-stamps
+        # the survivor with freshly recomputed stats (refresh awaited inline
+        # under the DELETE lock). delete_snapshot must also leave op_lock free.
         self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
         self._record_backup(repo_stats=self.STATS, snapshot_id="b" * 64)
         conf = backup_app.load_config()
@@ -815,12 +814,28 @@ class TestRepoStatsCache:
             backup_app, "repo_stats", new=AsyncMock(return_value=(after_prune, None))
         ):
             ok = await backup_app.delete_snapshot("b" * 64)
-            # The refresh runs in a tracked background task; drain it.
-            await asyncio.gather(*backup_app._background_tasks)
         assert ok is True
+        assert not backup_app.op_lock.busy  # lock released after the delete
         loaded = backup_app.load_repo_stats_cache()
         assert loaded["total_size_bytes"] == 1_000_000_000
         assert loaded["snapshots_count"] == 1
+
+    async def test_delete_snapshot_rejected_when_busy(self, client):
+        # A delete must not proceed while another operation holds op_lock.
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            with patch.object(
+                backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+            ) as mock_restic:
+                ok = await backup_app.delete_snapshot("a" * 64)
+            assert ok is False
+            mock_restic.assert_not_called()  # never ran the prune
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
 
     async def test_refresh_repo_stats_cache_restamps_newest(self, client):
         # The background helper on its own: recompute + re-stamp the newest row.
@@ -843,3 +858,45 @@ class TestRepoStatsCache:
             await backup_app._refresh_repo_stats_cache()
         loaded = backup_app.load_repo_stats_cache()
         assert loaded["total_size_bytes"] == self.STATS["total_size_bytes"]
+
+
+class TestCheckHoldsLock:
+    """`restic check` takes a repo lock, so run_check must hold op_lock(CHECK)
+    for its duration — upholding the invariant that op_lock is held whenever a
+    restic lock is held."""
+
+    def _configure(self):
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+
+    async def test_check_rejected_when_busy(self, client):
+        self._configure()
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            with patch.object(
+                backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+            ) as mock_restic:
+                ok = await backup_app.run_check()
+            assert ok is False
+            assert backup_app.check_last_status == "error"
+            mock_restic.assert_not_called()  # never ran restic check
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+    async def test_check_holds_lock_then_releases(self, client):
+        self._configure()
+        seen = {}
+
+        async def fake_run(args, conf, timeout=None):
+            # cat config probe -> repo exists; check -> record the active op.
+            if args and args[0] == "check":
+                seen["active"] = backup_app.op_lock.active
+            return 0, b"", b""
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            ok = await backup_app.run_check()
+        assert ok is True
+        assert seen["active"] == backup_app.OpKind.CHECK  # held during the check
+        assert not backup_app.op_lock.busy  # released afterward

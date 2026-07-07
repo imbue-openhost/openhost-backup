@@ -540,7 +540,13 @@ async def ensure_repo_initialized(
     async with _init_lock:
         # `cat config` is a cheap way to confirm the repo exists and the password
         # is correct. It returns non-zero on either missing repo or wrong password.
-        rc, _stdout, stderr = await _run_restic(["cat", "config"], conf, timeout=30)
+        # --no-lock: this is a pure read (existence/password probe), so it must
+        # not take a restic repo lock — that keeps the invariant "op_lock is
+        # held whenever a restic lock is held" true without gating this behind
+        # op_lock, and lets it run even while a prune holds the exclusive lock.
+        rc, _stdout, stderr = await _run_restic(
+            ["cat", "config", "--no-lock"], conf, timeout=30
+        )
         if rc == 0:
             return False, None
 
@@ -623,6 +629,7 @@ async def test_restic_connection(
         "restic",
         "cat",
         "config",
+        "--no-lock",  # pure read: never take a restic repo lock (see invariant)
         env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
@@ -871,7 +878,7 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         # written by this app. Backups are created with --tag openhost in
         # run_backup.
         rc, stdout, stderr = await _run_restic(
-            ["snapshots", "--json", "--tag", "openhost"], conf, timeout=60
+            ["snapshots", "--json", "--tag", "openhost", "--no-lock"], conf, timeout=60
         )
         if rc != 0:
             logger.error(
@@ -917,7 +924,7 @@ async def repo_stats() -> tuple[dict | None, str | None]:
         if init_err:
             return None, init_err
         rc, stdout, stderr = await _run_restic(
-            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost"],
+            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost", "--no-lock"],
             conf,
             timeout=60,
         )
@@ -964,7 +971,7 @@ async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):
     """
     present: list[dict] = []
     for name, path in _ROOT_NAMES.items():
-        args = ["ls", "--json", snapshot_id, str(path)]
+        args = ["ls", "--json", snapshot_id, str(path), "--no-lock"]
         try:
             rc, _stdout, _stderr = await _run_restic(args, conf, timeout=60)
         except Exception:
@@ -1011,7 +1018,7 @@ async def list_snapshot_files(
     if subpath:
         target_path = target_path.rstrip("/") + "/" + subpath
 
-    args = ["ls", "--json", snapshot_id, target_path]
+    args = ["ls", "--json", snapshot_id, target_path, "--no-lock"]
     try:
         rc, stdout, stderr = await _run_restic(args, conf, timeout=120)
     except Exception as e:
@@ -1061,55 +1068,69 @@ async def delete_snapshot(snapshot_id: str) -> bool:
     immediately. Prune on a large repo can be slow (several minutes on an
     S3 repo with a lot of data) — we set a generous but bounded timeout so
     a wedged prune can't permanently hold the UI.
+
+    Holds ``op_lock`` for its whole span (prune + DB cleanup + stats refresh)
+    so a delete is a first-class operation: it shows in the status banner and
+    mutually excludes backup/restore/migration. The route fires this via
+    ``_spawn_background`` and returns immediately, so the prune runs in the
+    background and the user tracks it through the banner.
     """
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return False
-    try:
-        rc, _out, stderr = await _run_restic(
-            ["forget", "--prune", snapshot_id], conf, timeout=30 * 60
-        )
-        if rc != 0:
-            logger.warning(
-                "restic forget failed for %s: %s",
-                snapshot_id,
-                stderr.decode(errors="replace").strip(),
-            )
-            return False
-    except Exception:
-        logger.exception("restic forget failed")
+
+    err = op_lock.try_acquire(OpKind.DELETE)
+    if err:
+        logger.warning("Skipping delete: %s", err)
         return False
-
-    # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
-    # that restic emits in its --json summary, so an exact match on the
-    # user-supplied ID is sufficient when they pass a full ID. When they
-    # pass a short (8-char) ID, match by prefix with length >= 8 to avoid
-    # accidental matches on arbitrary substrings.
-    conn = get_db()
     try:
-        if len(snapshot_id) >= 40:
-            conn.execute("DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,))
-        else:
-            conn.execute(
-                "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
-                (len(snapshot_id), snapshot_id),
+        try:
+            rc, _out, stderr = await _run_restic(
+                ["forget", "--prune", snapshot_id], conf, timeout=30 * 60
             )
-        conn.commit()
-    except sqlite3.Error:
-        # The restic forget already succeeded; don't fail the operation.
-        logger.exception("DB cleanup failed for snapshot %s", snapshot_id)
+            if rc != 0:
+                logger.warning(
+                    "restic forget failed for %s: %s",
+                    snapshot_id,
+                    stderr.decode(errors="replace").strip(),
+                )
+                return False
+        except Exception:
+            logger.exception("restic forget failed")
+            return False
+
+        # DB cleanup. Snapshot IDs stored here are always the full 64-char IDs
+        # that restic emits in its --json summary, so an exact match on the
+        # user-supplied ID is sufficient when they pass a full ID. When they
+        # pass a short (8-char) ID, match by prefix with length >= 8 to avoid
+        # accidental matches on arbitrary substrings.
+        conn = get_db()
+        try:
+            if len(snapshot_id) >= 40:
+                conn.execute(
+                    "DELETE FROM backups WHERE snapshot_id = ?", (snapshot_id,)
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM backups WHERE substr(snapshot_id, 1, ?) = ?",
+                    (len(snapshot_id), snapshot_id),
+                )
+            conn.commit()
+        except sqlite3.Error:
+            # The restic forget already succeeded; don't fail the operation.
+            logger.exception("DB cleanup failed for snapshot %s", snapshot_id)
+        finally:
+            conn.close()
+
+        # The prune reclaimed space, so the cached repo size is now stale.
+        # Awaited inline (we hold the lock and the request has already
+        # returned) so the banner stays up until the size is current.
+        await _refresh_repo_stats_cache()
+
+        logger.info("Deleted snapshot %s", snapshot_id)
+        return True
     finally:
-        conn.close()
-
-    # The prune reclaimed space, so the cached repo size is now stale. Refresh
-    # it in the background: `restic stats` is slow (tens of seconds on a large
-    # repo) and delete_snapshot is awaited inline in the /api/snapshot/delete
-    # request, so recomputing here would block the HTTP response. The delete
-    # itself is already done and durable; the cache refresh is best-effort.
-    _spawn_background(_refresh_repo_stats_cache())
-
-    logger.info("Deleted snapshot %s", snapshot_id)
-    return True
+        op_lock.release(OpKind.DELETE)
 
 
 async def _refresh_repo_stats_cache() -> None:
@@ -1276,12 +1297,21 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
 async def run_check() -> bool:
     """Run `restic check`. Updates module-level state.
 
-    Note: this coroutine doesn't take ``op_lock`` itself — callers (the
-    HTTP route) are expected to gate on both ``op_lock.busy`` and
-    ``check_running`` to avoid colliding with backup/restore or another
-    concurrent check. restic itself acquires its own repo-level lock.
+    ``restic check`` takes a restic repo lock, so this holds ``op_lock(CHECK)``
+    for its duration — that upholds the invariant "op_lock is held whenever a
+    restic lock is held", surfaces the check in the status banner, and makes a
+    backup/restore/delete attempted meanwhile get a clean "check in progress"
+    rejection. ``check_running`` remains as the flag the /api/check/status
+    endpoint reports.
     """
     global check_last_status, check_last_output, check_last_at, check_running
+    err = op_lock.try_acquire(OpKind.CHECK)
+    if err:
+        check_last_status = "error"
+        check_last_output = err
+        check_last_at = datetime.now(timezone.utc).isoformat()
+        logger.warning("Skipping check: %s", err)
+        return False
     # Set the flag inside the try so that any exception from load_config /
     # _run_restic still runs the finally clause that clears it. Without
     # this, a corrupt config.json would leave check_running=True forever.
@@ -1334,6 +1364,7 @@ async def run_check() -> bool:
         return False
     finally:
         check_running = False
+        op_lock.release(OpKind.CHECK)
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1642,7 @@ async def status():
         running=op_lock.backup_running,
         migration_running=op_lock.migration_running,
         restore_running=op_lock.restore_running,
+        delete_running=op_lock.delete_running,
         # Generic lock state so the UI can render one always-on banner for
         # whatever operation currently holds op_lock, without knowing each kind.
         busy=op_lock.busy,
@@ -1707,12 +1739,12 @@ async def snapshot_delete():
         return jsonify(ok=False, error="Invalid snapshot id"), 400
     if op_lock.busy:
         return jsonify(ok=False, error=op_lock.busy_message()), 409
-    try:
-        ok = await delete_snapshot(snapshot_id)
-        return jsonify(ok=ok)
-    except Exception as e:
-        logger.exception("Failed to delete snapshot")
-        return jsonify(ok=False, error=str(e)), 500
+    # Run the prune in the background (it can take minutes) and return
+    # immediately. delete_snapshot acquires op_lock(DELETE), so the status
+    # banner reflects it and other operations get a clean busy rejection; the
+    # UI watches the banner and refreshes the snapshot list when it clears.
+    _spawn_background(delete_snapshot(snapshot_id))
+    return jsonify(ok=True, message="Delete started")
 
 
 @route("/api/check", methods=["POST"])
