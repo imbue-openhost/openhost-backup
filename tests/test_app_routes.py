@@ -1010,6 +1010,49 @@ class TestZoneTagging:
         self, client, monkeypatch
     ):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+class TestSnapshotBrowsing:
+    """Top-level roots come from snapshot metadata (no recursive ls probe),
+    and directory listings stream instead of buffering the whole subtree."""
+
+    async def test_roots_come_from_metadata_without_ls(self, client):
+        root_paths = {name: str(p) for name, p in backup_app._ROOT_NAMES.items()}
+        snap_json = json.dumps(
+            [{"id": "s" * 64, "paths": [root_paths["app_data"], root_paths["vm_data"]]}]
+        ).encode()
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            return 0, snap_json, b""
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == {"app_data", "vm_data"}
+        # Exactly one restic call — the metadata lookup — and never an ls probe.
+        assert len(calls) == 1
+        assert calls[0][0] == "snapshots"
+        assert all(a[0] != "ls" for a in calls)
+
+    async def test_metadata_failure_falls_back_to_ls(self, client):
+        # When the metadata read fails, we fall back to per-root ls probing.
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            if args[0] == "snapshots":
+                return 1, b"", b"boom"  # metadata read fails
+            return 0, b"", b""  # ls probe: root present
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
+        assert any(a[0] == "ls" for a in calls)  # fallback ran
+
+    async def test_listing_streams_only_immediate_children(self, client):
         conf = backup_app.load_config()
         conf["repo"] = "/tmp/r"
         conf["repo_password"] = "p"
