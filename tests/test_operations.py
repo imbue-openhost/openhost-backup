@@ -45,6 +45,36 @@ def test_busy_message_reflects_active_op() -> None:
     assert lock.busy_message() is None
 
 
+def test_on_change_fires_on_acquire_and_release() -> None:
+    lock = OperationLock()
+    events: list[str | None] = []
+    lock.set_on_change(lambda: events.append(lock.active.value if lock.active else None))
+    lock.try_acquire(OpKind.BACKUP)
+    lock.release(OpKind.BACKUP)
+    assert events == ["backup", None]  # acquire (active=backup), release (idle)
+
+
+def test_on_change_not_fired_when_acquire_rejected() -> None:
+    lock = OperationLock()
+    lock.try_acquire(OpKind.BACKUP)
+    calls: list[int] = []
+    lock.set_on_change(lambda: calls.append(1))
+    assert lock.try_acquire(OpKind.DELETE) is not None  # rejected
+    assert calls == []  # no state change -> no notification
+
+
+def test_on_change_callback_exception_is_swallowed() -> None:
+    lock = OperationLock()
+
+    def boom() -> None:
+        raise RuntimeError("nope")
+
+    lock.set_on_change(boom)
+    # Must not propagate — a broken subscriber can't break the lock.
+    assert lock.try_acquire(OpKind.BACKUP) is None
+    lock.release(OpKind.BACKUP)
+
+
 def test_release_if_stale_reclaims_idle_migration() -> None:
     lock = OperationLock()
     lock.try_acquire(OpKind.MIGRATION)

@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from quart import Quart, jsonify, render_template, request
+from quart import Quart, Response, jsonify, render_template, request
 
 import migration
 from operations import OperationLock, OpKind
@@ -164,6 +164,44 @@ def _spawn_background(coro) -> asyncio.Task:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
+
+
+# ---------------------------------------------------------------------------
+# Live operation-status push (Server-Sent Events)
+# ---------------------------------------------------------------------------
+# The status banner reflects op_lock state. Rather than relying only on the
+# UI's slow poll, each connected browser holds an SSE stream (/api/events);
+# op_lock's on_change callback wakes every stream so the banner updates the
+# instant an operation starts or finishes.
+
+# One queue per connected SSE client. A notification pushes a sentinel into
+# each; the stream coroutine wakes, reads the current status, and emits it.
+_status_subscribers: set[asyncio.Queue] = set()
+
+
+def _lock_status() -> dict:
+    """Current op_lock state — the payload the banner needs. Shared by
+    /api/status and the SSE stream so the two never disagree."""
+    active = op_lock.active
+    return {
+        "busy": op_lock.busy,
+        "active_op": active.value if active else None,
+        "busy_message": op_lock.busy_message(),
+    }
+
+
+def _notify_status_change() -> None:
+    """Wake every SSE subscriber so it pushes the new status immediately.
+
+    Runs synchronously from op_lock.try_acquire/release (same event-loop
+    thread), so a non-blocking put_nowait is safe. A full queue already has a
+    pending wake-up, so dropping the extra is fine.
+    """
+    for q in list(_status_subscribers):
+        try:
+            q.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1443,6 +1481,9 @@ async def startup():
     global scheduler_task
     init_db()
     ensure_default_config()
+    # Push op_lock transitions to connected SSE clients so the status banner
+    # updates the instant an operation starts or finishes.
+    op_lock.set_on_change(_notify_status_change)
     # Best-effort unlock in case a previous run died mid-operation.
     try:
         conf = load_config()
@@ -1670,7 +1711,6 @@ async def trigger_backup():
 async def status():
     conf = load_config()
     last = get_last_backup()
-    active = op_lock.active
     return jsonify(
         running=op_lock.backup_running,
         migration_running=op_lock.migration_running,
@@ -1678,15 +1718,52 @@ async def status():
         delete_running=op_lock.delete_running,
         # Generic lock state so the UI can render one always-on banner for
         # whatever operation currently holds op_lock, without knowing each kind.
-        busy=op_lock.busy,
-        active_op=active.value if active else None,
-        busy_message=op_lock.busy_message(),
+        **_lock_status(),
         last_backup=last["timestamp"] if last else None,
         last_status=last["status"] if last else None,
         last_error=last["error_message"] if last else None,
         interval_seconds=conf["interval_seconds"],
         repo=conf.get("repo", ""),
         backend=classify_repo(conf.get("repo", "")),
+    )
+
+
+@route("/api/events")
+async def events():
+    """Server-Sent Events stream of op_lock state.
+
+    Emits the current status on connect, then again on every lock transition
+    (pushed via ``_notify_status_change``), with a periodic comment keepalive
+    so idle connections survive proxies. The UI uses this to update the banner
+    instantly; its slow poll is only a fallback.
+    """
+
+    async def stream():
+        q: asyncio.Queue = asyncio.Queue()
+        _status_subscribers.add(q)
+        try:
+            yield f"data: {json.dumps(_lock_status())}\n\n"
+            while True:
+                try:
+                    await asyncio.wait_for(q.get(), timeout=25)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                # Coalesce a burst of notifications into one status emit.
+                while not q.empty():
+                    q.get_nowait()
+                yield f"data: {json.dumps(_lock_status())}\n\n"
+        finally:
+            _status_subscribers.discard(q)
+
+    return Response(
+        stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Disable proxy buffering (nginx) so events aren't held back.
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

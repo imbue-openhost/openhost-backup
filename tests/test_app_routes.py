@@ -927,3 +927,37 @@ class TestCheckHoldsLock:
         assert ok is True
         assert seen["active"] == backup_app.OpKind.CHECK  # held during the check
         assert not backup_app.op_lock.busy  # released afterward
+
+
+class TestStatusPush:
+    """The SSE push mechanism behind the live status banner."""
+
+    def test_lock_status_reflects_op_lock(self, client):
+        assert backup_app._lock_status()["busy"] is False
+        backup_app.op_lock.try_acquire(backup_app.OpKind.DELETE)
+        try:
+            s = backup_app._lock_status()
+            assert s["busy"] is True
+            assert s["active_op"] == "delete"
+            assert "delete" in s["busy_message"]
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.DELETE)
+
+    def test_notify_wakes_subscribers(self, client):
+        q: asyncio.Queue = asyncio.Queue()
+        backup_app._status_subscribers.add(q)
+        try:
+            backup_app._notify_status_change()
+            assert q.qsize() == 1
+        finally:
+            backup_app._status_subscribers.discard(q)
+
+    def test_notify_tolerates_full_subscriber_queue(self, client):
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        q.put_nowait(None)  # already full
+        backup_app._status_subscribers.add(q)
+        try:
+            backup_app._notify_status_change()  # must not raise
+            assert q.qsize() == 1
+        finally:
+            backup_app._status_subscribers.discard(q)

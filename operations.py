@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -37,6 +38,20 @@ class OperationLock:
 
     _active: OpKind | None = field(default=None, init=False)
     _last_activity: float | None = field(default=None, init=False)
+    # Called (no args) on every state transition — acquire and release — so a
+    # push channel (SSE) can notify clients the instant the lock changes rather
+    # than waiting for the next poll. Set via ``set_on_change``.
+    _on_change: Callable[[], None] | None = field(default=None, init=False)
+
+    def set_on_change(self, callback: Callable[[], None] | None) -> None:
+        self._on_change = callback
+
+    def _fire_change(self) -> None:
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception:
+                logger.exception("op_lock on_change callback failed")
 
     @property
     def active(self) -> OpKind | None:
@@ -71,6 +86,7 @@ class OperationLock:
             return self.busy_message()
         self._active = kind
         self._last_activity = time.monotonic()
+        self._fire_change()
         return None
 
     def release(self, kind: OpKind) -> None:
@@ -81,6 +97,7 @@ class OperationLock:
             )
         self._active = None
         self._last_activity = None
+        self._fire_change()
 
     def touch(self, *, now: float | None = None) -> None:
         """Mark activity on the held operation, refreshing its staleness clock.
