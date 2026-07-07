@@ -22,7 +22,10 @@ class OpKind(Enum):
     BACKUP = "backup"
     RESTORE = "restore"
     MIGRATION = "migration"
+    # Manual removal of a single snapshot (restic forget --prune <id>).
     DELETE = "delete"
+    # Background retention prune worker (restic prune after keep-* forget).
+    PRUNE = "prune"
 
 
 @dataclass
@@ -153,3 +156,7 @@ class OperationLock:
     @property
     def delete_running(self) -> bool:
         return self._active == OpKind.DELETE
+
+    @property
+    def prune_running(self) -> bool:
+        return self._active == OpKind.PRUNE
