@@ -737,6 +737,33 @@ class TestRepoStatsCache:
         self._record_backup()
         assert backup_app.load_repo_stats_cache() is None
 
+    async def test_config_repo_change_invalidates_cache(self, client):
+        # Changing the repo URL must drop the cache (it described the old repo).
+        conf = backup_app.load_config()
+        conf["repo"] = "s3:old"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        self._record_backup(repo_stats=self.STATS)
+        assert backup_app.load_repo_stats_cache() is not None
+        resp = await client.post("/api/config", json={"repo": "s3:new"})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is None
+
+    async def test_config_non_repo_change_keeps_cache(self, client):
+        # Changing a non-repo field leaves the cache intact.
+        conf = backup_app.load_config()
+        conf["repo"] = "s3:same"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        self._record_backup(repo_stats=self.STATS)
+        resp = await client.post("/api/config", json={"interval_seconds": 120})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is not None
+        # Re-saving the same repo URL is a no-op for the cache too.
+        resp = await client.post("/api/config", json={"repo": "s3:same"})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is not None
+
     def test_load_returns_newest_stamped_row(self, client):
         # An unstamped newer backup must not shadow the last known-good stats.
         self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)

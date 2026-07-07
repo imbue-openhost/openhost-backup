@@ -342,6 +342,30 @@ def load_repo_stats_cache() -> dict | None:
     }
 
 
+def invalidate_repo_stats_cache() -> None:
+    """Drop the cached repo-size stamp from every backup row.
+
+    The cache describes a specific repository; call this when the configured
+    repo changes so ``load_repo_stats_cache`` returns ``None`` and the next
+    ``/api/repo/stats`` read computes live against the new repo instead of
+    serving the old repo's size. Leaves the backup history itself untouched —
+    only the auxiliary ``repo_stats_*`` columns are cleared.
+    """
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE backups SET repo_size_bytes = NULL, "
+            "repo_uncompressed_bytes = NULL, repo_blob_count = NULL, "
+            "repo_snapshots_count = NULL, repo_compression_ratio = NULL, "
+            "repo_stats_at = NULL WHERE repo_stats_at IS NOT NULL"
+        )
+        conn.commit()
+    except sqlite3.Error:
+        logger.exception("Failed to invalidate repo stats cache")
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -1568,6 +1592,11 @@ async def post_config():
                 error="Bearer token required to rotate router_api_token",
             ), 401
 
+    # The cached repo size describes whatever repo was configured. If the repo
+    # URL changes, that figure belongs to the old repo, so remember the old
+    # value now (before we overwrite it) to invalidate the cache below.
+    old_repo = current_conf.get("repo", "")
+
     conf = current_conf
     for key in ("repo", "repo_password", "router_api_token"):
         if key in data:
@@ -1585,6 +1614,10 @@ async def post_config():
             return jsonify(ok=False, error="interval_seconds must be an integer"), 400
         conf["interval_seconds"] = 0 if interval <= 0 else max(60, interval)
     save_config(conf)
+    # Pointing at a different repo makes the cached size stale — drop it so the
+    # next /api/repo/stats read computes live against the new repo.
+    if conf.get("repo", "") != old_repo:
+        invalidate_repo_stats_cache()
     return jsonify(ok=True)
 
 
