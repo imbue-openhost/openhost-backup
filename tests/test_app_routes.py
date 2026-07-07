@@ -695,3 +695,108 @@ class TestIndexRendersScope:
         body = (await resp.get_data()).decode()
         for root in backup_app.BACKUP_ROOTS:
             assert str(root) in body, f"missing BACKUP_ROOTS path {root}"
+
+
+class TestSnapshotBrowsing:
+    """Top-level roots come from snapshot metadata (no recursive ls probe),
+    and directory listings stream instead of buffering the whole subtree."""
+
+    async def test_roots_come_from_metadata_without_ls(self, client):
+        root_paths = {name: str(p) for name, p in backup_app._ROOT_NAMES.items()}
+        snap_json = json.dumps(
+            [{"id": "s" * 64, "paths": [root_paths["app_data"], root_paths["vm_data"]]}]
+        ).encode()
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            return 0, snap_json, b""
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == {"app_data", "vm_data"}
+        # Exactly one restic call — the metadata lookup — and never an ls probe.
+        assert len(calls) == 1
+        assert calls[0][0] == "snapshots"
+        assert all(a[0] != "ls" for a in calls)
+
+    async def test_metadata_failure_falls_back_to_ls(self, client):
+        # When the metadata read fails, we fall back to per-root ls probing.
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            if args[0] == "snapshots":
+                return 1, b"", b"boom"  # metadata read fails
+            return 0, b"", b""  # ls probe: root present
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
+        assert any(a[0] == "ls" for a in calls)  # fallback ran
+
+    async def test_listing_streams_only_immediate_children(self, client):
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/r"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        root_path = str(backup_app._ROOT_NAMES["app_data"])
+        lines = [
+            json.dumps({"struct_type": "snapshot"}),  # header, ignored
+            json.dumps(
+                {
+                    "struct_type": "node",
+                    "path": root_path + "/file1",
+                    "type": "file",
+                    "size": 10,
+                    "mtime": "2026-01-01T00:00:00Z",
+                }
+            ),
+            json.dumps(
+                {"struct_type": "node", "path": root_path + "/dir1", "type": "dir"}
+            ),
+            json.dumps(
+                {
+                    "struct_type": "node",
+                    "path": root_path + "/dir1/nested",  # deeper — excluded
+                    "type": "file",
+                }
+            ),
+        ]
+
+        async def fake_stream(args, conf, timeout, on_line):
+            assert args[0] == "ls"  # still an ls, just streamed
+            for ln in lines:
+                on_line(ln + "\n")
+            return 0, b""
+
+        with patch.object(backup_app, "_run_restic_streaming", fake_stream):
+            files, err = await backup_app.list_snapshot_files("s" * 64, root="app_data")
+        assert err is None
+        assert {f["path"] for f in files} == {"file1", "dir1"}
+        f1 = next(f for f in files if f["path"] == "file1")
+        assert f1["is_dir"] is False and f1["size"] == 10
+        d1 = next(f for f in files if f["path"] == "dir1")
+        assert d1["is_dir"] is True
+
+    async def test_metadata_with_no_matching_roots_falls_back_to_ls(self, client):
+        # Metadata is readable but its paths don't match any known root — must
+        # defer to the authoritative ls probe, not report "no roots".
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            if args[0] == "snapshots":
+                return 0, json.dumps([{"id": "s" * 64, "paths": ["/other"]}]).encode(), b""
+            return 0, b"", b""  # ls probe: root present
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
+        assert any(a[0] == "ls" for a in calls)  # fell back to probing
