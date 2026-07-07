@@ -1147,7 +1147,7 @@ async def _roots_from_snapshot_metadata(
     """
     try:
         rc, stdout, _stderr = await _run_restic(
-            ["snapshots", "--json", snapshot_id], conf, timeout=60
+            ["snapshots", "--json", snapshot_id, "--no-lock"], conf, timeout=60
         )
     except Exception:
         return None
@@ -1237,16 +1237,6 @@ async def list_snapshot_files(
         target_path = target_path.rstrip("/") + "/" + subpath
 
     args = ["ls", "--json", snapshot_id, target_path, "--no-lock"]
-    try:
-        rc, stdout, stderr = await _run_restic(args, conf, timeout=120)
-    except Exception as e:
-        return [], f"restic error: {e}"
-
-    if rc != 0:
-        err = stderr.decode(errors="replace").strip()
-        if "not found" in err.lower() or "no matching" in err.lower():
-            return [], "Snapshot or path not found"
-        return [], f"restic error: {err}"
 
     files: list[dict] = []
     target_norm = target_path.rstrip("/")
