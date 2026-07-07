@@ -895,14 +895,14 @@ async def repo_stats() -> tuple[dict | None, str | None]:
     openhost tag so a shared repo isn't double-counted with unrelated
     snapshots.
     """
-    conf = load_config()
-    if not conf.get("repo") or not conf.get("repo_password"):
-        return None, "Restic repo not configured"
-    # Auto-init only for local repos (see list_snapshots for the rationale).
-    init_err = (await ensure_repo_initialized(conf))[1]
-    if init_err:
-        return None, init_err
     try:
+        conf = load_config()
+        if not conf.get("repo") or not conf.get("repo_password"):
+            return None, "Restic repo not configured"
+        # Auto-init only for local repos (see list_snapshots for the rationale).
+        init_err = (await ensure_repo_initialized(conf))[1]
+        if init_err:
+            return None, init_err
         rc, stdout, stderr = await _run_restic(
             ["stats", "--mode", "raw-data", "--json", "--tag", "openhost"],
             conf,
@@ -911,10 +911,7 @@ async def repo_stats() -> tuple[dict | None, str | None]:
         if rc != 0:
             return None, stderr.decode(errors="replace").strip() or f"restic exit {rc}"
         data = json.loads(stdout.decode(errors="replace") or "{}")
-        # raw-data mode returns total_size / total_blob_count / snapshots_count
-        # and compression stats. It does NOT return total_file_count (that
-        # only exists for restore-size / files-by-contents). We surface
-        # total_size because that's the actual on-disk / S3 footprint.
+        # Returns stats on compressed binary blobs, not original content
         return {
             "total_size_bytes": data.get("total_size", 0),
             "total_uncompressed_size_bytes": data.get("total_uncompressed_size", 0),
