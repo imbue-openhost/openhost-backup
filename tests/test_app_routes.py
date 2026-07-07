@@ -6,6 +6,7 @@ Quart test client.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -736,6 +737,33 @@ class TestRepoStatsCache:
         self._record_backup()
         assert backup_app.load_repo_stats_cache() is None
 
+    async def test_config_repo_change_invalidates_cache(self, client):
+        # Changing the repo URL must drop the cache (it described the old repo).
+        conf = backup_app.load_config()
+        conf["repo"] = "s3:old"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        self._record_backup(repo_stats=self.STATS)
+        assert backup_app.load_repo_stats_cache() is not None
+        resp = await client.post("/api/config", json={"repo": "s3:new"})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is None
+
+    async def test_config_non_repo_change_keeps_cache(self, client):
+        # Changing a non-repo field leaves the cache intact.
+        conf = backup_app.load_config()
+        conf["repo"] = "s3:same"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        self._record_backup(repo_stats=self.STATS)
+        resp = await client.post("/api/config", json={"interval_seconds": 120})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is not None
+        # Re-saving the same repo URL is a no-op for the cache too.
+        resp = await client.post("/api/config", json={"repo": "s3:same"})
+        assert resp.status_code == 200
+        assert backup_app.load_repo_stats_cache() is not None
+
     def test_load_returns_newest_stamped_row(self, client):
         # An unstamped newer backup must not shadow the last known-good stats.
         self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
@@ -797,8 +825,9 @@ class TestRepoStatsCache:
         assert body["error"] == "boom"
 
     async def test_delete_snapshot_restamps_surviving_row(self, client):
-        # Two stamped backups; deleting the newer must re-stamp the survivor
-        # with freshly recomputed stats (the delete path's inline UPDATE).
+        # Two stamped backups; deleting the newer removes its row and re-stamps
+        # the survivor with freshly recomputed stats (refresh awaited inline
+        # under the DELETE lock). delete_snapshot must also leave op_lock free.
         self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
         self._record_backup(repo_stats=self.STATS, snapshot_id="b" * 64)
         conf = backup_app.load_config()
@@ -813,9 +842,302 @@ class TestRepoStatsCache:
         ):
             ok = await backup_app.delete_snapshot("b" * 64)
         assert ok is True
+        assert not backup_app.op_lock.busy  # lock released after the delete
         loaded = backup_app.load_repo_stats_cache()
         assert loaded["total_size_bytes"] == 1_000_000_000
         assert loaded["snapshots_count"] == 1
+
+    async def test_delete_snapshot_rejected_when_busy(self, client):
+        # A delete must not proceed while another operation holds op_lock.
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            with patch.object(
+                backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+            ) as mock_restic:
+                ok = await backup_app.delete_snapshot("a" * 64)
+            assert ok is False
+            mock_restic.assert_not_called()  # never ran the prune
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+    async def test_refresh_repo_stats_cache_restamps_newest(self, client):
+        # The background helper on its own: recompute + re-stamp the newest row.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        fresh = {**self.STATS, "total_size_bytes": 1_000_000_000, "snapshots_count": 1}
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(fresh, None))
+        ):
+            await backup_app._refresh_repo_stats_cache()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == 1_000_000_000
+        assert loaded["snapshots_count"] == 1
+
+    async def test_refresh_repo_stats_cache_noop_on_failure(self, client):
+        # If stats can't be computed, the previous stamp is left untouched.
+        self._record_backup(repo_stats=self.STATS, snapshot_id="a" * 64)
+        with patch.object(
+            backup_app, "repo_stats", new=AsyncMock(return_value=(None, "boom"))
+        ):
+            await backup_app._refresh_repo_stats_cache()
+        loaded = backup_app.load_repo_stats_cache()
+        assert loaded["total_size_bytes"] == self.STATS["total_size_bytes"]
+
+
+class TestCheckDoesNotLock:
+    """`restic check` is a read-only scan run with --no-lock, so it takes no
+    restic lock and must NOT claim op_lock — otherwise a long check would block
+    scheduled backups. Mutual exclusion at *start* is enforced by the route."""
+
+    def _configure(self):
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/test-repo"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+
+    async def test_check_uses_no_lock_and_never_claims_op_lock(self, client):
+        self._configure()
+        seen = {}
+
+        async def fake_run(args, conf, timeout=None):
+            # cat config probe -> repo exists; check -> record args + lock state.
+            if args and args[0] == "check":
+                seen["args"] = args
+                seen["active"] = backup_app.op_lock.active
+            return 0, b"", b""
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            ok = await backup_app.run_check()
+        assert ok is True
+        assert "--no-lock" in seen["args"]  # takes no restic lock
+        assert seen["active"] is None  # op_lock never claimed during the check
+        assert not backup_app.op_lock.busy
+
+    async def test_check_runs_even_while_op_lock_held(self, client):
+        # run_check itself doesn't gate on op_lock (the route does); it must
+        # still run to completion if invoked while another op holds the lock.
+        self._configure()
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            with patch.object(
+                backup_app, "_run_restic", new=AsyncMock(return_value=(0, b"", b""))
+            ) as mock_restic:
+                ok = await backup_app.run_check()
+            assert ok is True
+            assert mock_restic.called  # not blocked by op_lock
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+    async def test_check_route_rejected_when_busy(self, client):
+        # The *route* refuses to start a check while another op is modifying.
+        self._configure()
+        backup_app.op_lock.try_acquire(backup_app.OpKind.BACKUP)
+        try:
+            resp = await client.post("/api/check")
+            assert resp.status_code == 409
+            body = await resp.get_json()
+            assert "backup" in body["error"]
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.BACKUP)
+
+
+class TestStatusPush:
+    """The SSE push mechanism behind the live status banner."""
+
+    def test_lock_status_reflects_op_lock(self, client):
+        assert backup_app._lock_status()["busy"] is False
+        backup_app.op_lock.try_acquire(backup_app.OpKind.DELETE)
+        try:
+            s = backup_app._lock_status()
+            assert s["busy"] is True
+            assert s["active_op"] == "delete"
+            assert "delete" in s["busy_message"]
+        finally:
+            backup_app.op_lock.release(backup_app.OpKind.DELETE)
+
+    def test_notify_wakes_subscribers(self, client):
+        q: asyncio.Queue = asyncio.Queue()
+        backup_app._status_subscribers.add(q)
+        try:
+            backup_app._notify_status_change()
+            assert q.qsize() == 1
+        finally:
+            backup_app._status_subscribers.discard(q)
+
+    def test_notify_tolerates_full_subscriber_queue(self, client):
+        q: asyncio.Queue = asyncio.Queue(maxsize=1)
+        q.put_nowait(None)  # already full
+        backup_app._status_subscribers.add(q)
+        try:
+            backup_app._notify_status_change()  # must not raise
+            assert q.qsize() == 1
+        finally:
+            backup_app._status_subscribers.discard(q)
+
+
+class TestZoneTagging:
+    """Backups carry openhost + zone:<domain>; the snapshot list keeps this
+    zone's snapshots plus legacy (zone-less) ones and hides other zones'.
+    Falls back to openhost-only when OPENHOST_ZONE_DOMAIN is unset."""
+
+    ZONE = "samuel.selfhost.imbue.com"
+
+    def test_backup_tags_include_zone_when_set(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        assert backup_app._backup_tags() == ["openhost", f"zone:{self.ZONE}"]
+        assert backup_app._backup_tags("nightly") == [
+            "openhost",
+            f"zone:{self.ZONE}",
+            "name:nightly",
+        ]
+
+    def test_in_scope_keeps_mine_and_legacy_hides_foreign(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        assert backup_app._snapshot_in_scope(["openhost", f"zone:{self.ZONE}"])  # mine
+        assert backup_app._snapshot_in_scope(["openhost"])  # legacy, no zone tag
+        assert not backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
+
+    def test_backup_tags_and_scope_fall_back_when_zone_unset(self, client, monkeypatch):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", "")
+        assert backup_app._backup_tags("nightly") == ["openhost", "name:nightly"]
+        # No zone identity -> everything openhost is in scope.
+        assert backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
+
+    async def test_list_snapshots_includes_legacy_excludes_foreign(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/r"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        snaps = [
+            {"id": "a" * 64, "short_id": "a", "time": "2026-01-03T00:00:00Z",
+             "tags": ["openhost", f"zone:{self.ZONE}"]},          # mine
+            {"id": "b" * 64, "short_id": "b", "time": "2026-01-02T00:00:00Z",
+             "tags": ["openhost"]},                                # legacy
+            {"id": "c" * 64, "short_id": "c", "time": "2026-01-01T00:00:00Z",
+             "tags": ["openhost", "zone:other.example.com"]},      # foreign
+        ]
+
+        async def fake_run(args, conf, timeout=None):
+            if args and args[0] == "snapshots":
+                return 0, json.dumps(snaps).encode(), b""
+            return 0, b"", b""  # cat config probe -> repo exists
+
+        with patch.object(backup_app, "_run_restic", new=fake_run):
+            out, ok = await backup_app.list_snapshots()
+        assert ok is True
+        ids = {s["short_id"] for s in out}
+        assert ids == {"a", "b"}  # mine + legacy, foreign excluded
+
+
+class TestSnapshotBrowsing:
+    """Top-level roots come from snapshot metadata (no recursive ls probe),
+    and directory listings stream instead of buffering the whole subtree."""
+
+    async def test_roots_come_from_metadata_without_ls(self, client):
+        root_paths = {name: str(p) for name, p in backup_app._ROOT_NAMES.items()}
+        snap_json = json.dumps(
+            [{"id": "s" * 64, "paths": [root_paths["app_data"], root_paths["vm_data"]]}]
+        ).encode()
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            return 0, snap_json, b""
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == {"app_data", "vm_data"}
+        # Exactly one restic call — the metadata lookup — and never an ls probe.
+        assert len(calls) == 1
+        assert calls[0][0] == "snapshots"
+        assert all(a[0] != "ls" for a in calls)
+
+    async def test_metadata_failure_falls_back_to_ls(self, client):
+        # When the metadata read fails, we fall back to per-root ls probing.
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            if args[0] == "snapshots":
+                return 1, b"", b"boom"  # metadata read fails
+            return 0, b"", b""  # ls probe: root present
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
+        assert any(a[0] == "ls" for a in calls)  # fallback ran
+
+    async def test_listing_streams_only_immediate_children(self, client):
+        conf = backup_app.load_config()
+        conf["repo"] = "/tmp/r"
+        conf["repo_password"] = "p"
+        backup_app.save_config(conf)
+        root_path = str(backup_app._ROOT_NAMES["app_data"])
+        lines = [
+            json.dumps({"struct_type": "snapshot"}),  # header, ignored
+            json.dumps(
+                {
+                    "struct_type": "node",
+                    "path": root_path + "/file1",
+                    "type": "file",
+                    "size": 10,
+                    "mtime": "2026-01-01T00:00:00Z",
+                }
+            ),
+            json.dumps(
+                {"struct_type": "node", "path": root_path + "/dir1", "type": "dir"}
+            ),
+            json.dumps(
+                {
+                    "struct_type": "node",
+                    "path": root_path + "/dir1/nested",  # deeper — excluded
+                    "type": "file",
+                }
+            ),
+        ]
+
+        async def fake_stream(args, conf, timeout, on_line):
+            assert args[0] == "ls"  # still an ls, just streamed
+            for ln in lines:
+                on_line(ln + "\n")
+            return 0, b""
+
+        with patch.object(backup_app, "_run_restic_streaming", fake_stream):
+            files, err = await backup_app.list_snapshot_files("s" * 64, root="app_data")
+        assert err is None
+        assert {f["path"] for f in files} == {"file1", "dir1"}
+        f1 = next(f for f in files if f["path"] == "file1")
+        assert f1["is_dir"] is False and f1["size"] == 10
+        d1 = next(f for f in files if f["path"] == "dir1")
+        assert d1["is_dir"] is True
+
+    async def test_metadata_with_no_matching_roots_falls_back_to_ls(self, client):
+        # Metadata is readable but its paths don't match any known root — must
+        # defer to the authoritative ls probe, not report "no roots".
+        calls = []
+
+        async def fake_run_restic(args, conf, timeout=None):
+            calls.append(args)
+            if args[0] == "snapshots":
+                return 0, json.dumps([{"id": "s" * 64, "paths": ["/other"]}]).encode(), b""
+            return 0, b"", b""  # ls probe: root present
+
+        with patch.object(backup_app, "_run_restic", fake_run_restic):
+            roots = await backup_app._list_roots_in_snapshot(
+                "s" * 64, {"repo": "r", "repo_password": "p"}
+            )
+        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
+        assert any(a[0] == "ls" for a in calls)  # fell back to probing
 
 
 class TestRetention:

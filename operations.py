@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -21,6 +22,9 @@ class OpKind(Enum):
     BACKUP = "backup"
     RESTORE = "restore"
     MIGRATION = "migration"
+    # Manual removal of a single snapshot (restic forget --prune <id>).
+    DELETE = "delete"
+    # Background retention prune worker (restic prune after keep-* forget).
     PRUNE = "prune"
 
 
@@ -36,6 +40,20 @@ class OperationLock:
 
     _active: OpKind | None = field(default=None, init=False)
     _last_activity: float | None = field(default=None, init=False)
+    # Called (no args) on every state transition — acquire and release — so a
+    # push channel (SSE) can notify clients the instant the lock changes rather
+    # than waiting for the next poll. Set via ``set_on_change``.
+    _on_change: Callable[[], None] | None = field(default=None, init=False)
+
+    def set_on_change(self, callback: Callable[[], None] | None) -> None:
+        self._on_change = callback
+
+    def _fire_change(self) -> None:
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception:
+                logger.exception("op_lock on_change callback failed")
 
     @property
     def active(self) -> OpKind | None:
@@ -46,6 +64,20 @@ class OperationLock:
     def busy(self) -> bool:
         return self._active is not None
 
+    def busy_message(self) -> str | None:
+        """User-facing explanation of the current operation, or ``None`` if idle.
+
+        Single source of the wording used both by the UI status banner and by
+        routes that reject a request because another operation holds the lock,
+        so the two never drift.
+        """
+        if self._active is None:
+            return None
+        return (
+            f"A {self._active.value} is in progress — other operations "
+            f"are paused until it finishes."
+        )
+
     def try_acquire(self, kind: OpKind) -> str | None:
         """Try to start *kind*.
 
@@ -53,9 +85,10 @@ class OperationLock:
         error-message string explaining why it couldn't be acquired.
         """
         if self._active is not None:
-            return f"{self._active.value} in progress"
+            return self.busy_message()
         self._active = kind
         self._last_activity = time.monotonic()
+        self._fire_change()
         return None
 
     def release(self, kind: OpKind) -> None:
@@ -66,6 +99,7 @@ class OperationLock:
             )
         self._active = None
         self._last_activity = None
+        self._fire_change()
 
     def touch(self, *, now: float | None = None) -> None:
         """Mark activity on the held operation, refreshing its staleness clock.
@@ -118,3 +152,11 @@ class OperationLock:
     @property
     def migration_running(self) -> bool:
         return self._active == OpKind.MIGRATION
+
+    @property
+    def delete_running(self) -> bool:
+        return self._active == OpKind.DELETE
+
+    @property
+    def prune_running(self) -> bool:
+        return self._active == OpKind.PRUNE
