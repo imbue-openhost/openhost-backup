@@ -1,16 +1,16 @@
-# openhost-backup
+# bottle-backup
 
-User-controlled incremental backups and cross-instance migration for OpenHost, powered by [restic](https://restic.net).
+User-controlled incremental backups and cross-instance migration for Cloud in a Bottle, powered by [restic](https://restic.net).
 
 ## What it does
 
-This app backs up the persistent data on an OpenHost instance to a storage backend you control: S3, Backblaze B2, SFTP, Google Cloud Storage, Azure Blob, OpenStack Swift, rclone remotes, a restic REST server, or a local directory. Backups are incremental and deduplicated (restic handles this automatically), so only changed data is transferred on each run. It also provides a migration tool that pushes apps and data from one OpenHost instance to another over HTTP.
+This app backs up the persistent data on a Cloud in a Bottle instance to a storage backend you control: S3, Backblaze B2, SFTP, Google Cloud Storage, Azure Blob, OpenStack Swift, rclone remotes, a restic REST server, or a local directory. Backups are incremental and deduplicated (restic handles this automatically), so only changed data is transferred on each run. It also provides a migration tool that pushes apps and data from one Cloud in a Bottle instance to another over HTTP.
 
 The app has `access_all_data = true` in its manifest, which means it can see and back up every app's persistent data directory, temp data, and VM-level data. The archive tier (`/data/app_archive`) is intentionally excluded because it already lives in durable storage (an S3 bucket or host-managed local archive).
 
 ## Getting started
 
-1. Install the app from the OpenHost dashboard (point it at this repo).
+1. Install the app from the Cloud in a Bottle dashboard (point it at this repo).
 2. Open the Backup UI at `https://backup.<your-zone>/`.
 3. Enter your restic repository URL and password.
 4. Optionally configure backend credentials (AWS keys, B2 keys, etc.) in the environment variables section.
@@ -41,13 +41,13 @@ Any backend restic supports works here. The repository URL format follows restic
 | Backend | URL format | Example |
 |---------|-----------|---------|
 | Amazon S3 | `s3:s3.amazonaws.com/bucket` | `s3:s3.us-east-1.amazonaws.com/my-backups` |
-| Backblaze B2 | `b2:bucket-name:path` | `b2:my-backups:/openhost` |
+| Backblaze B2 | `b2:bucket-name:path` | `b2:my-backups:/bottle` |
 | SFTP | `sftp:user@host:/path` | `sftp:backup@nas.local:/backups` |
-| Google Cloud Storage | `gs:bucket:/path` | `gs:my-backups:/openhost` |
-| Azure Blob | `azure:container:path` | `azure:backups:/openhost` |
-| OpenStack Swift | `swift:container:/path` | `swift:my-backups:/openhost` |
+| Google Cloud Storage | `gs:bucket:/path` | `gs:my-backups:/bottle` |
+| Azure Blob | `azure:container:path` | `azure:backups:/bottle` |
+| OpenStack Swift | `swift:container:/path` | `swift:my-backups:/bottle` |
 | REST server | `rest:http://host:port/` | `rest:https://restic.example.com/` |
-| rclone | `rclone:remote:path` | `rclone:b2-remote:backups/openhost` |
+| rclone | `rclone:remote:path` | `rclone:b2-remote:backups/bottle` |
 | Local path | `/path/to/repo` | `/data/app_data/backup/local-repo` |
 
 Backend credentials (like `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for S3) are set through the environment variables field in the UI. The UI includes inline examples for common setups like S3.
@@ -75,13 +75,13 @@ After each successful backup, old snapshots are expired according to a retention
 
 A snapshot is kept if it matches **any** rule (the rules are OR'd), so tiers combine additively — e.g. `keep_last=5, keep_daily=7, keep_weekly=4` keeps the 5 most recent plus one per day for 7 days plus one per week for 4 weeks, deduplicated where they overlap. Set a field to 0 to disable that tier. **If every field is 0, nothing is expired** — the safety floor means the app never issues a `forget` with zero keep rules (which would delete everything).
 
-The policy is applied across all `openhost`-tagged snapshots as a single group (`--group-by ''`), which assumes one instance per repository. Every snapshot is recorded with a stable host (`--host`, set to the zone domain) so its identity doesn't change when the backup container is redeployed.
+The policy is applied across all `bottle`-tagged snapshots (and legacy `openhost`-tagged ones) as a single group (`--group-by ''`), which assumes one instance per repository. Every snapshot is recorded with a stable host (`--host`, set to the zone domain) so its identity doesn't change when the backup container is redeployed.
 
 Retention runs `forget` inline after the backup (fast — it only rewrites metadata) and reconciles the backup history database to match. The actual space is reclaimed by a `restic prune`, which runs **in the background** and only when snapshots were actually expired, so it never delays the backup or blocks the UI.
 
 ## Snapshots
 
-Each successful backup creates a restic snapshot tagged with `openhost`. The UI lists snapshots newest-first and lets you:
+Each successful backup creates a restic snapshot tagged with `bottle`. Older snapshots tagged `openhost` are still listed, restored, and expired. The UI lists snapshots newest-first and lets you:
 
 - Browse files in any snapshot (organized by data root: app_data, app_temp_data, vm_data)
 - Restore a snapshot (to all data roots, or to a specific root)
@@ -96,7 +96,7 @@ Restore overwrites files in place. During a full restore (all data roots), the a
 
 You can restore a full snapshot (all data roots) or a single root (for example, only app_data). During restore, a mutual-exclusion lock prevents concurrent backups or migrations.
 
-After restoring, you will likely need to reload the affected apps through the OpenHost dashboard so they pick up the restored data.
+After restoring, you will likely need to reload the affected apps through the Cloud in a Bottle dashboard so they pick up the restored data.
 
 ## Integrity checks
 
@@ -104,13 +104,13 @@ The "Run restic check" button runs `restic check`, which verifies the internal c
 
 ## Migration
 
-The Migrate tab provides a one-click way to move apps and data from this instance to another OpenHost instance. Both instances must have the backup app installed.
+The Migrate tab provides a one-click way to move apps and data from this instance to another Cloud in a Bottle instance. Both instances must have the backup app installed.
 
 ### How migration works
 
 1. The source gathers metadata about installed apps (from the router database or API).
 2. A manifest is sent to the target, which stops its apps and clears data directories for the apps being migrated.
-3. Each app's data directory is compressed as a tar.gz archive and streamed to the target. Archives larger than 14 MB are split into chunks to stay under the OpenHost reverse proxy's body size limit.
+3. Each app's data directory is compressed as a tar.gz archive and streamed to the target. Archives larger than 14 MB are split into chunks to stay under the Cloud in a Bottle reverse proxy's body size limit.
 4. The target extracts received data, fixes file ownership, then deploys or reloads each app.
 5. Apps that were running on the source are started on the target. Apps that were stopped remain stopped. Non-migrated apps that were stopped for the transfer are restarted.
 
@@ -133,13 +133,13 @@ Configuration is stored in `/data/app_data/backup/config.json` with permissions 
 | `env` | Backend credential environment variables (e.g., AWS keys) |
 | `interval_seconds` | Automatic backup interval (0 = disabled) |
 | `keep_last` / `keep_hourly` / `keep_daily` / `keep_weekly` / `keep_monthly` / `keep_yearly` | Retention policy tiers (0 = tier disabled; all 0 = keep everything) |
-| `router_api_token` | OpenHost router API token (needed for migration) |
+| `router_api_token` | Cloud in a Bottle router API token (needed for migration) |
 
 The config API (`POST /api/config`) requires a valid Bearer token to rotate the `router_api_token` after it has been set, preventing co-located containers from silently replacing it.
 
 ## API
 
-All routes are registered at both `/path` and `/backup/path` to handle the OpenHost base-path proxy.
+All routes are registered at both `/path` and `/backup/path` to handle the Cloud in a Bottle base-path proxy.
 
 ### Backup and restore
 
@@ -191,7 +191,7 @@ All routes are registered at both `/path` and `/backup/path` to handle the OpenH
 | `operations.py` | Mutual-exclusion lock ensuring only one backup, restore, migration, or prune runs at a time |
 | `migration.py` | Cross-instance migration logic (direct push protocol, tar streaming, app deployment) |
 | `Dockerfile` | Python 3.12 Alpine image with restic and uv |
-| `openhost.toml` | OpenHost manifest (2048 MB memory, 1000 millicores CPU, `access_all_data = true`) |
+| `openhost.toml` | App manifest (2048 MB memory, 1000 millicores CPU, `access_all_data = true`) |
 | `templates/index.html` | Single-page web UI with Backups and Migrate tabs |
 | `tests/` | Pytest test suite covering routes, exclude logic, and migration |
 

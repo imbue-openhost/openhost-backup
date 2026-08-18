@@ -979,31 +979,39 @@ class TestStatusPush:
 
 
 class TestZoneTagging:
-    """Backups carry openhost + zone:<domain>; the snapshot list keeps this
-    zone's snapshots plus legacy (zone-less) ones and hides other zones'.
-    Falls back to openhost-only when OPENHOST_ZONE_DOMAIN is unset."""
+    """New backups carry bottle + zone:<domain>; the snapshot list keeps this
+    zone's snapshots plus legacy (zone-less / openhost-tagged) ones and hides
+    other zones'. Falls back to unscoped when OPENHOST_ZONE_DOMAIN is unset."""
 
     ZONE = "samuel.selfhost.imbue.com"
 
     def test_backup_tags_include_zone_when_set(self, client, monkeypatch):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
-        assert backup_app._backup_tags() == ["openhost", f"zone:{self.ZONE}"]
+        assert backup_app._backup_tags() == ["bottle", f"zone:{self.ZONE}"]
         assert backup_app._backup_tags("nightly") == [
-            "openhost",
+            "bottle",
             f"zone:{self.ZONE}",
             "name:nightly",
         ]
 
     def test_in_scope_keeps_mine_and_legacy_hides_foreign(self, client, monkeypatch):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
-        assert backup_app._snapshot_in_scope(["openhost", f"zone:{self.ZONE}"])  # mine
+        assert backup_app._snapshot_in_scope(["bottle", f"zone:{self.ZONE}"])  # mine
         assert backup_app._snapshot_in_scope(["openhost"])  # legacy, no zone tag
         assert not backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
 
+    def test_has_app_tag_accepts_bottle_and_legacy_openhost(self, client):
+        assert backup_app._has_app_tag(["bottle"])
+        assert backup_app._has_app_tag(["openhost", "zone:x"])
+        assert not backup_app._has_app_tag(["name:nightly"])
+
+    def test_restic_tag_args_or_bottle_and_openhost(self, client):
+        assert backup_app._restic_tag_args() == ["--tag", "bottle", "--tag", "openhost"]
+
     def test_backup_tags_and_scope_fall_back_when_zone_unset(self, client, monkeypatch):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", "")
-        assert backup_app._backup_tags("nightly") == ["openhost", "name:nightly"]
-        # No zone identity -> everything openhost is in scope.
+        assert backup_app._backup_tags("nightly") == ["bottle", "name:nightly"]
+        # No zone identity -> everything is in scope.
         assert backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
 
     async def test_list_snapshots_includes_legacy_excludes_foreign(
@@ -1016,11 +1024,13 @@ class TestZoneTagging:
         backup_app.save_config(conf)
         snaps = [
             {"id": "a" * 64, "short_id": "a", "time": "2026-01-03T00:00:00Z",
-             "tags": ["openhost", f"zone:{self.ZONE}"]},          # mine
+             "tags": ["bottle", f"zone:{self.ZONE}"]},            # mine
             {"id": "b" * 64, "short_id": "b", "time": "2026-01-02T00:00:00Z",
-             "tags": ["openhost"]},                                # legacy
+             "tags": ["openhost"]},                                # legacy tag
             {"id": "c" * 64, "short_id": "c", "time": "2026-01-01T00:00:00Z",
              "tags": ["openhost", "zone:other.example.com"]},      # foreign
+            {"id": "d" * 64, "short_id": "d", "time": "2026-01-01T00:00:00Z",
+             "tags": ["other"]},                                   # not ours
         ]
 
         async def fake_run(args, conf, timeout=None):
@@ -1032,7 +1042,7 @@ class TestZoneTagging:
             out, ok = await backup_app.list_snapshots()
         assert ok is True
         ids = {s["short_id"] for s in out}
-        assert ids == {"a", "b"}  # mine + legacy, foreign excluded
+        assert ids == {"a", "b"}  # mine + legacy openhost, foreign/other excluded
 
 
 class TestSnapshotBrowsing:
@@ -1151,8 +1161,11 @@ class TestRetention:
         args = backup_app._forget_args(conf)
         assert args[0] == "forget"
         assert "--json" in args
-        # scoped to our snapshots, single group
-        assert args[args.index("--tag") + 1] == "openhost"
+        # scoped to bottle + legacy openhost (OR), single group
+        assert args.count("--tag") == 2
+        assert args[args.index("--tag") + 1] == "bottle"
+        second = args.index("--tag", args.index("--tag") + 1)
+        assert args[second + 1] == "openhost"
         assert args[args.index("--group-by") + 1] == ""  # single universal group
         # set tiers present, unset omitted, never --prune
         assert args[args.index("--keep-last") + 1] == "5"

@@ -67,7 +67,7 @@ ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 # to the (stable) zone domain gives every snapshot from this instance one
 # identity — and, in a shared repo, keeps instances distinguishable. Falls back
 # to a constant when the zone domain isn't set so we never pass an empty --host.
-BACKUP_HOST = ZONE_DOMAIN or "openhost"
+BACKUP_HOST = ZONE_DOMAIN or "bottle"
 # Router API token — the backup app needs this to call the local router API.
 # The OPENHOST_APP_TOKEN is for cross-app service communication and does NOT
 # grant access to router management endpoints (/api/apps, /reload_app, etc.).
@@ -111,19 +111,33 @@ KEEP_FLAGS = {
 SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
-# Backups are tagged ``openhost`` (this app) plus ``zone:<domain>`` so that when
-# several zones share one restic repo, each zone's snapshots — and its repo-size
-# totals — stay distinguishable. When OPENHOST_ZONE_DOMAIN isn't set (local dev,
-# tests) the zone tag is omitted and behaviour matches the old openhost-only
-# scheme.
+# New snapshots are tagged ``bottle`` plus ``zone:<domain>``. Legacy snapshots
+# used ``openhost``; list/stats/forget still accept that tag. No zone tag in
+# local dev (OPENHOST_ZONE_DOMAIN unset) matches the old unscoped scheme.
+SNAPSHOT_TAG = "bottle"
+LEGACY_SNAPSHOT_TAG = "openhost"
+SNAPSHOT_TAGS = (SNAPSHOT_TAG, LEGACY_SNAPSHOT_TAG)
+
+
 def _zone_tag() -> str | None:
     return f"zone:{ZONE_DOMAIN}" if ZONE_DOMAIN else None
 
 
+def _restic_tag_args() -> list[str]:
+    """``--tag bottle --tag openhost``. restic ORs repeated ``--tag`` flags."""
+    args: list[str] = []
+    for tag in SNAPSHOT_TAGS:
+        args += ["--tag", tag]
+    return args
+
+
+def _has_app_tag(tags: list[str]) -> bool:
+    return any(t in SNAPSHOT_TAGS for t in tags)
+
+
 def _backup_tags(name: str | None = None) -> list[str]:
-    """Tags applied to a new snapshot: always ``openhost``, plus the zone tag
-    (when known) and an optional ``name:<name>``."""
-    tags = ["openhost"]
+    """Tags on a new snapshot: ``bottle``, optional zone, optional ``name:``."""
+    tags = [SNAPSHOT_TAG]
     zone = _zone_tag()
     if zone:
         tags.append(zone)
@@ -139,10 +153,8 @@ def _snapshot_in_scope(tags: list[str]) -> bool:
     the latter covers *legacy* snapshots written before zone tagging existed
     (and any run where OPENHOST_ZONE_DOMAIN wasn't set). Only snapshots tagged
     for a *different* zone are hidden. With no zone configured here, everything
-    is in scope.
-
-    restic ``--tag`` can't express "has no zone tag", so callers filter
-    ``--tag openhost`` at restic and narrow with this in Python.
+    is in scope. Callers also require ``_has_app_tag`` (``bottle`` or legacy
+    ``openhost``); restic ``--tag`` can't express "has no zone tag".
     """
     zone = _zone_tag()
     if zone is None:
@@ -518,12 +530,12 @@ async def _verify_admin_token(supplied: str | None) -> bool:
 
     The backup app is reachable unauthenticated from inside the container
     network (co-located apps on the Docker bridge can hit
-    ``http://backup:8080/...`` directly, bypassing the OpenHost router's
+    ``http://backup:8080/...`` directly, bypassing the Cloud in a Bottle router's
     auth layer). Sensitive operations — password reveal, writing the
     stored router_api_token or repo_password — must therefore require an
     explicit caller token.
 
-    We accept any token that the local OpenHost router accepts. The
+    We accept any token that the local Cloud in a Bottle router accepts. The
     router validates the token by checking it against the owner API
     tokens table, so this gives us real auth even though the backup app
     itself doesn't have a user database.
@@ -831,7 +843,7 @@ def _build_restic_debug(conf: dict) -> dict:
     """Return the restic command + env used for testing.
 
     All values are included in plaintext — this app has no public routes,
-    so callers are already authed as the owner by the OpenHost router.
+    so callers are already authed as the owner by the Cloud in a Bottle router.
     The UI hides the secret-looking values behind a 'Show secrets' button
     purely as a shoulder-surfing guard.
     """
@@ -1028,13 +1040,12 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         logger.info("list_snapshots: %s", init_err)
         return [], False
     try:
-        # Filter to this app's snapshots (openhost) at restic, then narrow to
-        # this zone in Python: keep this zone's snapshots plus legacy ones with
-        # no zone tag, and drop snapshots belonging to a *different* zone. This
-        # keeps pre-zone-tag snapshots readable while still isolating zones that
-        # share a repo. See _snapshot_in_scope.
+        # Filter to this app's snapshots (bottle or legacy openhost) at restic,
+        # then narrow to this zone in Python: keep this zone's snapshots plus
+        # legacy ones with no zone tag, and drop snapshots belonging to a
+        # *different* zone. See _snapshot_in_scope.
         rc, stdout, stderr = await _run_restic(
-            ["snapshots", "--json", "--tag", "openhost", "--no-lock"],
+            ["snapshots", "--json", *_restic_tag_args(), "--no-lock"],
             conf,
             timeout=60,
         )
@@ -1047,7 +1058,7 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         out = []
         for e in entries:
             tags = e.get("tags", []) or []
-            if not _snapshot_in_scope(tags):
+            if not _has_app_tag(tags) or not _snapshot_in_scope(tags):
                 continue
             out.append(
                 {
@@ -1077,11 +1088,12 @@ async def repo_stats() -> tuple[dict | None, str | None]:
 
     Uses ``restic stats --mode raw-data`` which reports the deduplicated /
     compressed on-disk footprint of the repository (this is the number that
-    matters for S3 cost / local disk usage). Scopes to the ``openhost`` tag —
-    the *total* app footprint across zones. We intentionally don't narrow to a
-    single zone here: restic dedups blobs across all snapshots, so per-zone
-    size attribution is ill-defined, and the cost-relevant number is the whole
-    openhost footprint (which also naturally includes legacy snapshots).
+    matters for S3 cost / local disk usage). Scopes to the ``bottle`` tag and
+    the legacy ``openhost`` tag — the *total* app footprint across zones. We
+    intentionally don't narrow to a single zone here: restic dedups blobs
+    across all snapshots, so per-zone size attribution is ill-defined, and the
+    cost-relevant number is the whole bottle footprint (which also naturally
+    includes legacy snapshots).
     """
     try:
         conf = load_config()
@@ -1092,7 +1104,7 @@ async def repo_stats() -> tuple[dict | None, str | None]:
         if init_err:
             return None, init_err
         rc, stdout, stderr = await _run_restic(
-            ["stats", "--mode", "raw-data", "--json", "--tag", "openhost", "--no-lock"],
+            ["stats", "--mode", "raw-data", "--json", *_restic_tag_args(), "--no-lock"],
             conf,
             timeout=60,
         )
@@ -1469,13 +1481,13 @@ def _forget_args(conf: dict) -> list[str] | None:
     intentionally omitted — it runs in the background afterwards (see
     ``schedule_prune``).
 
-    Scoping: ``--tag openhost`` selects our snapshots and ``--group-by ''``
-    (empty) treats them all as ONE group so the policy applies across the
-    whole set. We assume a single instance per repo, so no per-host/paths
-    grouping is needed — and grouping would only fragment retention (paths
-    vary when a root like vm_data is absent; host varied on older snapshots
-    before we began pinning ``--host BACKUP_HOST``). Backups are pinned to
-    the zone host from now on for a stable snapshot identity.
+    Scoping: ``--tag bottle --tag openhost`` selects our snapshots (OR) and
+    ``--group-by ''`` (empty) treats them all as ONE group so the policy
+    applies across the whole set. We assume a single instance per repo, so no
+    per-host/paths grouping is needed — and grouping would only fragment
+    retention (paths vary when a root like vm_data is absent; host varied on
+    older snapshots before we began pinning ``--host BACKUP_HOST``). Backups
+    are pinned to the zone host from now on for a stable snapshot identity.
 
     Values are stored as validated ints by ``post_config`` and seeded by
     ``DEFAULT_CONFIG``, so we can read them directly.
@@ -1491,8 +1503,7 @@ def _forget_args(conf: dict) -> list[str] | None:
         "--json",
         "--retry-lock",
         RETRY_LOCK,
-        "--tag",
-        "openhost",
+        *_restic_tag_args(),
         "--group-by",
         "",
         *keeps,
@@ -2046,7 +2057,7 @@ async def post_config():
     data = await request.get_json()
     current_conf = load_config()
 
-    # router_api_token is special: it lets this app call the OpenHost
+    # router_api_token is special: it lets this app call the Cloud in a Bottle
     # router. After it's been set once, require a Bearer token to rotate
     # it so a co-located container can't quietly swap it for one they
     # control.
@@ -2584,7 +2595,7 @@ async def trigger_direct_push():
                         "Go to the Backups tab and set a valid router_api_token "
                         "in the backup config (POST /api/config with "
                         '{"router_api_token": "..."}). '
-                        "You can generate a token from the OpenHost dashboard "
+                        "You can generate a token from the Cloud in a Bottle dashboard "
                         "under API Tokens.",
                     ), 400
         except Exception:
@@ -2597,7 +2608,7 @@ async def trigger_direct_push():
             "token to access the local router API during migration. "
             "Set one via the backup config: POST /api/config with "
             '{"router_api_token": "YOUR_TOKEN"}. You can generate '
-            "a token from the OpenHost dashboard under API Tokens.",
+            "a token from the Cloud in a Bottle dashboard under API Tokens.",
         ), 400
 
     asyncio.create_task(

@@ -224,7 +224,7 @@ class TestBuildManifest:
         manifest = _build_manifest(sample_apps, "test.example.com")
         assert manifest["version"] == MIGRATION_PROTOCOL_VERSION
         assert manifest["source_instance"] == "test.example.com"
-        assert manifest["source_platform"] == "openhost"
+        assert manifest["source_platform"] == "bottle"
         assert "created_at" in manifest
         assert isinstance(manifest["apps"], list)
         assert len(manifest["apps"]) == 2
