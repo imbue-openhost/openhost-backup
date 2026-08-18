@@ -1,6 +1,6 @@
 """Cross-instance migration via direct push.
 
-This module handles migrating apps and data between OpenHost instances.
+This module handles migrating apps and data between Cloud in a Bottle instances.
 The source streams app data as tar.gz archives directly to the target
 instance's backup app over HTTP.  The target stops its apps, wipes data
 for migrated apps, receives the new data, then deploys/restarts apps.
@@ -123,7 +123,7 @@ def _log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Router HTTP helpers  (OpenHost-specific)
+# Router HTTP helpers  (Cloud in a Bottle-specific)
 # ---------------------------------------------------------------------------
 
 
@@ -271,7 +271,7 @@ async def get_apps_metadata(
 def _fix_permissions(directory: Path) -> None:
     """Fix ownership and permissions so the host router can manage the data.
 
-    The backup container runs as root, but the OpenHost router runs as the
+    The backup container runs as root, but the Cloud in a Bottle router runs as the
     host user. After extracting tar data, files are owned by root and the
     router's provision_data() will fail with PermissionError on chmod.
 
@@ -339,7 +339,7 @@ def _build_manifest(
         "version": MIGRATION_PROTOCOL_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_instance": zone_domain or "unknown",
-        "source_platform": "openhost",
+        "source_platform": "bottle",
         "apps": [
             {
                 "name": a["name"],
@@ -506,7 +506,7 @@ async def run_direct_push(
 
         # 3. Send each app's data as a tar.gz via per-app endpoint.
         # Each app is tarred to a temp file on disk (avoids OOM), then
-        # uploaded.  The OpenHost reverse proxy has a 16 MB body limit,
+        # uploaded.  The Cloud in a Bottle reverse proxy has a 16 MB body limit,
         # so large apps are split into multiple chunks.
         import tempfile
 
