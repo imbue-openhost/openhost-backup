@@ -785,6 +785,7 @@ async def test_restic_connection(
     buf = bytearray()
 
     async def drain() -> None:
+        assert proc.stderr is not None
         while True:
             chunk = await proc.stderr.read(4096)
             if not chunk:
@@ -2057,12 +2058,14 @@ async def post_config():
     data = await request.get_json()
     current_conf = load_config()
 
-    # router_api_token is special: it lets this app call the Cloud in a Bottle
-    # router. After it's been set once, require a Bearer token to rotate
-    # it so a co-located container can't quietly swap it for one they
-    # control.
     if "router_api_token" in data and current_conf.get("router_api_token"):
-        if not await _verify_admin_token(_extract_bearer_token()):
+        bearer = _extract_bearer_token()
+        new_token = data.get("router_api_token") or ""
+        authorized = (
+            await _verify_admin_token(bearer)
+            or (bool(new_token) and await _verify_admin_token(new_token))
+        )
+        if not authorized:
             return jsonify(
                 ok=False,
                 error="Bearer token required to rotate router_api_token",
@@ -2356,7 +2359,7 @@ async def rename_backup():
 
 
 async def _get_router_apps(router_token: str) -> dict:
-    """Fetch app list from the local router.  Raises on failure."""
+    """Fetch app list from the local router as a name-keyed dict."""
     import httpx
 
     async with httpx.AsyncClient(verify=False, timeout=10) as client:
@@ -2364,9 +2367,37 @@ async def _get_router_apps(router_token: str) -> dict:
             f"{ROUTER_URL}/api/apps",
             headers={"Authorization": f"Bearer {router_token}"},
         )
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"Router API token is invalid or unauthorized (HTTP {r.status_code})")
         if r.status_code != 200:
-            raise RuntimeError(f"Router returned {r.status_code}")
-        return r.json()
+            raise RuntimeError(f"Router returned HTTP {r.status_code}")
+        if "json" not in r.headers.get("content-type", ""):
+            raise RuntimeError("Router API token is invalid or unauthorized (non-JSON response)")
+        listing = r.json()
+        return {
+            a["name"]: a
+            for a in migration._normalize_app_listing(listing)
+            if isinstance(a, dict) and a.get("name")
+        }
+
+
+@route("/api/router/test", methods=["POST"])
+async def api_router_test():
+    """Test router API token validity against the local router."""
+    data = await request.get_json(silent=True) or {}
+    token = data.get("token") or _extract_bearer_token() or get_router_api_token()
+    if not token:
+        return jsonify(ok=False, error="No router API token provided or configured"), 400
+    try:
+        apps = await _get_router_apps(token)
+        app_names = [n for n in apps if n != "backup"]
+        return jsonify(
+            ok=True,
+            message=f"Connected to router successfully ({len(app_names)} apps found)",
+            app_count=len(app_names),
+        )
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
 
 
 @route("/api/apps-status")
@@ -2382,12 +2413,55 @@ async def apps_status():
         return jsonify(ok=False, error=str(e)), 500
 
 
+def _parse_selected_apps(raw: object) -> list[str] | None:
+    """Normalize app selection inputs to a list of app names or None for all."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        val = raw.strip()
+        if not val or val.lower() == "all" or val == "*":
+            return None
+        return [a.strip() for a in val.split(",") if a.strip()]
+    if isinstance(raw, list):
+        if not raw or "all" in raw or "*" in raw:
+            return None
+        return [str(a).strip() for a in raw if str(a).strip()]
+    return None
+
+
+# Statuses that mean an app still holds its data dir open. ``building`` and
+# ``starting`` count: a container that is about to run is as unsafe to copy
+# from as one already running.
+_ACTIVE_STATUSES = ("running", "building", "starting")
+
+
+async def _running_selected_apps(
+    router_token: str, selected_apps: list[str] | None
+) -> list[str]:
+    """Names of targeted non-backup apps that are not stopped.
+
+    ``backup`` is always excluded — it serves the request doing the asking,
+    so it can never be stopped first.
+    """
+    apps = await _get_router_apps(router_token)
+    return [
+        name
+        for name, info in apps.items()
+        if name != "backup"
+        and (selected_apps is None or name in selected_apps)
+        and info.get("status") in _ACTIVE_STATUSES
+    ]
+
+
 @route("/api/stop-all-apps", methods=["POST"])
+@route("/api/stop-apps", methods=["POST"])
 async def stop_all_apps():
-    """Stop all running apps except the backup app."""
+    """Stop running apps (all or a selected list), excluding backup."""
     router_token = _extract_bearer_token() or get_router_api_token()
     if not router_token:
         return jsonify(ok=False, error="No router API token configured"), 400
+    data = await request.get_json(silent=True) or {}
+    selected_apps = _parse_selected_apps(data.get("apps"))
     try:
         import httpx
 
@@ -2397,10 +2471,13 @@ async def stop_all_apps():
             for app_name, info in apps.items():
                 if app_name == "backup":
                     continue
-                if info.get("status") in ("running", "building", "starting"):
+                if selected_apps and app_name not in selected_apps:
+                    continue
+                if info.get("status") in _ACTIVE_STATUSES:
+                    app_id = info.get("app_id") or info.get("id") or app_name
                     try:
                         sr = await client.post(
-                            f"{ROUTER_URL}/stop_app/{app_name}",
+                            f"{ROUTER_URL}/stop_app/{app_id}",
                             headers={"Authorization": f"Bearer {router_token}"},
                         )
                         if sr.status_code == 200:
@@ -2430,43 +2507,25 @@ _SUBUID_FLOOR: int = 100000
 
 @route("/api/chown-app-data", methods=["POST"])
 async def chown_app_data():
-    """Recursively chown app_data to the host user, skipping subuid-mapped files.
-
-    Only allowed when all non-backup apps are stopped, to prevent
-    ownership changes on files being actively written.
-
-    Files whose current owner uid is at or above ``_SUBUID_FLOOR`` are
-    assumed to be subuid-mapped state owned by a non-root in-container
-    user (e.g. postgres at uid 70 → host uid 165605) and are left alone.
-    Chowning those would destroy the user-namespace mapping and break the
-    affected app.
-    """
+    """Recursively chown app_data to the host user, skipping subuid-mapped files."""
     router_token = _extract_bearer_token() or get_router_api_token()
     if not router_token:
         return jsonify(ok=False, error="No router API token configured"), 400
 
-    # Check that all non-backup apps are stopped
+    data = await request.get_json(silent=True) or {}
+    selected_apps = _parse_selected_apps(data.get("apps"))
+
     try:
-        apps = await _get_router_apps(router_token)
-        running = [
-            name
-            for name, info in apps.items()
-            if name != "backup"
-            and info.get("status") in ("running", "building", "starting")
-        ]
-        if running:
-            return jsonify(
-                ok=False,
-                error=f"Apps still running: {', '.join(running)}. "
-                "Stop all apps before fixing ownership.",
-            ), 400
+        running = await _running_selected_apps(router_token, selected_apps)
     except Exception as e:
         return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
+    if running:
+        return jsonify(
+            ok=False,
+            error=f"Apps still running: {', '.join(running)}. "
+            "Stop them before fixing ownership.",
+        ), 400
 
-    # Run chown on the entire app_data directory.
-    # We hardcode uid/gid 1000 (the default host user) because inside the
-    # Docker container the parent directory is owned by root, so the
-    # auto-detect logic in _fix_permissions would chown to root.
     if not ALL_APP_DATA.is_dir():
         return jsonify(
             ok=False, error=f"app_data directory not found: {ALL_APP_DATA}"
@@ -2474,14 +2533,6 @@ async def chown_app_data():
 
     target_uid = 1000
     target_gid = 1000
-    app_data = str(ALL_APP_DATA)
-    logger.info(
-        "chown -R %s:%s %s (skipping subuid-mapped files)",
-        target_uid,
-        target_gid,
-        app_data,
-    )
-
     count = 0
     skipped = 0
     errors = 0
@@ -2495,8 +2546,6 @@ async def chown_app_data():
             logger.warning("stat failed for %s: %s", path, e)
             return
         if st.st_uid >= _SUBUID_FLOOR or st.st_gid >= _SUBUID_FLOOR:
-            # Subuid-mapped state owned by a non-root in-container user.
-            # Leaving it alone keeps that app working.
             skipped += 1
             return
         try:
@@ -2506,10 +2555,20 @@ async def chown_app_data():
             errors += 1
             logger.warning("chown failed for %s: %s", path, e)
 
-    for root, dirs, files in os.walk(app_data):
-        for name in dirs + files:
-            _chown_one(os.path.join(root, name))
-    _chown_one(app_data)
+    def _chown_tree(dir_path: Path) -> None:
+        if not dir_path.exists():
+            return
+        path_str = str(dir_path)
+        for root, dirs, files in os.walk(path_str):
+            for name in dirs + files:
+                _chown_one(os.path.join(root, name))
+        _chown_one(path_str)
+
+    if selected_apps:
+        for app_name in selected_apps:
+            _chown_tree(ALL_APP_DATA / app_name)
+    else:
+        _chown_tree(ALL_APP_DATA)
 
     logger.info(
         "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
@@ -2565,10 +2624,11 @@ async def trigger_direct_push():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing target_token"), 400
 
-    selected_apps = data.get("apps")  # optional list
-    if selected_apps is not None and not isinstance(selected_apps, list):
+    raw_apps = data.get("apps")
+    if raw_apps is not None and not isinstance(raw_apps, (list, str)):
         op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="'apps' must be a list"), 400
+        return jsonify(ok=False, error="'apps' must be a list or string"), 400
+    selected_apps = _parse_selected_apps(raw_apps)
 
     router_token = _extract_bearer_token() or get_router_api_token()
 
@@ -2592,9 +2652,7 @@ async def trigger_direct_push():
                     return jsonify(
                         ok=False,
                         error="Router API token is invalid or expired. "
-                        "Go to the Backups tab and set a valid router_api_token "
-                        "in the backup config (POST /api/config with "
-                        '{"router_api_token": "..."}). '
+                        "Go to the Migrate tab and update your Router API Token. "
                         "You can generate a token from the Cloud in a Bottle dashboard "
                         "under API Tokens.",
                     ), 400
@@ -2606,9 +2664,63 @@ async def trigger_direct_push():
             ok=False,
             error="No router API token configured. The backup app needs a "
             "token to access the local router API during migration. "
-            "Set one via the backup config: POST /api/config with "
-            '{"router_api_token": "YOUR_TOKEN"}. You can generate '
-            "a token from the Cloud in a Bottle dashboard under API Tokens.",
+            "Set one in the Router API Token section on the Migrate tab.",
+        ), 400
+
+    # Pre-flight: the apps being moved must be stopped. A live app writes to
+    # its data dir while we tar it, so the destination would receive a torn
+    # copy (half-written SQLite pages, partial uploads) that looks like a
+    # successful migration.
+    try:
+        running = await _running_selected_apps(router_token, selected_apps)
+    except Exception as e:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
+    if running:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error=f"Apps still running: {', '.join(running)}. "
+            "Stop them before migrating.",
+        ), 409
+
+    # Pre-flight: the destination must have the backup app installed and must
+    # accept the provided token before we start a background push.
+    import httpx
+
+    target_backup_url = migration._target_backup_url(target_url)
+    try:
+        async with httpx.AsyncClient(
+            verify=not migration._is_local_url(target_backup_url), timeout=15
+        ) as client:
+            tr = await client.get(
+                f"{target_backup_url}/api/migration/status",
+                headers={"Authorization": f"Bearer {target_token}"},
+            )
+    except Exception as e:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error=f"Could not reach the destination backup app at {target_backup_url}: {e}",
+        ), 400
+    if tr.status_code == 404:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error="The backup app is not installed on the destination instance. "
+            "Install it there, then retry.",
+        ), 400
+    if tr.status_code in (401, 403) or "json" not in tr.headers.get("content-type", ""):
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error="The destination rejected the API token. Check the destination "
+            "API token and try again.",
+        ), 400
+    if tr.status_code != 200:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False, error=f"Destination backup app returned HTTP {tr.status_code}."
         ), 400
 
     asyncio.create_task(

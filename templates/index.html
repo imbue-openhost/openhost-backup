@@ -343,75 +343,68 @@
          ============================================================ -->
     <div id="page-migrate" class="page">
 
-        {% if not config.get("router_api_token") %}
-        <section style="background:#fef3c7;border-color:#f59e0b;">
-            <h2 style="color:#92400e;">Router API Token Required</h2>
-            <p class="info" style="color:#92400e;">
-                The backup app needs a <strong>router API token</strong> to access the
-                local router during migration. Without it, migration will fail.
-            </p>
-            <p class="info" style="color:#92400e;">
-                <strong>To set it up:</strong> Go to the Cloud in a Bottle dashboard &rarr;
-                API Tokens, generate a new token, then paste it below
-                and click Save.
+        <!-- Router API Token -->
+        <section id="router-token-section" style="{% if not config.get('router_api_token') %}background:#fef3c7;border-color:#f59e0b;{% endif %}">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                <h2 style="margin:0;{% if not config.get('router_api_token') %}color:#92400e;{% endif %}">Router API Token</h2>
+                <span id="router-token-badge" class="status-badge {% if config.get('router_api_token') %}status-success{% else %}status-warning{% endif %}">
+                    {% if config.get('router_api_token') %}Configured{% else %}Required{% endif %}
+                </span>
+            </div>
+            <p class="info" id="router-token-desc" style="{% if not config.get('router_api_token') %}color:#92400e;{% endif %}">
+                The backup app needs an API token from the local Cloud in a Bottle instance to manage and transfer app data in this instance. 
+                Generate one in the dashboard settings page under <strong>API Tokens</strong>.
             </p>
             <label>Router API Token</label>
-            <input type="password" id="router-token-input" placeholder="Paste your router API token here">
+            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                <input type="password" id="router-token-input" placeholder="{% if config.get('router_api_token') %}Configured; enter a new token to update. {% else %}Paste your API token here{% endif %}" autocomplete="off" style="margin-bottom:0;">
+                <button class="btn-secondary" id="btn-toggle-router-token" onclick="toggleRouterTokenVisibility()" type="button" style="white-space:nowrap;">Show</button>
+            </div>
             <div class="btn-row" style="margin-top:8px;">
-                <button class="btn-primary" onclick="saveRouterToken()">Save</button>
+                <button class="btn-primary" id="btn-save-router-token" onclick="saveRouterToken()">Save token</button>
+                <button class="btn-secondary" id="btn-test-router-token" onclick="testRouterToken()">Test connection</button>
+                <button class="btn-secondary" id="btn-clear-router-token" onclick="clearRouterToken()" style="color:#dc2626;{% if not config.get('router_api_token') %}display:none;{% endif %}">Clear</button>
             </div>
             <div id="router-token-msg"></div>
         </section>
-        {% endif %}
 
         <section>
-            <h2>Pre-migration tools</h2>
+            <h2>Migrate apps to another instance</h2>
             <p class="info">
-                Stop all applications and fix potential file ownership issues. If you don't know what that means, you should do this. Migrations without stopping applications should only be performed if you have a specific reason to do so.
-            </p>
-
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-                <button class="btn-primary" id="btn-stop-all" onclick="stopAllApps()">Stop all apps</button>
-                <button class="btn-primary" id="btn-chown" onclick="chownAppData()" disabled>Fix file ownership (chown)</button>
-            </div>
-            <div id="apps-status-list" style="font-size:0.85rem;color:#555;margin-bottom:8px;"></div>
-            <div id="premig-msg"></div>
-        </section>
-
-        <section>
-            <h2>Migrate to another instance</h2>
-            <p class="info">
-                Move all your apps and data to another Cloud in a Bottle instance.
-                Install the backup app on both instances, then generate an API token
-                on the destination. Your data will be transferred and your applications
-                will be restarted on the other side.
+                Move apps and data to another Cloud in a Bottle instance. The backup app needs to be installed on both instances. An API token from the destination also needs to be provided. 
+                This transfers all permanent app data and will restart the app on the other side. 
             </p>
             <details style="margin-bottom:12px;">
-                <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Important details before migrating</summary>
+                <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Details about migration</summary>
                 <div class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;margin-top:6px;">
-                    <strong>This instance:</strong> Not changed. Migration copies your data
-                    to the destination. Nothing on this instance is modified or deleted.
+                    <strong>This instance:</strong> The selected apps are stopped before the
+                    transfer and are left stopped afterward, so nothing writes to their data
+                    while it is copied. No data on this instance is modified or deleted.
                     <br><br>
-                    <strong>Destination:</strong> All running apps will be stopped, and
-                    existing app data for migrated apps will be deleted before new data is
-                    written. Apps not included in the migration will be stopped during the
-                    transfer and restarted afterward.
+                    <strong>Destination:</strong> Running apps will be stopped during the migration, and existing app data for migrated apps will be deleted.
+                    Other apps retain data and are restarted afterward.
                     <br><br>
-                    <strong>Tip:</strong> It is a good idea to stop applications on this
-                    instance before migrating, especially databases or apps that might not
-                    transfer correctly if they are actively writing data. Stopping is not
-                    required, but it reduces the risk of inconsistent data.
-                    <br><br>
-                    <strong>Not migrated:</strong> API tokens, owner password, and other
-                    system-level settings are not transferred.
+                    <strong>Not migrated:</strong> API tokens, owner password, and settings are not transferred. 
                     {% for entry in scope.excluded if entry.user_facing and entry.reason %}
                     The path <code>{{ entry.path }}</code> is also excluded from
                     the snapshot pipeline. {{ entry.reason }}
                     {% endfor %}
-                    See <em>What is and isn't backed up</em> on the Backups tab
-                    for the full list.
+                    See the Backups tab for the full list.
                 </div>
             </details>
+
+            <div style="margin-bottom:12px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                    <label style="margin-bottom:0;">Applications to migrate</label>
+                    <div style="display:flex;gap:6px;">
+                        <button class="btn-secondary" type="button" style="padding:2px 8px;font-size:0.75rem;" onclick="selectAllMigApps()">Select all</button>
+                        <button class="btn-secondary" type="button" style="padding:2px 8px;font-size:0.75rem;" onclick="deselectAllMigApps()">Deselect all</button>
+                    </div>
+                </div>
+                <div id="mig-apps-list" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:8px;margin-top:6px;">
+                    <span style="font-size:0.85rem;color:#666;">Loading apps…</span>
+                </div>
+            </div>
 
             <div style="margin-bottom:12px;">
                 <label>Destination instance URL</label>
@@ -422,7 +415,7 @@
                 <input type="password" id="push-target-token" placeholder="Paste the token you generated on the destination instance">
             </div>
             <div class="btn-row" style="margin-bottom:12px;">
-                <button class="btn-primary" id="btn-push" onclick="startPush()">Start migration</button>
+                <button class="btn-primary" id="btn-migrate" onclick="stopAppsAndMigrate()">Stop apps and migrate</button>
             </div>
 
             <!-- Progress -->
@@ -462,15 +455,93 @@
         let snapshotsPage = 0;
 
         /* ================================================================
-           Router token setup
+           Router token management
            ================================================================ */
 
+        function toggleRouterTokenVisibility() {
+            const input = document.getElementById("router-token-input");
+            const btn = document.getElementById("btn-toggle-router-token");
+            if (!input) return;
+            const isPassword = input.type === "password";
+            input.type = isPassword ? "text" : "password";
+            if (btn) btn.textContent = isPassword ? "Hide" : "Show";
+        }
+
+        function setRouterTokenUIState(configured) {
+            const badge = document.getElementById("router-token-badge");
+            const input = document.getElementById("router-token-input");
+            const section = document.getElementById("router-token-section");
+            const desc = document.getElementById("router-token-desc");
+            const clearBtn = document.getElementById("btn-clear-router-token");
+            if (badge) {
+                badge.className = "status-badge " + (configured ? "status-success" : "status-warning");
+                badge.textContent = configured ? "Configured" : "Required";
+            }
+            if (input) {
+                input.value = "";
+                input.placeholder = configured ? "(Configured — enter new token to update)" : "Paste your router API token here";
+            }
+            if (section) {
+                section.style.background = configured ? "white" : "#fef3c7";
+                section.style.borderColor = configured ? "#ddd" : "#f59e0b";
+            }
+            if (desc) {
+                desc.style.color = configured ? "#666" : "#92400e";
+            }
+            if (clearBtn) {
+                clearBtn.style.display = configured ? "inline-block" : "none";
+            }
+        }
+
         async function saveRouterToken() {
-            const token = document.getElementById("router-token-input").value.trim();
-            if (!token) { showMsg("router-token-msg", "Enter a token", false); return; }
-            const res = await api("/api/config", { method: "POST", body: { router_api_token: token } });
+            const input = document.getElementById("router-token-input");
+            const token = input ? input.value.trim() : "";
+            if (!token) { showMsg("router-token-msg", "Enter a token to save", false); return; }
+            const saveBtn = document.getElementById("btn-save-router-token");
+            if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = "Saving…"; }
+            const res = await api("/api/config", {
+                method: "POST",
+                headers: { "Authorization": "Bearer " + token },
+                body: { router_api_token: token }
+            });
+            if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = "Save token"; }
             if (res.ok) {
-                showMsg("router-token-msg", "Saved! Reload the page to continue.", true);
+                setRouterTokenUIState(true);
+                showMsg("router-token-msg", "Router API token saved successfully!", true);
+                refreshAppsStatus();
+            } else {
+                showMsg("router-token-msg", "Error: " + (res.error || "unknown"), false);
+            }
+        }
+
+        async function testRouterToken() {
+            const input = document.getElementById("router-token-input");
+            const typedToken = input ? input.value.trim() : "";
+            const testBtn = document.getElementById("btn-test-router-token");
+            if (testBtn) { testBtn.disabled = true; testBtn.textContent = "Testing…"; }
+            const res = await api("/api/router/test", {
+                method: "POST",
+                body: typedToken ? { token: typedToken } : {}
+            });
+            if (testBtn) { testBtn.disabled = false; testBtn.textContent = "Test connection"; }
+            if (res.ok) {
+                showMsg("router-token-msg", res.message || "Connected to router successfully!", true);
+                if (!typedToken) setRouterTokenUIState(true);
+            } else {
+                showMsg("router-token-msg", "Connection failed: " + (res.error || "unknown"), false);
+            }
+        }
+
+        async function clearRouterToken() {
+            if (!confirm("Are you sure you want to clear the configured Router API token?")) return;
+            const res = await api("/api/config", {
+                method: "POST",
+                body: { router_api_token: "" }
+            });
+            if (res.ok) {
+                setRouterTokenUIState(false);
+                showMsg("router-token-msg", "Router API token cleared.", true);
+                refreshAppsStatus();
             } else {
                 showMsg("router-token-msg", "Error: " + (res.error || "unknown"), false);
             }
@@ -480,62 +551,86 @@
            Pre-migration
            ================================================================ */
 
+        let cachedAppsList = [];
+        let selectedAppNames = null; // null = all apps selected by default
+        // Held across the stop -> chown -> push sequence. The intermediate
+        // refreshAppsStatus() would otherwise re-enable the button mid-run.
+        let migBusy = false;
+
+        function getSelectedApps() {
+            if (selectedAppNames === null) return null;
+            return Array.from(selectedAppNames);
+        }
+
+        function selectAllMigApps() {
+            selectedAppNames = null;
+            document.querySelectorAll(".mig-app-cb").forEach(cb => { cb.checked = true; });
+            updateMigAppsButtons();
+        }
+
+        function deselectAllMigApps() {
+            selectedAppNames = new Set();
+            document.querySelectorAll(".mig-app-cb").forEach(cb => { cb.checked = false; });
+            updateMigAppsButtons();
+        }
+
+        function onMigAppCheckboxChange() {
+            const cbs = Array.from(document.querySelectorAll(".mig-app-cb"));
+            const checked = cbs.filter(cb => cb.checked).map(cb => cb.value);
+            if (checked.length === cbs.length) {
+                selectedAppNames = null;
+            } else {
+                selectedAppNames = new Set(checked);
+            }
+            updateMigAppsButtons();
+        }
+
+        function updateMigAppsButtons() {
+            const btn = document.getElementById("btn-migrate");
+            if (!btn || migBusy || migPolling) return;
+            const cbs = Array.from(document.querySelectorAll(".mig-app-cb"));
+            const checkedCount = cbs.filter(cb => cb.checked).length;
+            btn.disabled = checkedCount === 0 && cachedAppsList.length > 0;
+        }
+
         async function refreshAppsStatus() {
             const res = await api("/api/apps-status");
-            const listEl = document.getElementById("apps-status-list");
-            const chownBtn = document.getElementById("btn-chown");
+            const listEl = document.getElementById("mig-apps-list");
+            if (!listEl) return;
             if (!res.ok) {
-                listEl.textContent = "Could not load app status: " + (res.error || "unknown");
-                chownBtn.disabled = true;
+                const isTokenErr = res.error && (res.error.includes("token") || res.error.includes("401") || res.error.includes("403"));
+                if (isTokenErr) {
+                    listEl.innerHTML = '<span style="color:#dc2626;font-size:0.85rem;font-weight:500;">Router token invalid or not configured. Set a valid token above.</span>';
+                } else {
+                    listEl.innerHTML = '<span style="color:#dc2626;font-size:0.85rem;">Could not load app status: ' + (res.error || "unknown") + '</span>';
+                }
+                updateMigAppsButtons();
                 return;
             }
             const apps = res.apps || {};
             const names = Object.keys(apps).filter(n => n !== "backup");
+            cachedAppsList = names.map(n => ({ name: n, status: apps[n].status || "unknown" }));
+
             if (names.length === 0) {
-                listEl.textContent = "No apps deployed (besides backup).";
-                chownBtn.disabled = false;
+                listEl.innerHTML = '<span style="font-size:0.85rem;color:#666;">No apps deployed (besides backup).</span>';
+                updateMigAppsButtons();
                 return;
             }
-            const lines = names.map(n => {
-                const s = apps[n].status || "unknown";
-                const color = s === "running" ? "#16a34a" : s === "stopped" ? "#6b7280" : "#d97706";
-                return `<span style="color:${color};font-weight:600;">${n}</span>: ${s}`;
-            });
-            listEl.innerHTML = lines.join(" &nbsp;&middot;&nbsp; ");
-            const allStopped = names.every(n => apps[n].status === "stopped" || apps[n].status === "error");
-            chownBtn.disabled = !allStopped;
-        }
 
-        async function stopAllApps() {
-            const btn = document.getElementById("btn-stop-all");
-            btn.disabled = true;
-            btn.textContent = "Stopping...";
-            const res = await api("/api/stop-all-apps", { method: "POST" });
-            btn.disabled = false;
-            btn.textContent = "Stop all apps";
-            if (res.ok) {
-                const stopped = res.stopped || [];
-                showMsg("premig-msg", stopped.length > 0
-                    ? "Stopped: " + stopped.join(", ")
-                    : "No apps were running.", true);
-            } else {
-                showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
-            }
-            await refreshAppsStatus();
-        }
+            listEl.innerHTML = cachedAppsList.map(app => {
+                const isChecked = selectedAppNames === null || selectedAppNames.has(app.name);
+                const s = app.status;
+                const badgeClass = s === "running" ? "status-success" : s === "stopped" ? "status-none" : "status-warning";
+                return `
+                    <label style="display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid #e5e7eb;border-radius:6px;background:white;cursor:pointer;user-select:none;">
+                        <input type="checkbox" class="mig-app-cb" value="${app.name}" ${isChecked ? "checked" : ""} onchange="onMigAppCheckboxChange()" style="margin:0;cursor:pointer;">
+                        <span style="font-size:0.85rem;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${app.name}</span>
+                        <span class="status-badge ${badgeClass}" style="margin-left:auto;font-size:0.72rem;padding:2px 6px;">${s}</span>
+                    </label>
+                `;
+            }).join("");
 
-        async function chownAppData() {
-            const btn = document.getElementById("btn-chown");
-            btn.disabled = true;
-            btn.textContent = "Fixing ownership...";
-            const res = await api("/api/chown-app-data", { method: "POST" });
-            btn.disabled = false;
-            btn.textContent = "Fix file ownership (chown)";
-            if (res.ok) {
-                showMsg("premig-msg", res.message || "Ownership fixed.", true);
-            } else {
-                showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
-            }
+            updateMigAppsButtons();
         }
 
         /* ================================================================
@@ -1230,27 +1325,64 @@
 
         let migPolling = false;
 
-        async function startPush() {
+        // Stopping is a hard requirement, not a courtesy: /api/migration/push
+        // rejects a run whose apps are still up, so the button owns the whole
+        // sequence rather than leaving the user to order it correctly.
+        async function stopAppsAndMigrate() {
             const targetUrl = document.getElementById("push-target-url").value.trim();
             const targetToken = document.getElementById("push-target-token").value.trim();
+            const selected = getSelectedApps();
+            if (selected !== null && selected.length === 0) {
+                showMsg("mig-msg", "Select at least one app to migrate", false);
+                return;
+            }
             if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
             if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
-            if (!confirm("Migrate all apps and data to " + targetUrl + "?\n\nMake sure the backup app is installed on the destination.")) return;
+            const promptTarget = selected ? selected.join(", ") : "all apps and data";
+            if (!confirm("Stop " + promptTarget + " on this instance and migrate to " + targetUrl + "?")) return;
 
-            const btn = document.getElementById("btn-push");
+            const btn = document.getElementById("btn-migrate");
+            const body = selected ? { apps: selected } : {};
+            migBusy = true;
             btn.disabled = true;
-            btn.textContent = "Migrating...";
-            const res = await api("/api/migration/push", {
-                method: "POST",
-                body: { target_url: targetUrl, target_token: targetToken }
-            });
-            if (res.ok) {
+            try {
+                btn.textContent = "Stopping apps...";
+                const stopRes = await api("/api/stop-all-apps", { method: "POST", body });
+                if (!stopRes.ok) {
+                    showMsg("mig-msg", "Could not stop apps: " + (stopRes.error || "unknown"), false);
+                    return;
+                }
+                await refreshAppsStatus();
+
+                btn.textContent = "Fixing ownership...";
+                const chownRes = await api("/api/chown-app-data", { method: "POST", body });
+                if (!chownRes.ok) {
+                    showMsg("mig-msg", "Could not fix file ownership: " + (chownRes.error || "unknown"), false);
+                    return;
+                }
+
+                btn.textContent = "Migrating...";
+                const res = await api("/api/migration/push", {
+                    method: "POST",
+                    body: {
+                        target_url: targetUrl,
+                        target_token: targetToken,
+                        ...(selected ? { apps: selected } : {})
+                    }
+                });
+                if (!res.ok) {
+                    showMsg("mig-msg", res.error || "Failed", false);
+                    return;
+                }
                 showMsg("mig-msg", "Migration started", true);
                 pollMigration();
-            } else {
-                showMsg("mig-msg", res.error || "Failed", false);
-                btn.disabled = false;
-                btn.textContent = "Start migration";
+            } finally {
+                migBusy = false;
+                // pollMigration owns the button for the duration of the run.
+                if (!migPolling) {
+                    btn.disabled = false;
+                    btn.textContent = "Stop apps and migrate";
+                }
             }
         }
 
@@ -1287,8 +1419,8 @@
                     setTimeout(poll, 2000);
                 } else {
                     migPolling = false;
-                    const pushBtn = document.getElementById("btn-push");
-                    if (pushBtn) { pushBtn.disabled = false; pushBtn.textContent = "Start migration"; }
+                    const migBtn = document.getElementById("btn-migrate");
+                    if (migBtn) { migBtn.disabled = false; migBtn.textContent = "Stop apps and migrate"; }
 
                     if (phase === "done") {
                         showMsg("mig-msg", "Migration complete! Your apps and data have been transferred.", true);

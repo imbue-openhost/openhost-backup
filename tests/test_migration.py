@@ -14,7 +14,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import gzip
 import io
 import os
 import tarfile
@@ -115,6 +114,37 @@ def op_lock() -> OperationLock:
 # ---------------------------------------------------------------------------
 
 
+class TestRouterGet:
+    async def test_non_json_response_raises(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/html"}
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        with patch("migration.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(RuntimeError, match="non-JSON"):
+                await migration._router_get("/api/apps", token="t", base_url="https://localhost")
+
+
+class TestTargetBackupUrl:
+    def test_rewrites_zone_url_to_backup_subdomain(self):
+        f = migration._target_backup_url
+        assert f("https://myzone.selfhost.imbue.com") == "https://backup.myzone.selfhost.imbue.com"
+        assert f("https://myzone.example.com/") == "https://backup.myzone.example.com"
+        assert f("myzone.example.com") == "https://backup.myzone.example.com"
+        assert f("https://backup.myzone.example.com") == "https://backup.myzone.example.com"
+        assert f("https://myzone.example.com:8443") == "https://backup.myzone.example.com:8443"
+
+    def test_preserves_ip_addresses_and_localhost(self):
+        f = migration._target_backup_url
+        assert f("http://192.168.1.50:8080") == "http://192.168.1.50:8080"
+        assert f("http://localhost:8080") == "http://localhost:8080"
+        assert f("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
+        assert f("http://[::1]:8080") == "http://[::1]:8080"
+
+
 class TestValidateName:
     def test_valid_simple(self):
         assert validate_name("myapp") is True
@@ -212,6 +242,11 @@ class TestStripUrlCredentials:
         url = "https://user:pass@example.com/path?foo=bar#section"
         result = _strip_url_credentials(url)
         assert result == "https://example.com/path?foo=bar#section"
+
+    def test_strips_ipv6_credentials(self):
+        url = "https://user:pass@[::1]:8080/repo.git"
+        result = _strip_url_credentials(url)
+        assert result == "https://[::1]:8080/repo.git"
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +698,13 @@ class TestReceiveAllData:
 
 
 class TestReceiveFinalize:
+    @pytest.fixture(autouse=True)
+    def router_listing(self):
+        """Target /api/apps listing; empty by default so apps go down the deploy path."""
+        with patch("migration._router_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = []
+            yield mock_get
+
     async def test_does_not_call_wait_for_apps_ready(self):
         """receive_finalize should NOT call _wait_for_apps_ready (removed)."""
         # Verify the function doesn't exist on the module
@@ -670,8 +712,11 @@ class TestReceiveFinalize:
             "_wait_for_apps_ready should not exist in the migration module"
         )
 
-    async def test_reloads_existing_apps(self):
-        """Should call reload_app for apps that exist on the target."""
+    async def test_reloads_existing_apps(self, router_listing):
+        """Should call reload_app (by app_id) for apps that exist on the target."""
+        router_listing.return_value = [
+            {"app_id": "id-myapp", "name": "myapp", "status": "stopped"},
+        ]
         manifest = {
             "apps": [
                 {"name": "myapp", "status": "running", "repo_url": None},
@@ -685,15 +730,18 @@ class TestReceiveFinalize:
             )
 
         assert result["ok"] is True
-        # Should have called reload_app
+        # Should have called reload_app with the target's app_id
         mock_post.assert_any_call(
-            "/reload_app/myapp",
+            "/reload_app/id-myapp",
             token="test-token",
             base_url="http://localhost:8080",
         )
 
-    async def test_stops_app_not_running_on_source(self):
+    async def test_stops_app_not_running_on_source(self, router_listing):
         """Apps that were stopped on source should be stopped after reload."""
+        router_listing.return_value = [
+            {"app_id": "id-stopped", "name": "stoppedapp", "status": "stopped"},
+        ]
         manifest = {
             "apps": [
                 {"name": "stoppedapp", "status": "stopped", "repo_url": None},
@@ -709,11 +757,11 @@ class TestReceiveFinalize:
         assert result["ok"] is True
         # Should have called reload then stop
         calls = [c.args[0] for c in mock_post.call_args_list]
-        assert "/reload_app/stoppedapp" in calls
-        assert "/stop_app/stoppedapp" in calls
+        assert "/reload_app/id-stopped" in calls
+        assert "/stop_app/id-stopped" in calls
 
-    async def test_deploys_from_repo_url_when_reload_fails(self):
-        """If reload fails (app doesn't exist), should deploy from repo_url."""
+    async def test_deploys_from_repo_url_when_not_on_target(self):
+        """Apps missing from the target's listing should be deployed from repo_url."""
         manifest = {
             "apps": [
                 {
@@ -969,8 +1017,12 @@ class TestReceiveFinalize:
 
         assert sorted(result["apps_to_start"]) == ["running1", "running2"]
 
-    async def test_restarts_non_migrated_stopped_apps(self):
+    async def test_restarts_non_migrated_stopped_apps(self, router_listing):
         """Apps stopped during receive_start that aren't being migrated should be restarted."""
+        router_listing.return_value = [
+            {"app_id": "id-migrated", "name": "migratedapp", "status": "stopped"},
+            {"app_id": "id-other", "name": "otherliveapp", "status": "stopped"},
+        ]
         manifest = {
             "apps": [
                 {"name": "migratedapp", "status": "running"},
@@ -984,11 +1036,11 @@ class TestReceiveFinalize:
             mock_post.return_value = {"ok": True}
             result = await receive_finalize(manifest, "http://localhost:8080", "token")
 
-        # otherliveapp should have been restarted (reload called)
+        # otherliveapp should have been restarted (reload called by app_id)
         reload_calls = [
             c.args[0]
             for c in mock_post.call_args_list
-            if "reload_app/otherliveapp" in c.args[0]
+            if "reload_app/id-other" in c.args[0]
         ]
         assert len(reload_calls) == 1
 
@@ -1424,11 +1476,11 @@ class TestReceiveStart:
     @patch("migration._router_post")
     async def test_stops_running_apps(self, mock_post, mock_get, tmp_app_data):
         """Should stop all non-backup running apps on destination."""
-        mock_get.return_value = {
-            "myapp": {"status": "running"},
-            "secrets": {"status": "running"},
-            "backup": {"status": "running"},
-        }
+        mock_get.return_value = [
+            {"app_id": "id-myapp", "name": "myapp", "status": "running"},
+            {"app_id": "id-secrets", "name": "secrets", "status": "running"},
+            {"app_id": "id-backup", "name": "backup", "status": "running"},
+        ]
         mock_post.return_value = {"ok": True}
 
         manifest = {"apps": [{"name": "myapp"}]}
@@ -1440,12 +1492,9 @@ class TestReceiveStart:
         )
         assert result["ok"] is True
 
-        # Should have stopped myapp and secrets but NOT backup
-        stop_calls = [c for c in mock_post.call_args_list if "/stop_app/" in str(c)]
-        stopped_names = {str(c) for c in stop_calls}
-        assert any("myapp" in s for s in stopped_names)
-        assert any("secrets" in s for s in stopped_names)
-        assert not any("backup" in s for s in stopped_names)
+        # Should have stopped myapp and secrets (by app_id) but NOT backup
+        stop_calls = {c.args[0] for c in mock_post.call_args_list if "/stop_app/" in c.args[0]}
+        assert stop_calls == {"/stop_app/id-myapp", "/stop_app/id-secrets"}
 
     async def test_records_stopped_apps(self, tmp_app_data):
         """Stopped apps should be recorded for receive_finalize to restart."""

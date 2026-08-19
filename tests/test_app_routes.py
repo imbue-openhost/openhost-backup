@@ -11,9 +11,8 @@ import io
 import json
 import os
 import tarfile
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -232,6 +231,24 @@ class TestAppsStatusEndpoint:
         response = await client.get("/api/apps-status")
         assert response.status_code == 400
 
+    async def test_non_json_response_reported_as_token_error(self, client):
+        """A 200 HTML reply (router login page) is surfaced as a token error, not fake apps."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/html"}
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.get("/api/apps-status")
+        data = await response.get_json()
+        assert data["ok"] is False
+        assert "token" in data["error"].lower()
+        backup_app.ROUTER_API_TOKEN = ""
+
 
 class TestStopAllAppsEndpoint:
     """Tests for POST /api/stop-all-apps."""
@@ -239,9 +256,9 @@ class TestStopAllAppsEndpoint:
     @patch("app._get_router_apps")
     async def test_stops_running_apps(self, mock_get, client):
         mock_get.return_value = {
-            "secrets": {"status": "running"},
-            "backup": {"status": "running"},
-            "agent": {"status": "stopped"},
+            "secrets": {"app_id": "id-secrets", "status": "running"},
+            "backup": {"app_id": "id-backup", "status": "running"},
+            "agent": {"app_id": "id-agent", "status": "stopped"},
         }
 
         # Mock the httpx module used inside the function
@@ -260,6 +277,128 @@ class TestStopAllAppsEndpoint:
         assert "secrets" in data["stopped"]
         assert "backup" not in data["stopped"]  # backup is never stopped
         assert "agent" not in data["stopped"]  # already stopped
+        backup_app.ROUTER_API_TOKEN = ""
+
+    async def test_stops_partial_selected_apps(self, client):
+        """Stop endpoint only stops requested apps when apps filter is provided."""
+        mock_apps_resp = MagicMock()
+        mock_apps_resp.status_code = 200
+        mock_apps_resp.headers = {"content-type": "application/json"}
+        mock_apps_resp.json.return_value = [
+            {"app_id": "id-app1", "name": "app1", "status": "running"},
+            {"app_id": "id-app2", "name": "app2", "status": "running"},
+            {"app_id": "id-backup", "name": "backup", "status": "running"},
+        ]
+
+        mock_stop_resp = MagicMock()
+        mock_stop_resp.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_apps_resp)
+        mock_client.post = AsyncMock(return_value=mock_stop_resp)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post("/api/stop-all-apps", json={"apps": ["app1"]})
+        data = await response.get_json()
+        assert data["ok"] is True
+        assert data["stopped"] == ["app1"]
+        stop_urls = [c.args[0] for c in mock_client.post.call_args_list]
+        assert stop_urls == [f"{backup_app.ROUTER_URL}/stop_app/id-app1"]
+        backup_app.ROUTER_API_TOKEN = ""
+
+
+class TestMigrationPushEndpoint:
+    """Tests for POST /api/migration/push."""
+
+    async def test_rejects_when_target_missing_backup_app(self, client):
+        """Preflight fails cleanly when the destination 404s (backup app not installed)."""
+        local_resp = MagicMock()
+        local_resp.status_code = 200
+        local_resp.headers = {"content-type": "application/json"}
+
+        target_resp = MagicMock()
+        target_resp.status_code = 404
+        target_resp.headers = {"content-type": "application/json"}
+
+        async def fake_get(url, **kwargs):
+            return target_resp if "backup." in url else local_resp
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post(
+                "/api/migration/push",
+                json={"target_url": "https://myzone.example.com", "target_token": "tok"},
+            )
+        data = await response.get_json()
+        assert data["ok"] is False
+        assert "not installed" in data["error"]
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("app._get_router_apps")
+    async def test_rejects_when_selected_apps_still_running(self, mock_get, client):
+        """Push refuses to start while a targeted app is up, and frees the lock."""
+        mock_get.return_value = {
+            "app1": {"status": "running"},
+            "app2": {"status": "stopped"},
+            "backup": {"status": "running"},
+        }
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        response = await client.post(
+            "/api/migration/push",
+            json={
+                "target_url": "https://myzone.example.com",
+                "target_token": "tok",
+                "apps": ["app1", "app2"],
+            },
+        )
+        assert response.status_code == 409
+        data = await response.get_json()
+        assert data["ok"] is False
+        # backup is never reported: it serves this request and can't be stopped.
+        assert "app1" in data["error"] and "backup" not in data["error"]
+        assert not backup_app.op_lock.migration_running
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("app._get_router_apps")
+    async def test_allows_start_when_selected_apps_stopped(self, mock_get, client):
+        """A running app outside the selection does not block the migration."""
+        mock_get.return_value = {
+            "app1": {"status": "stopped"},
+            "app2": {"status": "running"},
+        }
+
+        target_resp = MagicMock()
+        target_resp.status_code = 200
+        target_resp.headers = {"content-type": "application/json"}
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=target_resp)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with (
+            patch("httpx.AsyncClient") as mock_cls,
+            patch("migration.run_direct_push", new=AsyncMock()),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post(
+                "/api/migration/push",
+                json={
+                    "target_url": "https://myzone.example.com",
+                    "target_token": "tok",
+                    "apps": ["app1"],
+                },
+            )
+        data = await response.get_json()
+        assert data["ok"] is True
+        backup_app.op_lock.release(backup_app.OpKind.MIGRATION)
         backup_app.ROUTER_API_TOKEN = ""
 
 
@@ -334,6 +473,26 @@ class TestChownAppDataEndpoint:
         # The subuid-mapped path must never have been chown'd.
         chowned_paths = {call_args[0][0] for call_args in mock_chown.call_args_list}
         assert not any(p.endswith("postgres_conf") for p in chowned_paths)
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("app._get_router_apps")
+    async def test_chown_partial_apps_allowed_if_target_stopped(
+        self, mock_get, client
+    ):
+        """Chown for selected apps succeeds even if an unselected app is running."""
+        mock_get.return_value = {
+            "secrets": {"status": "running"},
+            "myapp": {"status": "stopped"},
+            "backup": {"status": "running"},
+        }
+        (backup_app.ALL_APP_DATA / "myapp").mkdir(exist_ok=True)
+        (backup_app.ALL_APP_DATA / "myapp" / "data.txt").touch()
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("os.chown") as mock_chown:
+            response = await client.post("/api/chown-app-data", json={"apps": ["myapp"]})
+        data = await response.get_json()
+        assert data["ok"] is True
         backup_app.ROUTER_API_TOKEN = ""
 
     @patch("app._get_router_apps")
@@ -505,8 +664,78 @@ class TestPostConfigSensitiveWrites:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 401
-        # Token should NOT have been rotated.
         assert backup_app.load_config()["router_api_token"] == "existing"
+
+    async def test_rotate_router_token_succeeds_with_auth_or_clear(self, client):
+        """Rotating router token succeeds when authorized or when cleared."""
+        backup_app.ensure_default_config()
+        conf = backup_app.load_config()
+        conf["router_api_token"] = "existing"
+        backup_app.save_config(conf)
+
+        # Authorized via Bearer header.
+        with patch.object(backup_app, "_verify_admin_token", new=AsyncMock(return_value=True)):
+            resp = await client.post(
+                "/api/config",
+                data=json.dumps({"router_api_token": "rotated-bearer"}),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer admin-token"},
+            )
+            assert resp.status_code == 200
+            assert backup_app.load_config()["router_api_token"] == "rotated-bearer"
+
+        # Authorized because the new token itself is verified against router.
+        with patch.object(backup_app, "_verify_admin_token", new=AsyncMock(return_value=True)):
+            resp = await client.post(
+                "/api/config",
+                data=json.dumps({"router_api_token": "rotated-direct"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+            assert backup_app.load_config()["router_api_token"] == "rotated-direct"
+
+        # Clearing the token requires caller Bearer authorization.
+        with patch.object(backup_app, "_verify_admin_token", new=AsyncMock(return_value=True)):
+            resp = await client.post(
+                "/api/config",
+                data=json.dumps({"router_api_token": ""}),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer admin-token"},
+            )
+            assert resp.status_code == 200
+            assert backup_app.load_config()["router_api_token"] == ""
+
+    async def test_router_test_endpoint(self, client):
+        """Tests the POST /api/router/test endpoint."""
+        # Missing token
+        backup_app.ROUTER_API_TOKEN = ""
+        conf = backup_app.load_config()
+        conf["router_api_token"] = ""
+        backup_app.save_config(conf)
+
+        resp = await client.post("/api/router/test", data=json.dumps({}), headers={"Content-Type": "application/json"})
+        assert resp.status_code == 400
+
+        # Successful test
+        with patch("app._get_router_apps", new=AsyncMock(return_value={"app1": {}, "backup": {}})):
+            resp = await client.post(
+                "/api/router/test",
+                data=json.dumps({"token": "valid-token"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["ok"] is True
+            assert body["app_count"] == 1
+
+        # Router rejects token
+        with patch("app._get_router_apps", new=AsyncMock(side_effect=RuntimeError("Router API token is invalid"))):
+            resp = await client.post(
+                "/api/router/test",
+                data=json.dumps({"token": "bad-token"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 400
+            body = await resp.get_json()
+            assert body["ok"] is False
 
     async def test_set_repo_password_no_auth_required(self, client):
         # The owner is the only caller (the app has no public paths), so

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -25,6 +24,7 @@ import tarfile
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -75,7 +75,9 @@ def _strip_url_credentials(url: str | None) -> str | None:
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.username or parsed.password:
-            netloc = parsed.hostname or ""
+            host = parsed.hostname or ""
+            formatted_host = f"[{host}]" if ":" in host else host
+            netloc = formatted_host
             if parsed.port:
                 netloc += f":{parsed.port}"
             return urllib.parse.urlunparse(
@@ -94,17 +96,41 @@ def _strip_url_credentials(url: str | None) -> str | None:
     return url
 
 
+def _is_ip_or_localhost(host: str) -> bool:
+    """Check if host is an IP address or local hostname."""
+    h = host.lower()
+    if h in ("localhost", "host.docker.internal") or h.endswith(".local"):
+        return True
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return False
+
+
+def _target_backup_url(target_url: str) -> str:
+    """URL of the backup app on the target zone (the router routes by subdomain)."""
+    if "://" not in target_url:
+        target_url = "https://" + target_url
+    parsed = urllib.parse.urlparse(target_url)
+    host = parsed.hostname or ""
+    if not _is_ip_or_localhost(host) and not host.startswith("backup."):
+        host = f"backup.{host}"
+    formatted_host = f"[{host}]" if ":" in host else host
+    netloc = formatted_host + (f":{parsed.port}" if parsed.port else "")
+    return f"{parsed.scheme}://{netloc}"
+
+
 def _is_local_url(url: str) -> bool:
     """Check if a URL points to a local / internal address."""
     try:
         parsed = urllib.parse.urlparse(url)
         host = (parsed.hostname or "").lower()
-        return host in (
-            "localhost",
-            "127.0.0.1",
-            "::1",
-            "host.docker.internal",
-        ) or host.endswith(".local")
+        if host.startswith("backup."):
+            host = host[len("backup.") :]
+        return _is_ip_or_localhost(host)
     except Exception:
         logger.warning("Failed to parse URL in _is_local_url: %s", url)
         return False
@@ -127,7 +153,7 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _router_get(path: str, token: str | None = None, base_url: str = "") -> dict:
+async def _router_get(path: str, token: str | None = None, base_url: str = "") -> dict | list:
     url = base_url.rstrip("/") + path
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
@@ -135,9 +161,12 @@ async def _router_get(path: str, token: str | None = None, base_url: str = "") -
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         ct = r.headers.get("content-type", "")
-        if "json" in ct:
-            return r.json()
-        return {"ok": True, "text": r.text}
+        # The router answers 200 with an HTML page when the token is bad.
+        if "json" not in ct:
+            raise RuntimeError(
+                f"Router returned non-JSON response (HTTP {r.status_code}); API token may be invalid"
+            )
+        return r.json()
 
 
 async def _router_post(
@@ -150,12 +179,31 @@ async def _router_post(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
     async with httpx.AsyncClient(verify=not skip_verify, timeout=120) as client:
-        r = await client.post(url, data=data or {}, headers=headers)
+        kwargs: dict[str, Any] = {"headers": headers}
+        if data is not None:
+            kwargs["json"] = data
+        r = await client.post(url, **kwargs)
         r.raise_for_status()
         ct = r.headers.get("content-type", "")
+        if "text/html" in ct:
+            raise RuntimeError(
+                f"Router returned HTML response (HTTP {r.status_code}); API token may be invalid"
+            )
         if "json" in ct:
             return r.json()
         return {"ok": True, "text": r.text}
+
+
+def _normalize_app_listing(listing: dict | list) -> list[dict]:
+    """Normalize router app listing to a list of app dicts."""
+    if isinstance(listing, dict):
+        return [
+            {"name": name, **(info if isinstance(info, dict) else {})}
+            for name, info in listing.items()
+        ]
+    if isinstance(listing, list):
+        return [a for a in listing if isinstance(a, dict)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -229,16 +277,15 @@ async def get_apps_metadata(
 
     # Fall back to the router HTTP API
     data = await _router_get("/api/apps", token=token, base_url=base_url or router_url)
-    if isinstance(data, dict):
-        for name, info in data.items():
-            apps.append(
-                {
-                    "name": name,
-                    "status": info.get("status"),
-                    "repo_url": None,
-                    "manifest_raw": None,
-                }
-            )
+    for item in _normalize_app_listing(data):
+        apps.append(
+            {
+                "name": item.get("name"),
+                "status": item.get("status"),
+                "repo_url": None,
+                "manifest_raw": None,
+            }
+        )
 
     # Enrich apps with repo_url from git repos in temp data if available.
     # The router API doesn't expose repo_url, but each app's cloned repo
@@ -459,7 +506,7 @@ async def run_direct_push(
     log.clear()
     status = {"phase": "starting", "progress": 0}
 
-    target_backup_url = target_url.rstrip("/") + "/backup"
+    target_backup_url = _target_backup_url(target_url)
 
     try:
         # 1. Gather local app metadata
@@ -515,6 +562,7 @@ async def run_direct_push(
         total = len(accepted_apps)
 
         for i, app_name in enumerate(accepted_apps):
+            lock.touch()
             app_dir = all_app_data / app_name
             if not app_dir.exists():
                 _log(f"Skipping {app_name}: no local data directory")
@@ -780,21 +828,22 @@ async def receive_start(
             existing = await _router_get(
                 "/api/apps", token=router_token, base_url=router_url
             )
-            if isinstance(existing, dict):
-                for app_name, info in existing.items():
-                    if app_name == "backup":
-                        continue
-                    if info.get("status") in ("running", "building", "starting"):
-                        try:
-                            await _router_post(
-                                f"/stop_app/{app_name}",
-                                token=router_token,
-                                base_url=router_url,
-                            )
-                            stopped_apps.append(app_name)
-                            _log(f"Receive: stopped {app_name}")
-                        except Exception as e:
-                            _log(f"Receive: could not stop {app_name}: {e}")
+            for item in _normalize_app_listing(existing):
+                app_name = item.get("name")
+                if not app_name or app_name == "backup":
+                    continue
+                if item.get("status") in ("running", "building", "starting"):
+                    app_id = item.get("app_id") or item.get("id") or app_name
+                    try:
+                        await _router_post(
+                            f"/stop_app/{app_id}",
+                            token=router_token,
+                            base_url=router_url,
+                        )
+                        stopped_apps.append(app_name)
+                        _log(f"Receive: stopped {app_name}")
+                    except Exception as e:
+                        _log(f"Receive: could not stop {app_name}: {e}")
         except Exception as e:
             _log(f"Receive: could not list apps to stop: {e}")
 
@@ -1015,6 +1064,21 @@ async def receive_finalize(
     apps = manifest.get("apps", [])
     results = []
 
+    # Reload/stop address apps by app_id, so resolve the target's name->id map once.
+    name_to_id: dict[str, str] = {}
+    if router_url and router_token:
+        try:
+            listing = await _router_get(
+                "/api/apps", token=router_token, base_url=router_url
+            )
+            name_to_id = {
+                a["name"]: (a.get("app_id") or a.get("id") or a["name"])
+                for a in _normalize_app_listing(listing)
+                if a.get("name")
+            }
+        except Exception as e:
+            _log(f"Receive: could not list apps on target: {e}")
+
     # Determine which apps should be started after migration
     apps_to_start: set[str] = set()
     for app_info in apps:
@@ -1029,30 +1093,33 @@ async def receive_finalize(
 
         should_start = app_name in apps_to_start
 
-        # Try to reload the app (if it already exists on this instance)
-        try:
-            await _router_post(
-                f"/reload_app/{app_name}",
-                token=router_token,
-                base_url=router_url,
-            )
-            _log(f"Receive: reloaded {app_name}")
-            results.append({"name": app_name, "action": "reloaded"})
-            # If it was not running on source, stop it after reload
-            if not should_start:
-                try:
-                    await _router_post(
-                        f"/stop_app/{app_name}",
-                        token=router_token,
-                        base_url=router_url,
-                    )
-                    _log(f"Receive: stopped {app_name} (was not running on source)")
-                except Exception as e:
-                    _log(f"Receive: could not stop {app_name}: {e}")
-            continue
-        except Exception as e:
-            _log(f"Receive: {app_name} not found on target, will deploy ({e})")
-            pass  # app doesn't exist yet, try deploying
+        # Reload the app if it already exists on this instance
+        app_id = name_to_id.get(app_name)
+        if app_id:
+            try:
+                await _router_post(
+                    f"/reload_app/{app_id}",
+                    token=router_token,
+                    base_url=router_url,
+                )
+                _log(f"Receive: reloaded {app_name}")
+                results.append({"name": app_name, "action": "reloaded"})
+                # If it was not running on source, stop it after reload
+                if not should_start:
+                    try:
+                        await _router_post(
+                            f"/stop_app/{app_id}",
+                            token=router_token,
+                            base_url=router_url,
+                        )
+                        _log(f"Receive: stopped {app_name} (was not running on source)")
+                    except Exception as e:
+                        _log(f"Receive: could not stop {app_name}: {e}")
+                continue
+            except Exception as e:
+                _log(f"Receive: could not reload {app_name}, will try deploy ({e})")
+        else:
+            _log(f"Receive: {app_name} not found on target, will deploy")
 
         # Try to deploy the app from its repo URL.
         # Prefer the authenticated URL from repo_urls (direct push) over
@@ -1063,7 +1130,11 @@ async def receive_finalize(
             try:
                 await _router_post(
                     "/api/add_app",
-                    data={"repo_url": repo_url, "app_name": app_name},
+                    data={
+                        "repo_url": repo_url,
+                        "app_name": app_name,
+                        "grant_permissions_v2": True,
+                    },
                     token=router_token,
                     base_url=router_url,
                 )
@@ -1093,7 +1164,11 @@ async def receive_finalize(
                 try:
                     await _router_post(
                         "/api/add_app",
-                        data={"repo_url": builtin_url, "app_name": app_name},
+                        data={
+                            "repo_url": builtin_url,
+                            "app_name": app_name,
+                            "grant_permissions_v2": True,
+                        },
                         token=router_token,
                         base_url=router_url,
                     )
@@ -1130,9 +1205,13 @@ async def receive_finalize(
             f"{', '.join(non_migrated_stopped)}"
         )
         for app_name in non_migrated_stopped:
+            app_id = name_to_id.get(app_name)
+            if not app_id:
+                _log(f"Receive: cannot restart {app_name}: not on target")
+                continue
             try:
                 await _router_post(
-                    f"/reload_app/{app_name}",
+                    f"/reload_app/{app_id}",
                     token=router_token,
                     base_url=router_url,
                 )

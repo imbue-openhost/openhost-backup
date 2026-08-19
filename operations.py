@@ -92,11 +92,12 @@ class OperationLock:
         return None
 
     def release(self, kind: OpKind) -> None:
-        """Release the lock.  Logs a warning on mismatch but always clears."""
+        """Release the lock held by kind."""
         if self._active != kind:
             logger.warning(
-                "OperationLock.release(%s) but active was %s", kind, self._active
+                "OperationLock.release(%s) ignored; active was %s", kind, self._active
             )
+            return
         self._active = None
         self._last_activity = None
         self._fire_change()
