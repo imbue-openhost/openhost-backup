@@ -1323,7 +1323,7 @@
             const targetToken = document.getElementById("push-target-token").value.trim();
             if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
             if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
-            if (!confirm("Migrate all apps and data to " + targetUrl + "?\n\nMake sure the backup app is installed on the destination.")) return;
+            if (!confirm("Migrate all apps and data to " + targetUrl + "?")) return;
 
             const btn = document.getElementById("btn-push");
             btn.disabled = true;

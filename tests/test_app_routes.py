@@ -314,6 +314,39 @@ class TestStopAllAppsEndpoint:
         backup_app.ROUTER_API_TOKEN = ""
 
 
+class TestMigrationPushEndpoint:
+    """Tests for POST /api/migration/push."""
+
+    async def test_rejects_when_target_missing_backup_app(self, client):
+        """Preflight fails cleanly when the destination 404s (backup app not installed)."""
+        local_resp = MagicMock()
+        local_resp.status_code = 200
+        local_resp.headers = {"content-type": "application/json"}
+
+        target_resp = MagicMock()
+        target_resp.status_code = 404
+        target_resp.headers = {"content-type": "application/json"}
+
+        async def fake_get(url, **kwargs):
+            return target_resp if "backup." in url else local_resp
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=fake_get)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post(
+                "/api/migration/push",
+                json={"target_url": "https://myzone.example.com", "target_token": "tok"},
+            )
+        data = await response.get_json()
+        assert data["ok"] is False
+        assert "not installed" in data["error"]
+        backup_app.ROUTER_API_TOKEN = ""
+
+
 class TestChownAppDataEndpoint:
     """Tests for POST /api/chown-app-data."""
 

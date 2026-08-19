@@ -2633,6 +2633,45 @@ async def trigger_direct_push():
             "Set one in the Router API Token section on the Migrate tab.",
         ), 400
 
+    # Pre-flight: the destination must have the backup app installed and must
+    # accept the provided token before we start a background push.
+    import httpx
+
+    target_backup_url = migration._target_backup_url(target_url)
+    try:
+        async with httpx.AsyncClient(
+            verify=not migration._is_local_url(target_backup_url), timeout=15
+        ) as client:
+            tr = await client.get(
+                f"{target_backup_url}/api/migration/status",
+                headers={"Authorization": f"Bearer {target_token}"},
+            )
+    except Exception as e:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error=f"Could not reach the destination backup app at {target_backup_url}: {e}",
+        ), 400
+    if tr.status_code == 404:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error="The backup app is not installed on the destination instance. "
+            "Install it there, then retry.",
+        ), 400
+    if tr.status_code in (401, 403) or "json" not in tr.headers.get("content-type", ""):
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error="The destination rejected the API token. Check the destination "
+            "API token and try again.",
+        ), 400
+    if tr.status_code != 200:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False, error=f"Destination backup app returned HTTP {tr.status_code}."
+        ), 400
+
     asyncio.create_task(
         migration.run_direct_push(
             target_url=target_url,
