@@ -2359,7 +2359,7 @@ async def rename_backup():
 
 
 async def _get_router_apps(router_token: str) -> dict:
-    """Fetch app list from the local router. Raises on failure."""
+    """Fetch app list from the local router as a name-keyed dict."""
     import httpx
 
     async with httpx.AsyncClient(verify=False, timeout=10) as client:
@@ -2371,7 +2371,9 @@ async def _get_router_apps(router_token: str) -> dict:
             raise RuntimeError(f"Router API token is invalid or unauthorized (HTTP {r.status_code})")
         if r.status_code != 200:
             raise RuntimeError(f"Router returned HTTP {r.status_code}")
-        return r.json()
+        if "json" not in r.headers.get("content-type", ""):
+            raise RuntimeError("Router API token is invalid or unauthorized (non-JSON response)")
+        return {a["name"]: a for a in r.json()}
 
 
 @route("/api/router/test", methods=["POST"])
@@ -2424,7 +2426,7 @@ async def stop_all_apps():
                 if info.get("status") in ("running", "building", "starting"):
                     try:
                         sr = await client.post(
-                            f"{ROUTER_URL}/stop_app/{app_name}",
+                            f"{ROUTER_URL}/stop_app/{info['app_id']}",
                             headers={"Authorization": f"Bearer {router_token}"},
                         )
                         if sr.status_code == 200:

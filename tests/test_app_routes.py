@@ -13,7 +13,7 @@ import os
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -232,6 +232,24 @@ class TestAppsStatusEndpoint:
         response = await client.get("/api/apps-status")
         assert response.status_code == 400
 
+    async def test_non_json_response_reported_as_token_error(self, client):
+        """A 200 HTML reply (router login page) is surfaced as a token error, not fake apps."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"content-type": "text/html"}
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.get("/api/apps-status")
+        data = await response.get_json()
+        assert data["ok"] is False
+        assert "token" in data["error"].lower()
+        backup_app.ROUTER_API_TOKEN = ""
+
 
 class TestStopAllAppsEndpoint:
     """Tests for POST /api/stop-all-apps."""
@@ -239,9 +257,9 @@ class TestStopAllAppsEndpoint:
     @patch("app._get_router_apps")
     async def test_stops_running_apps(self, mock_get, client):
         mock_get.return_value = {
-            "secrets": {"status": "running"},
-            "backup": {"status": "running"},
-            "agent": {"status": "stopped"},
+            "secrets": {"app_id": "id-secrets", "status": "running"},
+            "backup": {"app_id": "id-backup", "status": "running"},
+            "agent": {"app_id": "id-agent", "status": "stopped"},
         }
 
         # Mock the httpx module used inside the function
@@ -260,6 +278,39 @@ class TestStopAllAppsEndpoint:
         assert "secrets" in data["stopped"]
         assert "backup" not in data["stopped"]  # backup is never stopped
         assert "agent" not in data["stopped"]  # already stopped
+        backup_app.ROUTER_API_TOKEN = ""
+
+    async def test_stops_running_apps_when_router_returns_list(self, client):
+        """Stop all apps works when the router API returns a list of dicts."""
+        mock_apps_resp = MagicMock()
+        mock_apps_resp.status_code = 200
+        mock_apps_resp.headers = {"content-type": "application/json"}
+        mock_apps_resp.json.return_value = [
+            {"app_id": "id-secrets", "name": "secrets", "status": "running"},
+            {"app_id": "id-backup", "name": "backup", "status": "running"},
+            {"app_id": "id-agent", "name": "agent", "status": "stopped"},
+        ]
+
+        mock_stop_resp = MagicMock()
+        mock_stop_resp.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_apps_resp)
+        mock_client.post = AsyncMock(return_value=mock_stop_resp)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post("/api/stop-all-apps")
+        data = await response.get_json()
+        assert data["ok"] is True
+        assert "secrets" in data["stopped"]
+        assert "backup" not in data["stopped"]
+        assert "agent" not in data["stopped"]
+        # The stop call must address the app by id, not name
+        stop_urls = [c.args[0] for c in mock_client.post.call_args_list]
+        assert stop_urls and all("/stop_app/id-secrets" in u for u in stop_urls)
         backup_app.ROUTER_API_TOKEN = ""
 
 

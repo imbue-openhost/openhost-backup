@@ -127,7 +127,7 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _router_get(path: str, token: str | None = None, base_url: str = "") -> dict:
+async def _router_get(path: str, token: str | None = None, base_url: str = "") -> dict | list:
     url = base_url.rstrip("/") + path
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
@@ -135,9 +135,12 @@ async def _router_get(path: str, token: str | None = None, base_url: str = "") -
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         ct = r.headers.get("content-type", "")
-        if "json" in ct:
-            return r.json()
-        return {"ok": True, "text": r.text}
+        # The router answers 200 with an HTML page when the token is bad.
+        if "json" not in ct:
+            raise RuntimeError(
+                f"Router returned non-JSON response (HTTP {r.status_code}); API token may be invalid"
+            )
+        return r.json()
 
 
 async def _router_post(
@@ -150,12 +153,14 @@ async def _router_post(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
     async with httpx.AsyncClient(verify=not skip_verify, timeout=120) as client:
-        r = await client.post(url, data=data or {}, headers=headers)
+        r = await client.post(url, json=data, headers=headers)
         r.raise_for_status()
         ct = r.headers.get("content-type", "")
-        if "json" in ct:
-            return r.json()
-        return {"ok": True, "text": r.text}
+        if "json" not in ct:
+            raise RuntimeError(
+                f"Router returned non-JSON response (HTTP {r.status_code}); API token may be invalid"
+            )
+        return r.json()
 
 
 # ---------------------------------------------------------------------------
@@ -229,16 +234,15 @@ async def get_apps_metadata(
 
     # Fall back to the router HTTP API
     data = await _router_get("/api/apps", token=token, base_url=base_url or router_url)
-    if isinstance(data, dict):
-        for name, info in data.items():
-            apps.append(
-                {
-                    "name": name,
-                    "status": info.get("status"),
-                    "repo_url": None,
-                    "manifest_raw": None,
-                }
-            )
+    for item in data:
+        apps.append(
+            {
+                "name": item["name"],
+                "status": item.get("status"),
+                "repo_url": None,
+                "manifest_raw": None,
+            }
+        )
 
     # Enrich apps with repo_url from git repos in temp data if available.
     # The router API doesn't expose repo_url, but each app's cloned repo
@@ -780,21 +784,21 @@ async def receive_start(
             existing = await _router_get(
                 "/api/apps", token=router_token, base_url=router_url
             )
-            if isinstance(existing, dict):
-                for app_name, info in existing.items():
-                    if app_name == "backup":
-                        continue
-                    if info.get("status") in ("running", "building", "starting"):
-                        try:
-                            await _router_post(
-                                f"/stop_app/{app_name}",
-                                token=router_token,
-                                base_url=router_url,
-                            )
-                            stopped_apps.append(app_name)
-                            _log(f"Receive: stopped {app_name}")
-                        except Exception as e:
-                            _log(f"Receive: could not stop {app_name}: {e}")
+            for item in existing:
+                app_name = item["name"]
+                if app_name == "backup":
+                    continue
+                if item.get("status") in ("running", "building", "starting"):
+                    try:
+                        await _router_post(
+                            f"/stop_app/{item['app_id']}",
+                            token=router_token,
+                            base_url=router_url,
+                        )
+                        stopped_apps.append(app_name)
+                        _log(f"Receive: stopped {app_name}")
+                    except Exception as e:
+                        _log(f"Receive: could not stop {app_name}: {e}")
         except Exception as e:
             _log(f"Receive: could not list apps to stop: {e}")
 
@@ -1015,6 +1019,17 @@ async def receive_finalize(
     apps = manifest.get("apps", [])
     results = []
 
+    # Reload/stop address apps by app_id, so resolve the target's name->id map once.
+    name_to_id: dict[str, str] = {}
+    if router_url and router_token:
+        try:
+            listing = await _router_get(
+                "/api/apps", token=router_token, base_url=router_url
+            )
+            name_to_id = {a["name"]: a["app_id"] for a in listing}
+        except Exception as e:
+            _log(f"Receive: could not list apps on target: {e}")
+
     # Determine which apps should be started after migration
     apps_to_start: set[str] = set()
     for app_info in apps:
@@ -1029,30 +1044,33 @@ async def receive_finalize(
 
         should_start = app_name in apps_to_start
 
-        # Try to reload the app (if it already exists on this instance)
-        try:
-            await _router_post(
-                f"/reload_app/{app_name}",
-                token=router_token,
-                base_url=router_url,
-            )
-            _log(f"Receive: reloaded {app_name}")
-            results.append({"name": app_name, "action": "reloaded"})
-            # If it was not running on source, stop it after reload
-            if not should_start:
-                try:
-                    await _router_post(
-                        f"/stop_app/{app_name}",
-                        token=router_token,
-                        base_url=router_url,
-                    )
-                    _log(f"Receive: stopped {app_name} (was not running on source)")
-                except Exception as e:
-                    _log(f"Receive: could not stop {app_name}: {e}")
-            continue
-        except Exception as e:
-            _log(f"Receive: {app_name} not found on target, will deploy ({e})")
-            pass  # app doesn't exist yet, try deploying
+        # Reload the app if it already exists on this instance
+        app_id = name_to_id.get(app_name)
+        if app_id:
+            try:
+                await _router_post(
+                    f"/reload_app/{app_id}",
+                    token=router_token,
+                    base_url=router_url,
+                )
+                _log(f"Receive: reloaded {app_name}")
+                results.append({"name": app_name, "action": "reloaded"})
+                # If it was not running on source, stop it after reload
+                if not should_start:
+                    try:
+                        await _router_post(
+                            f"/stop_app/{app_id}",
+                            token=router_token,
+                            base_url=router_url,
+                        )
+                        _log(f"Receive: stopped {app_name} (was not running on source)")
+                    except Exception as e:
+                        _log(f"Receive: could not stop {app_name}: {e}")
+                continue
+            except Exception as e:
+                _log(f"Receive: could not reload {app_name}, will try deploy ({e})")
+        else:
+            _log(f"Receive: {app_name} not found on target, will deploy")
 
         # Try to deploy the app from its repo URL.
         # Prefer the authenticated URL from repo_urls (direct push) over
@@ -1130,9 +1148,13 @@ async def receive_finalize(
             f"{', '.join(non_migrated_stopped)}"
         )
         for app_name in non_migrated_stopped:
+            app_id = name_to_id.get(app_name)
+            if not app_id:
+                _log(f"Receive: cannot restart {app_name}: not on target")
+                continue
             try:
                 await _router_post(
-                    f"/reload_app/{app_name}",
+                    f"/reload_app/{app_id}",
                     token=router_token,
                     base_url=router_url,
                 )
