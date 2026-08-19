@@ -342,6 +342,65 @@ class TestMigrationPushEndpoint:
         assert "not installed" in data["error"]
         backup_app.ROUTER_API_TOKEN = ""
 
+    @patch("app._get_router_apps")
+    async def test_rejects_when_selected_apps_still_running(self, mock_get, client):
+        """Push refuses to start while a targeted app is up, and frees the lock."""
+        mock_get.return_value = {
+            "app1": {"status": "running"},
+            "app2": {"status": "stopped"},
+            "backup": {"status": "running"},
+        }
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        response = await client.post(
+            "/api/migration/push",
+            json={
+                "target_url": "https://myzone.example.com",
+                "target_token": "tok",
+                "apps": ["app1", "app2"],
+            },
+        )
+        assert response.status_code == 409
+        data = await response.get_json()
+        assert data["ok"] is False
+        # backup is never reported: it serves this request and can't be stopped.
+        assert "app1" in data["error"] and "backup" not in data["error"]
+        assert not backup_app.op_lock.migration_running
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("app._get_router_apps")
+    async def test_allows_start_when_selected_apps_stopped(self, mock_get, client):
+        """A running app outside the selection does not block the migration."""
+        mock_get.return_value = {
+            "app1": {"status": "stopped"},
+            "app2": {"status": "running"},
+        }
+
+        target_resp = MagicMock()
+        target_resp.status_code = 200
+        target_resp.headers = {"content-type": "application/json"}
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=target_resp)
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with (
+            patch("httpx.AsyncClient") as mock_cls,
+            patch("migration.run_direct_push", new=AsyncMock()),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            response = await client.post(
+                "/api/migration/push",
+                json={
+                    "target_url": "https://myzone.example.com",
+                    "target_token": "tok",
+                    "apps": ["app1"],
+                },
+            )
+        data = await response.get_json()
+        assert data["ok"] is True
+        backup_app.op_lock.release(backup_app.OpKind.MIGRATION)
+        backup_app.ROUTER_API_TOKEN = ""
+
 
 class TestChownAppDataEndpoint:
     """Tests for POST /api/chown-app-data."""

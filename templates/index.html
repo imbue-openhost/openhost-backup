@@ -352,13 +352,12 @@
                 </span>
             </div>
             <p class="info" id="router-token-desc" style="{% if not config.get('router_api_token') %}color:#92400e;{% endif %}">
-                The backup app needs a <strong>router API token</strong> to access the
-                local router during migration (to list, stop, and deploy apps).
-                Generate a token in the Cloud in a Bottle dashboard under <strong>API Tokens</strong>.
+                The backup app needs an API token from the local Cloud in a Bottle instance to manage and transfer app data in this instance. 
+                Generate one in the dashboard settings page under <strong>API Tokens</strong>.
             </p>
             <label>Router API Token</label>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
-                <input type="password" id="router-token-input" placeholder="{% if config.get('router_api_token') %}(Configured — enter new token to update){% else %}Paste your router API token here{% endif %}" autocomplete="off" style="margin-bottom:0;">
+                <input type="password" id="router-token-input" placeholder="{% if config.get('router_api_token') %}Configured; enter a new token to update. {% else %}Paste your API token here{% endif %}" autocomplete="off" style="margin-bottom:0;">
                 <button class="btn-secondary" id="btn-toggle-router-token" onclick="toggleRouterTokenVisibility()" type="button" style="white-space:nowrap;">Show</button>
             </div>
             <div class="btn-row" style="margin-top:8px;">
@@ -370,35 +369,27 @@
         </section>
 
         <section>
-            <h2>Migrate to another instance</h2>
+            <h2>Migrate apps to another instance</h2>
             <p class="info">
-                Move your apps and data to another Cloud in a Bottle instance.
-                Install the backup app on both instances, then generate an API token
-                on the destination. Your data will be transferred and your applications
-                will be restarted on the other side.
+                Move apps and data to another Cloud in a Bottle instance. The backup app needs to be installed on both instances. An API token from the destination also needs to be provided. 
+                This transfers all permanent app data and will restart the app on the other side. 
             </p>
             <details style="margin-bottom:12px;">
-                <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Important details before migrating</summary>
+                <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Details about migration</summary>
                 <div class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;margin-top:6px;">
-                    <strong>This instance:</strong> Not changed. Migration copies your data
-                    to the destination. Nothing on this instance is modified or deleted.
+                    <strong>This instance:</strong> The selected apps are stopped before the
+                    transfer and are left stopped afterward, so nothing writes to their data
+                    while it is copied. No data on this instance is modified or deleted.
                     <br><br>
-                    <strong>Destination:</strong> All running apps will be stopped, and
-                    existing app data for migrated apps will be deleted before new data is
-                    written. Apps not included in the migration will be stopped during the
-                    transfer and restarted afterward.
+                    <strong>Destination:</strong> Running apps will be stopped during the migration, and existing app data for migrated apps will be deleted.
+                    Other apps retain data and are restarted afterward.
                     <br><br>
-                    <strong>Tip:</strong> Stop applications on this instance before migrating
-                    to avoid transferring inconsistent data while apps are actively writing.
-                    <br><br>
-                    <strong>Not migrated:</strong> API tokens, owner password, and other
-                    system-level settings are not transferred.
+                    <strong>Not migrated:</strong> API tokens, owner password, and settings are not transferred. 
                     {% for entry in scope.excluded if entry.user_facing and entry.reason %}
                     The path <code>{{ entry.path }}</code> is also excluded from
                     the snapshot pipeline. {{ entry.reason }}
                     {% endfor %}
-                    See <em>What is and isn't backed up</em> on the Backups tab
-                    for the full list.
+                    See the Backups tab for the full list.
                 </div>
             </details>
 
@@ -415,12 +406,6 @@
                 </div>
             </div>
 
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-                <button class="btn-primary" id="btn-stop-apps" onclick="stopApps()">Stop apps</button>
-                <button class="btn-primary" id="btn-chown" onclick="chownAppData()" disabled>Fix file ownership (chown)</button>
-            </div>
-            <div id="premig-msg"></div>
-
             <div style="margin-bottom:12px;">
                 <label>Destination instance URL</label>
                 <input type="text" id="push-target-url" placeholder="https://my-other-instance.selfhost.imbue.com">
@@ -430,7 +415,7 @@
                 <input type="password" id="push-target-token" placeholder="Paste the token you generated on the destination instance">
             </div>
             <div class="btn-row" style="margin-bottom:12px;">
-                <button class="btn-primary" id="btn-push" onclick="startPush()">Start migration</button>
+                <button class="btn-primary" id="btn-migrate" onclick="stopAppsAndMigrate()">Stop apps and migrate</button>
             </div>
 
             <!-- Progress -->
@@ -568,6 +553,9 @@
 
         let cachedAppsList = [];
         let selectedAppNames = null; // null = all apps selected by default
+        // Held across the stop -> chown -> push sequence. The intermediate
+        // refreshAppsStatus() would otherwise re-enable the button mid-run.
+        let migBusy = false;
 
         function getSelectedApps() {
             if (selectedAppNames === null) return null;
@@ -598,23 +586,11 @@
         }
 
         function updateMigAppsButtons() {
-            const chownBtn = document.getElementById("btn-chown");
-            const stopBtn = document.getElementById("btn-stop-apps");
-            const pushBtn = document.getElementById("btn-push");
+            const btn = document.getElementById("btn-migrate");
+            if (!btn || migBusy || migPolling) return;
             const cbs = Array.from(document.querySelectorAll(".mig-app-cb"));
             const checkedCount = cbs.filter(cb => cb.checked).length;
-
-            if (checkedCount === 0 && cachedAppsList.length > 0) {
-                if (stopBtn) stopBtn.disabled = true;
-                if (chownBtn) chownBtn.disabled = true;
-                return;
-            }
-            if (stopBtn) stopBtn.disabled = false;
-
-            const selectedList = getSelectedApps();
-            const targetApps = cachedAppsList.filter(a => selectedList === null || selectedList.includes(a.name));
-            const allTargetStopped = targetApps.length > 0 && targetApps.every(a => a.status === "stopped" || a.status === "error");
-            if (chownBtn) chownBtn.disabled = !allTargetStopped;
+            btn.disabled = checkedCount === 0 && cachedAppsList.length > 0;
         }
 
         async function refreshAppsStatus() {
@@ -655,54 +631,6 @@
             }).join("");
 
             updateMigAppsButtons();
-        }
-
-        async function stopApps() {
-            const selected = getSelectedApps();
-            if (selected !== null && selected.length === 0) {
-                showMsg("premig-msg", "No apps selected to stop.", false);
-                return;
-            }
-            const btn = document.getElementById("btn-stop-apps");
-            btn.disabled = true;
-            btn.textContent = "Stopping...";
-            const res = await api("/api/stop-all-apps", {
-                method: "POST",
-                body: selected ? { apps: selected } : {}
-            });
-            btn.disabled = false;
-            btn.textContent = "Stop apps";
-            if (res.ok) {
-                const stopped = res.stopped || [];
-                showMsg("premig-msg", stopped.length > 0
-                    ? "Stopped: " + stopped.join(", ")
-                    : "No matching apps were running.", true);
-            } else {
-                showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
-            }
-            await refreshAppsStatus();
-        }
-
-        async function chownAppData() {
-            const selected = getSelectedApps();
-            if (selected !== null && selected.length === 0) {
-                showMsg("premig-msg", "No apps selected for fixing ownership.", false);
-                return;
-            }
-            const btn = document.getElementById("btn-chown");
-            btn.disabled = true;
-            btn.textContent = "Fixing ownership...";
-            const res = await api("/api/chown-app-data", {
-                method: "POST",
-                body: selected ? { apps: selected } : {}
-            });
-            btn.disabled = false;
-            btn.textContent = "Fix file ownership (chown)";
-            if (res.ok) {
-                showMsg("premig-msg", res.message || "Ownership fixed.", true);
-            } else {
-                showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
-            }
         }
 
         /* ================================================================
@@ -1397,7 +1325,10 @@
 
         let migPolling = false;
 
-        async function startPush() {
+        // Stopping is a hard requirement, not a courtesy: /api/migration/push
+        // rejects a run whose apps are still up, so the button owns the whole
+        // sequence rather than leaving the user to order it correctly.
+        async function stopAppsAndMigrate() {
             const targetUrl = document.getElementById("push-target-url").value.trim();
             const targetToken = document.getElementById("push-target-token").value.trim();
             const selected = getSelectedApps();
@@ -1408,26 +1339,50 @@
             if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
             if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
             const promptTarget = selected ? selected.join(", ") : "all apps and data";
-            if (!confirm("Migrate " + promptTarget + " to " + targetUrl + "?")) return;
+            if (!confirm("Stop " + promptTarget + " on this instance and migrate to " + targetUrl + "?")) return;
 
-            const btn = document.getElementById("btn-push");
+            const btn = document.getElementById("btn-migrate");
+            const body = selected ? { apps: selected } : {};
+            migBusy = true;
             btn.disabled = true;
-            btn.textContent = "Migrating...";
-            const res = await api("/api/migration/push", {
-                method: "POST",
-                body: {
-                    target_url: targetUrl,
-                    target_token: targetToken,
-                    ...(selected ? { apps: selected } : {})
+            try {
+                btn.textContent = "Stopping apps...";
+                const stopRes = await api("/api/stop-all-apps", { method: "POST", body });
+                if (!stopRes.ok) {
+                    showMsg("mig-msg", "Could not stop apps: " + (stopRes.error || "unknown"), false);
+                    return;
                 }
-            });
-            if (res.ok) {
+                await refreshAppsStatus();
+
+                btn.textContent = "Fixing ownership...";
+                const chownRes = await api("/api/chown-app-data", { method: "POST", body });
+                if (!chownRes.ok) {
+                    showMsg("mig-msg", "Could not fix file ownership: " + (chownRes.error || "unknown"), false);
+                    return;
+                }
+
+                btn.textContent = "Migrating...";
+                const res = await api("/api/migration/push", {
+                    method: "POST",
+                    body: {
+                        target_url: targetUrl,
+                        target_token: targetToken,
+                        ...(selected ? { apps: selected } : {})
+                    }
+                });
+                if (!res.ok) {
+                    showMsg("mig-msg", res.error || "Failed", false);
+                    return;
+                }
                 showMsg("mig-msg", "Migration started", true);
                 pollMigration();
-            } else {
-                showMsg("mig-msg", res.error || "Failed", false);
-                btn.disabled = false;
-                btn.textContent = "Start migration";
+            } finally {
+                migBusy = false;
+                // pollMigration owns the button for the duration of the run.
+                if (!migPolling) {
+                    btn.disabled = false;
+                    btn.textContent = "Stop apps and migrate";
+                }
             }
         }
 
@@ -1464,8 +1419,8 @@
                     setTimeout(poll, 2000);
                 } else {
                     migPolling = false;
-                    const pushBtn = document.getElementById("btn-push");
-                    if (pushBtn) { pushBtn.disabled = false; pushBtn.textContent = "Start migration"; }
+                    const migBtn = document.getElementById("btn-migrate");
+                    if (migBtn) { migBtn.disabled = false; migBtn.textContent = "Stop apps and migrate"; }
 
                     if (phase === "done") {
                         showMsg("mig-msg", "Migration complete! Your apps and data have been transferred.", true);

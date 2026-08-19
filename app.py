@@ -2429,6 +2429,30 @@ def _parse_selected_apps(raw: object) -> list[str] | None:
     return None
 
 
+# Statuses that mean an app still holds its data dir open. ``building`` and
+# ``starting`` count: a container that is about to run is as unsafe to copy
+# from as one already running.
+_ACTIVE_STATUSES = ("running", "building", "starting")
+
+
+async def _running_selected_apps(
+    router_token: str, selected_apps: list[str] | None
+) -> list[str]:
+    """Names of targeted non-backup apps that are not stopped.
+
+    ``backup`` is always excluded — it serves the request doing the asking,
+    so it can never be stopped first.
+    """
+    apps = await _get_router_apps(router_token)
+    return [
+        name
+        for name, info in apps.items()
+        if name != "backup"
+        and (selected_apps is None or name in selected_apps)
+        and info.get("status") in _ACTIVE_STATUSES
+    ]
+
+
 @route("/api/stop-all-apps", methods=["POST"])
 @route("/api/stop-apps", methods=["POST"])
 async def stop_all_apps():
@@ -2449,7 +2473,7 @@ async def stop_all_apps():
                     continue
                 if selected_apps and app_name not in selected_apps:
                     continue
-                if info.get("status") in ("running", "building", "starting"):
+                if info.get("status") in _ACTIVE_STATUSES:
                     app_id = info.get("app_id") or info.get("id") or app_name
                     try:
                         sr = await client.post(
@@ -2491,24 +2515,16 @@ async def chown_app_data():
     data = await request.get_json(silent=True) or {}
     selected_apps = _parse_selected_apps(data.get("apps"))
 
-    # Check that targeted non-backup apps are stopped
     try:
-        apps = await _get_router_apps(router_token)
-        running = [
-            name
-            for name, info in apps.items()
-            if name != "backup"
-            and (selected_apps is None or name in selected_apps)
-            and info.get("status") in ("running", "building", "starting")
-        ]
-        if running:
-            return jsonify(
-                ok=False,
-                error=f"Apps still running: {', '.join(running)}. "
-                "Stop them before fixing ownership.",
-            ), 400
+        running = await _running_selected_apps(router_token, selected_apps)
     except Exception as e:
         return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
+    if running:
+        return jsonify(
+            ok=False,
+            error=f"Apps still running: {', '.join(running)}. "
+            "Stop them before fixing ownership.",
+        ), 400
 
     if not ALL_APP_DATA.is_dir():
         return jsonify(
@@ -2650,6 +2666,23 @@ async def trigger_direct_push():
             "token to access the local router API during migration. "
             "Set one in the Router API Token section on the Migrate tab.",
         ), 400
+
+    # Pre-flight: the apps being moved must be stopped. A live app writes to
+    # its data dir while we tar it, so the destination would receive a torn
+    # copy (half-written SQLite pages, partial uploads) that looks like a
+    # successful migration.
+    try:
+        running = await _running_selected_apps(router_token, selected_apps)
+    except Exception as e:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
+    if running:
+        op_lock.release(OpKind.MIGRATION)
+        return jsonify(
+            ok=False,
+            error=f"Apps still running: {', '.join(running)}. "
+            "Stop them before migrating.",
+        ), 409
 
     # Pre-flight: the destination must have the backup app installed and must
     # accept the provided token before we start a background push.
