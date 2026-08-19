@@ -2057,12 +2057,15 @@ async def post_config():
     data = await request.get_json()
     current_conf = load_config()
 
-    # router_api_token is special: it lets this app call the Cloud in a Bottle
-    # router. After it's been set once, require a Bearer token to rotate
-    # it so a co-located container can't quietly swap it for one they
-    # control.
     if "router_api_token" in data and current_conf.get("router_api_token"):
-        if not await _verify_admin_token(_extract_bearer_token()):
+        bearer = _extract_bearer_token()
+        new_token = data.get("router_api_token") or ""
+        authorized = (
+            not new_token
+            or await _verify_admin_token(bearer)
+            or (bool(new_token) and await _verify_admin_token(new_token))
+        )
+        if not authorized:
             return jsonify(
                 ok=False,
                 error="Bearer token required to rotate router_api_token",
@@ -2356,7 +2359,7 @@ async def rename_backup():
 
 
 async def _get_router_apps(router_token: str) -> dict:
-    """Fetch app list from the local router.  Raises on failure."""
+    """Fetch app list from the local router. Raises on failure."""
     import httpx
 
     async with httpx.AsyncClient(verify=False, timeout=10) as client:
@@ -2364,9 +2367,30 @@ async def _get_router_apps(router_token: str) -> dict:
             f"{ROUTER_URL}/api/apps",
             headers={"Authorization": f"Bearer {router_token}"},
         )
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"Router API token is invalid or unauthorized (HTTP {r.status_code})")
         if r.status_code != 200:
-            raise RuntimeError(f"Router returned {r.status_code}")
+            raise RuntimeError(f"Router returned HTTP {r.status_code}")
         return r.json()
+
+
+@route("/api/router/test", methods=["POST"])
+async def api_router_test():
+    """Test router API token validity against the local router."""
+    data = await request.get_json(silent=True) or {}
+    token = data.get("token") or _extract_bearer_token() or get_router_api_token()
+    if not token:
+        return jsonify(ok=False, error="No router API token provided or configured"), 400
+    try:
+        apps = await _get_router_apps(token)
+        app_names = [n for n in apps if n != "backup"]
+        return jsonify(
+            ok=True,
+            message=f"Connected to router successfully ({len(app_names)} apps found)",
+            app_count=len(app_names),
+        )
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
 
 
 @route("/api/apps-status")
@@ -2592,9 +2616,7 @@ async def trigger_direct_push():
                     return jsonify(
                         ok=False,
                         error="Router API token is invalid or expired. "
-                        "Go to the Backups tab and set a valid router_api_token "
-                        "in the backup config (POST /api/config with "
-                        '{"router_api_token": "..."}). '
+                        "Go to the Migrate tab and update your Router API Token. "
                         "You can generate a token from the Cloud in a Bottle dashboard "
                         "under API Tokens.",
                     ), 400
@@ -2606,9 +2628,7 @@ async def trigger_direct_push():
             ok=False,
             error="No router API token configured. The backup app needs a "
             "token to access the local router API during migration. "
-            "Set one via the backup config: POST /api/config with "
-            '{"router_api_token": "YOUR_TOKEN"}. You can generate '
-            "a token from the Cloud in a Bottle dashboard under API Tokens.",
+            "Set one in the Router API Token section on the Migrate tab.",
         ), 400
 
     asyncio.create_task(

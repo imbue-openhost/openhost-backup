@@ -505,8 +505,77 @@ class TestPostConfigSensitiveWrites:
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 401
-        # Token should NOT have been rotated.
         assert backup_app.load_config()["router_api_token"] == "existing"
+
+    async def test_rotate_router_token_succeeds_with_auth_or_clear(self, client):
+        """Rotating router token succeeds when authorized or when cleared."""
+        backup_app.ensure_default_config()
+        conf = backup_app.load_config()
+        conf["router_api_token"] = "existing"
+        backup_app.save_config(conf)
+
+        # Authorized via Bearer header.
+        with patch.object(backup_app, "_verify_admin_token", new=AsyncMock(return_value=True)):
+            resp = await client.post(
+                "/api/config",
+                data=json.dumps({"router_api_token": "rotated-bearer"}),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer admin-token"},
+            )
+            assert resp.status_code == 200
+            assert backup_app.load_config()["router_api_token"] == "rotated-bearer"
+
+        # Authorized because the new token itself is verified against router.
+        with patch.object(backup_app, "_verify_admin_token", new=AsyncMock(return_value=True)):
+            resp = await client.post(
+                "/api/config",
+                data=json.dumps({"router_api_token": "rotated-direct"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+            assert backup_app.load_config()["router_api_token"] == "rotated-direct"
+
+        # Clearing the token.
+        resp = await client.post(
+            "/api/config",
+            data=json.dumps({"router_api_token": ""}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 200
+        assert backup_app.load_config()["router_api_token"] == ""
+
+    async def test_router_test_endpoint(self, client):
+        """Tests the POST /api/router/test endpoint."""
+        # Missing token
+        backup_app.ROUTER_API_TOKEN = ""
+        conf = backup_app.load_config()
+        conf["router_api_token"] = ""
+        backup_app.save_config(conf)
+
+        resp = await client.post("/api/router/test", data=json.dumps({}), headers={"Content-Type": "application/json"})
+        assert resp.status_code == 400
+
+        # Successful test
+        with patch("app._get_router_apps", new=AsyncMock(return_value={"app1": {}, "backup": {}})):
+            resp = await client.post(
+                "/api/router/test",
+                data=json.dumps({"token": "valid-token"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+            body = await resp.get_json()
+            assert body["ok"] is True
+            assert body["app_count"] == 1
+
+        # Router rejects token
+        with patch("app._get_router_apps", new=AsyncMock(side_effect=RuntimeError("Router API token is invalid"))):
+            resp = await client.post(
+                "/api/router/test",
+                data=json.dumps({"token": "bad-token"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 400
+            body = await resp.get_json()
+            assert body["ok"] is False
 
     async def test_set_repo_password_no_auth_required(self, client):
         # The owner is the only caller (the app has no public paths), so
