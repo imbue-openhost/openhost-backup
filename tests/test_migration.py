@@ -129,6 +129,16 @@ class TestRouterGet:
                 await migration._router_get("/api/apps", token="t", base_url="https://localhost")
 
 
+class TestTargetBackupUrl:
+    def test_rewrites_zone_url_to_backup_subdomain(self):
+        f = migration._target_backup_url
+        assert f("https://myzone.selfhost.imbue.com") == "https://backup.myzone.selfhost.imbue.com"
+        assert f("https://myzone.example.com/") == "https://backup.myzone.example.com"
+        assert f("myzone.example.com") == "https://backup.myzone.example.com"
+        assert f("https://backup.myzone.example.com") == "https://backup.myzone.example.com"
+        assert f("https://myzone.example.com:8443") == "https://backup.myzone.example.com:8443"
+
+
 class TestValidateName:
     def test_valid_simple(self):
         assert validate_name("myapp") is True

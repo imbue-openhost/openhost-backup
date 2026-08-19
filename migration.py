@@ -94,6 +94,18 @@ def _strip_url_credentials(url: str | None) -> str | None:
     return url
 
 
+def _target_backup_url(target_url: str) -> str:
+    """URL of the backup app on the target zone (the router routes by subdomain)."""
+    if "://" not in target_url:
+        target_url = "https://" + target_url
+    parsed = urllib.parse.urlparse(target_url)
+    host = parsed.hostname or ""
+    if not host.startswith("backup."):
+        host = f"backup.{host}"
+    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    return f"{parsed.scheme}://{netloc}"
+
+
 def _is_local_url(url: str) -> bool:
     """Check if a URL points to a local / internal address."""
     try:
@@ -463,7 +475,7 @@ async def run_direct_push(
     log.clear()
     status = {"phase": "starting", "progress": 0}
 
-    target_backup_url = target_url.rstrip("/") + "/backup"
+    target_backup_url = _target_backup_url(target_url)
 
     try:
         # 1. Gather local app metadata
