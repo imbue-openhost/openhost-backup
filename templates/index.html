@@ -403,9 +403,16 @@
             </details>
 
             <div style="margin-bottom:12px;">
-                <label>Applications to migrate</label>
-                <input type="text" id="mig-apps" value="all" placeholder="all, or comma-separated app names (e.g. myapp, database)" oninput="refreshAppsStatus()">
-                <div id="apps-status-list" style="font-size:0.85rem;color:#555;margin-top:4px;"></div>
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                    <label style="margin-bottom:0;">Applications to migrate</label>
+                    <div style="display:flex;gap:6px;">
+                        <button class="btn-secondary" type="button" style="padding:2px 8px;font-size:0.75rem;" onclick="selectAllMigApps()">Select all</button>
+                        <button class="btn-secondary" type="button" style="padding:2px 8px;font-size:0.75rem;" onclick="deselectAllMigApps()">Deselect all</button>
+                    </div>
+                </div>
+                <div id="mig-apps-list" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:8px;margin-top:6px;">
+                    <span style="font-size:0.85rem;color:#666;">Loading apps…</span>
+                </div>
             </div>
 
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
@@ -559,55 +566,106 @@
            Pre-migration
            ================================================================ */
 
+        let cachedAppsList = [];
+        let selectedAppNames = null; // null = all apps selected by default
+
         function getSelectedApps() {
-            const el = document.getElementById("mig-apps");
-            if (!el) return null;
-            const val = el.value.trim();
-            if (!val || val.toLowerCase() === "all" || val === "*") return null;
-            const list = val.split(",").map(s => s.trim()).filter(Boolean);
-            return list.length > 0 ? list : null;
+            if (selectedAppNames === null) return null;
+            return Array.from(selectedAppNames);
+        }
+
+        function selectAllMigApps() {
+            selectedAppNames = null;
+            document.querySelectorAll(".mig-app-cb").forEach(cb => { cb.checked = true; });
+            updateMigAppsButtons();
+        }
+
+        function deselectAllMigApps() {
+            selectedAppNames = new Set();
+            document.querySelectorAll(".mig-app-cb").forEach(cb => { cb.checked = false; });
+            updateMigAppsButtons();
+        }
+
+        function onMigAppCheckboxChange() {
+            const cbs = Array.from(document.querySelectorAll(".mig-app-cb"));
+            const checked = cbs.filter(cb => cb.checked).map(cb => cb.value);
+            if (checked.length === cbs.length) {
+                selectedAppNames = null;
+            } else {
+                selectedAppNames = new Set(checked);
+            }
+            updateMigAppsButtons();
+        }
+
+        function updateMigAppsButtons() {
+            const chownBtn = document.getElementById("btn-chown");
+            const stopBtn = document.getElementById("btn-stop-apps");
+            const pushBtn = document.getElementById("btn-push");
+            const cbs = Array.from(document.querySelectorAll(".mig-app-cb"));
+            const checkedCount = cbs.filter(cb => cb.checked).length;
+
+            if (checkedCount === 0 && cachedAppsList.length > 0) {
+                if (stopBtn) stopBtn.disabled = true;
+                if (chownBtn) chownBtn.disabled = true;
+                return;
+            }
+            if (stopBtn) stopBtn.disabled = false;
+
+            const selectedList = getSelectedApps();
+            const targetApps = cachedAppsList.filter(a => selectedList === null || selectedList.includes(a.name));
+            const allTargetStopped = targetApps.length > 0 && targetApps.every(a => a.status === "stopped" || a.status === "error");
+            if (chownBtn) chownBtn.disabled = !allTargetStopped;
         }
 
         async function refreshAppsStatus() {
             const res = await api("/api/apps-status");
-            const listEl = document.getElementById("apps-status-list");
-            const chownBtn = document.getElementById("btn-chown");
+            const listEl = document.getElementById("mig-apps-list");
+            if (!listEl) return;
             if (!res.ok) {
                 const isTokenErr = res.error && (res.error.includes("token") || res.error.includes("401") || res.error.includes("403"));
                 if (isTokenErr) {
-                    listEl.innerHTML = '<span style="color:#dc2626;font-weight:500;">Router token invalid or not configured. Set a valid token above.</span>';
+                    listEl.innerHTML = '<span style="color:#dc2626;font-size:0.85rem;font-weight:500;">Router token invalid or not configured. Set a valid token above.</span>';
                 } else {
-                    listEl.textContent = "Could not load app status: " + (res.error || "unknown");
+                    listEl.innerHTML = '<span style="color:#dc2626;font-size:0.85rem;">Could not load app status: ' + (res.error || "unknown") + '</span>';
                 }
-                chownBtn.disabled = true;
+                updateMigAppsButtons();
                 return;
             }
             const apps = res.apps || {};
             const names = Object.keys(apps).filter(n => n !== "backup");
+            cachedAppsList = names.map(n => ({ name: n, status: apps[n].status || "unknown" }));
+
             if (names.length === 0) {
-                listEl.textContent = "No apps deployed (besides backup).";
-                chownBtn.disabled = false;
+                listEl.innerHTML = '<span style="font-size:0.85rem;color:#666;">No apps deployed (besides backup).</span>';
+                updateMigAppsButtons();
                 return;
             }
-            const selected = getSelectedApps();
-            const targetNames = selected ? names.filter(n => selected.includes(n)) : names;
-            const lines = names.map(n => {
-                const s = apps[n].status || "unknown";
-                const color = s === "running" ? "#16a34a" : s === "stopped" ? "#6b7280" : "#d97706";
-                const isTarget = !selected || selected.includes(n);
-                const style = isTarget ? `color:${color};font-weight:600;` : `color:#9ca3af;font-weight:normal;`;
-                return `<span style="${style}">${n}</span>: ${s}`;
-            });
-            listEl.innerHTML = lines.join(" &nbsp;&middot;&nbsp; ");
-            const targetStopped = targetNames.length > 0 && targetNames.every(n => apps[n].status === "stopped" || apps[n].status === "error");
-            chownBtn.disabled = !targetStopped;
+
+            listEl.innerHTML = cachedAppsList.map(app => {
+                const isChecked = selectedAppNames === null || selectedAppNames.has(app.name);
+                const s = app.status;
+                const badgeClass = s === "running" ? "status-success" : s === "stopped" ? "status-none" : "status-warning";
+                return `
+                    <label style="display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid #e5e7eb;border-radius:6px;background:white;cursor:pointer;user-select:none;">
+                        <input type="checkbox" class="mig-app-cb" value="${app.name}" ${isChecked ? "checked" : ""} onchange="onMigAppCheckboxChange()" style="margin:0;cursor:pointer;">
+                        <span style="font-size:0.85rem;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${app.name}</span>
+                        <span class="status-badge ${badgeClass}" style="margin-left:auto;font-size:0.72rem;padding:2px 6px;">${s}</span>
+                    </label>
+                `;
+            }).join("");
+
+            updateMigAppsButtons();
         }
 
         async function stopApps() {
+            const selected = getSelectedApps();
+            if (selected !== null && selected.length === 0) {
+                showMsg("premig-msg", "No apps selected to stop.", false);
+                return;
+            }
             const btn = document.getElementById("btn-stop-apps");
             btn.disabled = true;
             btn.textContent = "Stopping...";
-            const selected = getSelectedApps();
             const res = await api("/api/stop-all-apps", {
                 method: "POST",
                 body: selected ? { apps: selected } : {}
@@ -626,10 +684,14 @@
         }
 
         async function chownAppData() {
+            const selected = getSelectedApps();
+            if (selected !== null && selected.length === 0) {
+                showMsg("premig-msg", "No apps selected for fixing ownership.", false);
+                return;
+            }
             const btn = document.getElementById("btn-chown");
             btn.disabled = true;
             btn.textContent = "Fixing ownership...";
-            const selected = getSelectedApps();
             const res = await api("/api/chown-app-data", {
                 method: "POST",
                 body: selected ? { apps: selected } : {}
@@ -1339,6 +1401,10 @@
             const targetUrl = document.getElementById("push-target-url").value.trim();
             const targetToken = document.getElementById("push-target-token").value.trim();
             const selected = getSelectedApps();
+            if (selected !== null && selected.length === 0) {
+                showMsg("mig-msg", "Select at least one app to migrate", false);
+                return;
+            }
             if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
             if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
             const promptTarget = selected ? selected.join(", ") : "all apps and data";
