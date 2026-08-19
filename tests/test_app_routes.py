@@ -280,15 +280,15 @@ class TestStopAllAppsEndpoint:
         assert "agent" not in data["stopped"]  # already stopped
         backup_app.ROUTER_API_TOKEN = ""
 
-    async def test_stops_running_apps_when_router_returns_list(self, client):
-        """Stop all apps works when the router API returns a list of dicts."""
+    async def test_stops_partial_selected_apps(self, client):
+        """Stop endpoint only stops requested apps when apps filter is provided."""
         mock_apps_resp = MagicMock()
         mock_apps_resp.status_code = 200
         mock_apps_resp.headers = {"content-type": "application/json"}
         mock_apps_resp.json.return_value = [
-            {"app_id": "id-secrets", "name": "secrets", "status": "running"},
+            {"app_id": "id-app1", "name": "app1", "status": "running"},
+            {"app_id": "id-app2", "name": "app2", "status": "running"},
             {"app_id": "id-backup", "name": "backup", "status": "running"},
-            {"app_id": "id-agent", "name": "agent", "status": "stopped"},
         ]
 
         mock_stop_resp = MagicMock()
@@ -302,15 +302,12 @@ class TestStopAllAppsEndpoint:
         with patch("httpx.AsyncClient") as mock_cls:
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-            response = await client.post("/api/stop-all-apps")
+            response = await client.post("/api/stop-all-apps", json={"apps": ["app1"]})
         data = await response.get_json()
         assert data["ok"] is True
-        assert "secrets" in data["stopped"]
-        assert "backup" not in data["stopped"]
-        assert "agent" not in data["stopped"]
-        # The stop call must address the app by id, not name
+        assert data["stopped"] == ["app1"]
         stop_urls = [c.args[0] for c in mock_client.post.call_args_list]
-        assert stop_urls and all("/stop_app/id-secrets" in u for u in stop_urls)
+        assert stop_urls == ["http://localhost:8080/stop_app/id-app1"]
         backup_app.ROUTER_API_TOKEN = ""
 
 
@@ -418,6 +415,26 @@ class TestChownAppDataEndpoint:
         # The subuid-mapped path must never have been chown'd.
         chowned_paths = {call_args[0][0] for call_args in mock_chown.call_args_list}
         assert not any(p.endswith("postgres_conf") for p in chowned_paths)
+        backup_app.ROUTER_API_TOKEN = ""
+
+    @patch("app._get_router_apps")
+    async def test_chown_partial_apps_allowed_if_target_stopped(
+        self, mock_get, client
+    ):
+        """Chown for selected apps succeeds even if an unselected app is running."""
+        mock_get.return_value = {
+            "secrets": {"status": "running"},
+            "myapp": {"status": "stopped"},
+            "backup": {"status": "running"},
+        }
+        (backup_app.ALL_APP_DATA / "myapp").mkdir(exist_ok=True)
+        (backup_app.ALL_APP_DATA / "myapp" / "data.txt").touch()
+
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        with patch("os.chown") as mock_chown:
+            response = await client.post("/api/chown-app-data", json={"apps": ["myapp"]})
+        data = await response.get_json()
+        assert data["ok"] is True
         backup_app.ROUTER_API_TOKEN = ""
 
     @patch("app._get_router_apps")
@@ -618,14 +635,15 @@ class TestPostConfigSensitiveWrites:
             assert resp.status_code == 200
             assert backup_app.load_config()["router_api_token"] == "rotated-direct"
 
-        # Clearing the token.
-        resp = await client.post(
-            "/api/config",
-            data=json.dumps({"router_api_token": ""}),
-            headers={"Content-Type": "application/json"},
-        )
-        assert resp.status_code == 200
-        assert backup_app.load_config()["router_api_token"] == ""
+        # Clearing the token requires caller Bearer authorization.
+        with patch.object(backup_app, "_verify_admin_token", new=AsyncMock(return_value=True)):
+            resp = await client.post(
+                "/api/config",
+                data=json.dumps({"router_api_token": ""}),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer admin-token"},
+            )
+            assert resp.status_code == 200
+            assert backup_app.load_config()["router_api_token"] == ""
 
     async def test_router_test_endpoint(self, client):
         """Tests the POST /api/router/test endpoint."""

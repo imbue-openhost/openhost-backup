@@ -370,23 +370,9 @@
         </section>
 
         <section>
-            <h2>Pre-migration tools</h2>
-            <p class="info">
-                Stop all applications and fix potential file ownership issues. If you don't know what that means, you should do this. Migrations without stopping applications should only be performed if you have a specific reason to do so.
-            </p>
-
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
-                <button class="btn-primary" id="btn-stop-all" onclick="stopAllApps()">Stop all apps</button>
-                <button class="btn-primary" id="btn-chown" onclick="chownAppData()" disabled>Fix file ownership (chown)</button>
-            </div>
-            <div id="apps-status-list" style="font-size:0.85rem;color:#555;margin-bottom:8px;"></div>
-            <div id="premig-msg"></div>
-        </section>
-
-        <section>
             <h2>Migrate to another instance</h2>
             <p class="info">
-                Move all your apps and data to another Cloud in a Bottle instance.
+                Move your apps and data to another Cloud in a Bottle instance.
                 Install the backup app on both instances, then generate an API token
                 on the destination. Your data will be transferred and your applications
                 will be restarted on the other side.
@@ -402,10 +388,8 @@
                     written. Apps not included in the migration will be stopped during the
                     transfer and restarted afterward.
                     <br><br>
-                    <strong>Tip:</strong> It is a good idea to stop applications on this
-                    instance before migrating, especially databases or apps that might not
-                    transfer correctly if they are actively writing data. Stopping is not
-                    required, but it reduces the risk of inconsistent data.
+                    <strong>Tip:</strong> Stop applications on this instance before migrating
+                    to avoid transferring inconsistent data while apps are actively writing.
                     <br><br>
                     <strong>Not migrated:</strong> API tokens, owner password, and other
                     system-level settings are not transferred.
@@ -417,6 +401,18 @@
                     for the full list.
                 </div>
             </details>
+
+            <div style="margin-bottom:12px;">
+                <label>Applications to migrate</label>
+                <input type="text" id="mig-apps" value="all" placeholder="all, or comma-separated app names (e.g. myapp, database)" oninput="refreshAppsStatus()">
+                <div id="apps-status-list" style="font-size:0.85rem;color:#555;margin-top:4px;"></div>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+                <button class="btn-primary" id="btn-stop-apps" onclick="stopApps()">Stop apps</button>
+                <button class="btn-primary" id="btn-chown" onclick="chownAppData()" disabled>Fix file ownership (chown)</button>
+            </div>
+            <div id="premig-msg"></div>
 
             <div style="margin-bottom:12px;">
                 <label>Destination instance URL</label>
@@ -563,6 +559,15 @@
            Pre-migration
            ================================================================ */
 
+        function getSelectedApps() {
+            const el = document.getElementById("mig-apps");
+            if (!el) return null;
+            const val = el.value.trim();
+            if (!val || val.toLowerCase() === "all" || val === "*") return null;
+            const list = val.split(",").map(s => s.trim()).filter(Boolean);
+            return list.length > 0 ? list : null;
+        }
+
         async function refreshAppsStatus() {
             const res = await api("/api/apps-status");
             const listEl = document.getElementById("apps-status-list");
@@ -584,28 +589,36 @@
                 chownBtn.disabled = false;
                 return;
             }
+            const selected = getSelectedApps();
+            const targetNames = selected ? names.filter(n => selected.includes(n)) : names;
             const lines = names.map(n => {
                 const s = apps[n].status || "unknown";
                 const color = s === "running" ? "#16a34a" : s === "stopped" ? "#6b7280" : "#d97706";
-                return `<span style="color:${color};font-weight:600;">${n}</span>: ${s}`;
+                const isTarget = !selected || selected.includes(n);
+                const style = isTarget ? `color:${color};font-weight:600;` : `color:#9ca3af;font-weight:normal;`;
+                return `<span style="${style}">${n}</span>: ${s}`;
             });
             listEl.innerHTML = lines.join(" &nbsp;&middot;&nbsp; ");
-            const allStopped = names.every(n => apps[n].status === "stopped" || apps[n].status === "error");
-            chownBtn.disabled = !allStopped;
+            const targetStopped = targetNames.length > 0 && targetNames.every(n => apps[n].status === "stopped" || apps[n].status === "error");
+            chownBtn.disabled = !targetStopped;
         }
 
-        async function stopAllApps() {
-            const btn = document.getElementById("btn-stop-all");
+        async function stopApps() {
+            const btn = document.getElementById("btn-stop-apps");
             btn.disabled = true;
             btn.textContent = "Stopping...";
-            const res = await api("/api/stop-all-apps", { method: "POST" });
+            const selected = getSelectedApps();
+            const res = await api("/api/stop-all-apps", {
+                method: "POST",
+                body: selected ? { apps: selected } : {}
+            });
             btn.disabled = false;
-            btn.textContent = "Stop all apps";
+            btn.textContent = "Stop apps";
             if (res.ok) {
                 const stopped = res.stopped || [];
                 showMsg("premig-msg", stopped.length > 0
                     ? "Stopped: " + stopped.join(", ")
-                    : "No apps were running.", true);
+                    : "No matching apps were running.", true);
             } else {
                 showMsg("premig-msg", "Error: " + (res.error || "unknown"), false);
             }
@@ -616,7 +629,11 @@
             const btn = document.getElementById("btn-chown");
             btn.disabled = true;
             btn.textContent = "Fixing ownership...";
-            const res = await api("/api/chown-app-data", { method: "POST" });
+            const selected = getSelectedApps();
+            const res = await api("/api/chown-app-data", {
+                method: "POST",
+                body: selected ? { apps: selected } : {}
+            });
             btn.disabled = false;
             btn.textContent = "Fix file ownership (chown)";
             if (res.ok) {
@@ -1321,16 +1338,22 @@
         async function startPush() {
             const targetUrl = document.getElementById("push-target-url").value.trim();
             const targetToken = document.getElementById("push-target-token").value.trim();
+            const selected = getSelectedApps();
             if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
             if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
-            if (!confirm("Migrate all apps and data to " + targetUrl + "?")) return;
+            const promptTarget = selected ? selected.join(", ") : "all apps and data";
+            if (!confirm("Migrate " + promptTarget + " to " + targetUrl + "?")) return;
 
             const btn = document.getElementById("btn-push");
             btn.disabled = true;
             btn.textContent = "Migrating...";
             const res = await api("/api/migration/push", {
                 method: "POST",
-                body: { target_url: targetUrl, target_token: targetToken }
+                body: {
+                    target_url: targetUrl,
+                    target_token: targetToken,
+                    ...(selected ? { apps: selected } : {})
+                }
             });
             if (res.ok) {
                 showMsg("mig-msg", "Migration started", true);

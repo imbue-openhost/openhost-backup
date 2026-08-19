@@ -94,13 +94,27 @@ def _strip_url_credentials(url: str | None) -> str | None:
     return url
 
 
+def _is_ip_or_localhost(host: str) -> bool:
+    """Check if host is an IP address or local hostname."""
+    h = host.lower()
+    if h in ("localhost", "host.docker.internal") or h.endswith(".local"):
+        return True
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return False
+
+
 def _target_backup_url(target_url: str) -> str:
     """URL of the backup app on the target zone (the router routes by subdomain)."""
     if "://" not in target_url:
         target_url = "https://" + target_url
     parsed = urllib.parse.urlparse(target_url)
     host = parsed.hostname or ""
-    if not host.startswith("backup."):
+    if not _is_ip_or_localhost(host) and not host.startswith("backup."):
         host = f"backup.{host}"
     netloc = host + (f":{parsed.port}" if parsed.port else "")
     return f"{parsed.scheme}://{netloc}"
@@ -111,12 +125,9 @@ def _is_local_url(url: str) -> bool:
     try:
         parsed = urllib.parse.urlparse(url)
         host = (parsed.hostname or "").lower()
-        return host in (
-            "localhost",
-            "127.0.0.1",
-            "::1",
-            "host.docker.internal",
-        ) or host.endswith(".local")
+        if host.startswith("backup."):
+            host = host[len("backup.") :]
+        return _is_ip_or_localhost(host)
     except Exception:
         logger.warning("Failed to parse URL in _is_local_url: %s", url)
         return False
@@ -165,14 +176,31 @@ async def _router_post(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
     async with httpx.AsyncClient(verify=not skip_verify, timeout=120) as client:
-        r = await client.post(url, json=data, headers=headers)
+        kwargs = {"headers": headers}
+        if data is not None:
+            kwargs["json"] = data
+        r = await client.post(url, **kwargs)
         r.raise_for_status()
         ct = r.headers.get("content-type", "")
-        if "json" not in ct:
+        if "text/html" in ct:
             raise RuntimeError(
-                f"Router returned non-JSON response (HTTP {r.status_code}); API token may be invalid"
+                f"Router returned HTML response (HTTP {r.status_code}); API token may be invalid"
             )
-        return r.json()
+        if "json" in ct:
+            return r.json()
+        return {"ok": True, "text": r.text}
+
+
+def _normalize_app_listing(listing: dict | list) -> list[dict]:
+    """Normalize router app listing to a list of app dicts."""
+    if isinstance(listing, dict):
+        return [
+            {"name": name, **(info if isinstance(info, dict) else {})}
+            for name, info in listing.items()
+        ]
+    if isinstance(listing, list):
+        return [a for a in listing if isinstance(a, dict)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -246,10 +274,10 @@ async def get_apps_metadata(
 
     # Fall back to the router HTTP API
     data = await _router_get("/api/apps", token=token, base_url=base_url or router_url)
-    for item in data:
+    for item in _normalize_app_listing(data):
         apps.append(
             {
-                "name": item["name"],
+                "name": item.get("name"),
                 "status": item.get("status"),
                 "repo_url": None,
                 "manifest_raw": None,
@@ -531,6 +559,7 @@ async def run_direct_push(
         total = len(accepted_apps)
 
         for i, app_name in enumerate(accepted_apps):
+            lock.touch()
             app_dir = all_app_data / app_name
             if not app_dir.exists():
                 _log(f"Skipping {app_name}: no local data directory")
@@ -796,14 +825,15 @@ async def receive_start(
             existing = await _router_get(
                 "/api/apps", token=router_token, base_url=router_url
             )
-            for item in existing:
-                app_name = item["name"]
-                if app_name == "backup":
+            for item in _normalize_app_listing(existing):
+                app_name = item.get("name")
+                if not app_name or app_name == "backup":
                     continue
                 if item.get("status") in ("running", "building", "starting"):
+                    app_id = item.get("app_id") or item.get("id") or app_name
                     try:
                         await _router_post(
-                            f"/stop_app/{item['app_id']}",
+                            f"/stop_app/{app_id}",
                             token=router_token,
                             base_url=router_url,
                         )
@@ -1038,7 +1068,11 @@ async def receive_finalize(
             listing = await _router_get(
                 "/api/apps", token=router_token, base_url=router_url
             )
-            name_to_id = {a["name"]: a["app_id"] for a in listing}
+            name_to_id = {
+                a["name"]: (a.get("app_id") or a.get("id") or a["name"])
+                for a in _normalize_app_listing(listing)
+                if a.get("name")
+            }
         except Exception as e:
             _log(f"Receive: could not list apps on target: {e}")
 

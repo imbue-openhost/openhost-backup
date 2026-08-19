@@ -138,6 +138,13 @@ class TestTargetBackupUrl:
         assert f("https://backup.myzone.example.com") == "https://backup.myzone.example.com"
         assert f("https://myzone.example.com:8443") == "https://backup.myzone.example.com:8443"
 
+    def test_preserves_ip_addresses_and_localhost(self):
+        f = migration._target_backup_url
+        assert f("http://192.168.1.50:8080") == "http://192.168.1.50:8080"
+        assert f("http://localhost:8080") == "http://localhost:8080"
+        assert f("http://127.0.0.1:8080") == "http://127.0.0.1:8080"
+        assert f("http://[::1]:8080") == "http://[::1]:8080"
+
 
 class TestValidateName:
     def test_valid_simple(self):

@@ -2061,8 +2061,7 @@ async def post_config():
         bearer = _extract_bearer_token()
         new_token = data.get("router_api_token") or ""
         authorized = (
-            not new_token
-            or await _verify_admin_token(bearer)
+            await _verify_admin_token(bearer)
             or (bool(new_token) and await _verify_admin_token(new_token))
         )
         if not authorized:
@@ -2408,12 +2407,31 @@ async def apps_status():
         return jsonify(ok=False, error=str(e)), 500
 
 
+def _parse_selected_apps(raw: object) -> list[str] | None:
+    """Normalize app selection inputs to a list of app names or None for all."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        val = raw.strip()
+        if not val or val.lower() == "all" or val == "*":
+            return None
+        return [a.strip() for a in val.split(",") if a.strip()]
+    if isinstance(raw, list):
+        if not raw or "all" in raw or "*" in raw:
+            return None
+        return [str(a).strip() for a in raw if str(a).strip()]
+    return None
+
+
 @route("/api/stop-all-apps", methods=["POST"])
+@route("/api/stop-apps", methods=["POST"])
 async def stop_all_apps():
-    """Stop all running apps except the backup app."""
+    """Stop running apps (all or a selected list), excluding backup."""
     router_token = _extract_bearer_token() or get_router_api_token()
     if not router_token:
         return jsonify(ok=False, error="No router API token configured"), 400
+    data = await request.get_json(silent=True) or {}
+    selected_apps = _parse_selected_apps(data.get("apps"))
     try:
         import httpx
 
@@ -2423,10 +2441,13 @@ async def stop_all_apps():
             for app_name, info in apps.items():
                 if app_name == "backup":
                     continue
+                if selected_apps and app_name not in selected_apps:
+                    continue
                 if info.get("status") in ("running", "building", "starting"):
+                    app_id = info.get("app_id") or info.get("id") or app_name
                     try:
                         sr = await client.post(
-                            f"{ROUTER_URL}/stop_app/{info['app_id']}",
+                            f"{ROUTER_URL}/stop_app/{app_id}",
                             headers={"Authorization": f"Bearer {router_token}"},
                         )
                         if sr.status_code == 200:
@@ -2456,43 +2477,33 @@ _SUBUID_FLOOR: int = 100000
 
 @route("/api/chown-app-data", methods=["POST"])
 async def chown_app_data():
-    """Recursively chown app_data to the host user, skipping subuid-mapped files.
-
-    Only allowed when all non-backup apps are stopped, to prevent
-    ownership changes on files being actively written.
-
-    Files whose current owner uid is at or above ``_SUBUID_FLOOR`` are
-    assumed to be subuid-mapped state owned by a non-root in-container
-    user (e.g. postgres at uid 70 → host uid 165605) and are left alone.
-    Chowning those would destroy the user-namespace mapping and break the
-    affected app.
-    """
+    """Recursively chown app_data to the host user, skipping subuid-mapped files."""
     router_token = _extract_bearer_token() or get_router_api_token()
     if not router_token:
         return jsonify(ok=False, error="No router API token configured"), 400
 
-    # Check that all non-backup apps are stopped
+    data = await request.get_json(silent=True) or {}
+    selected_apps = _parse_selected_apps(data.get("apps"))
+
+    # Check that targeted non-backup apps are stopped
     try:
         apps = await _get_router_apps(router_token)
         running = [
             name
             for name, info in apps.items()
             if name != "backup"
+            and (selected_apps is None or name in selected_apps)
             and info.get("status") in ("running", "building", "starting")
         ]
         if running:
             return jsonify(
                 ok=False,
                 error=f"Apps still running: {', '.join(running)}. "
-                "Stop all apps before fixing ownership.",
+                "Stop them before fixing ownership.",
             ), 400
     except Exception as e:
         return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
 
-    # Run chown on the entire app_data directory.
-    # We hardcode uid/gid 1000 (the default host user) because inside the
-    # Docker container the parent directory is owned by root, so the
-    # auto-detect logic in _fix_permissions would chown to root.
     if not ALL_APP_DATA.is_dir():
         return jsonify(
             ok=False, error=f"app_data directory not found: {ALL_APP_DATA}"
@@ -2500,14 +2511,6 @@ async def chown_app_data():
 
     target_uid = 1000
     target_gid = 1000
-    app_data = str(ALL_APP_DATA)
-    logger.info(
-        "chown -R %s:%s %s (skipping subuid-mapped files)",
-        target_uid,
-        target_gid,
-        app_data,
-    )
-
     count = 0
     skipped = 0
     errors = 0
@@ -2521,8 +2524,6 @@ async def chown_app_data():
             logger.warning("stat failed for %s: %s", path, e)
             return
         if st.st_uid >= _SUBUID_FLOOR or st.st_gid >= _SUBUID_FLOOR:
-            # Subuid-mapped state owned by a non-root in-container user.
-            # Leaving it alone keeps that app working.
             skipped += 1
             return
         try:
@@ -2532,10 +2533,32 @@ async def chown_app_data():
             errors += 1
             logger.warning("chown failed for %s: %s", path, e)
 
-    for root, dirs, files in os.walk(app_data):
-        for name in dirs + files:
-            _chown_one(os.path.join(root, name))
-    _chown_one(app_data)
+    def _chown_tree(dir_path: Path) -> None:
+        if not dir_path.exists():
+            return
+        path_str = str(dir_path)
+        for root, dirs, files in os.walk(path_str):
+            for name in dirs + files:
+                _chown_one(os.path.join(root, name))
+        _chown_one(path_str)
+
+    if selected_apps:
+        for app_name in selected_apps:
+            _chown_tree(ALL_APP_DATA / app_name)
+    else:
+        _chown_tree(ALL_APP_DATA)
+
+    logger.info(
+        "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
+    )
+    return jsonify(
+        ok=True,
+        message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid}); "
+        f"skipped {skipped} subuid-mapped items",
+        count=count,
+        skipped=skipped,
+        errors=errors,
+    )
 
     logger.info(
         "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
@@ -2591,10 +2614,11 @@ async def trigger_direct_push():
         op_lock.release(OpKind.MIGRATION)
         return jsonify(ok=False, error="Missing target_token"), 400
 
-    selected_apps = data.get("apps")  # optional list
-    if selected_apps is not None and not isinstance(selected_apps, list):
+    raw_apps = data.get("apps")
+    if raw_apps is not None and not isinstance(raw_apps, (list, str)):
         op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="'apps' must be a list"), 400
+        return jsonify(ok=False, error="'apps' must be a list or string"), 400
+    selected_apps = _parse_selected_apps(raw_apps)
 
     router_token = _extract_bearer_token() or get_router_api_token()
 
