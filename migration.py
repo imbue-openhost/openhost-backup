@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import json
 import logging
 import os
 import re
@@ -25,6 +24,7 @@ import tarfile
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -75,7 +75,9 @@ def _strip_url_credentials(url: str | None) -> str | None:
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.username or parsed.password:
-            netloc = parsed.hostname or ""
+            host = parsed.hostname or ""
+            formatted_host = f"[{host}]" if ":" in host else host
+            netloc = formatted_host
             if parsed.port:
                 netloc += f":{parsed.port}"
             return urllib.parse.urlunparse(
@@ -116,7 +118,8 @@ def _target_backup_url(target_url: str) -> str:
     host = parsed.hostname or ""
     if not _is_ip_or_localhost(host) and not host.startswith("backup."):
         host = f"backup.{host}"
-    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    formatted_host = f"[{host}]" if ":" in host else host
+    netloc = formatted_host + (f":{parsed.port}" if parsed.port else "")
     return f"{parsed.scheme}://{netloc}"
 
 
@@ -176,7 +179,7 @@ async def _router_post(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     skip_verify = _is_local_url(base_url)
     async with httpx.AsyncClient(verify=not skip_verify, timeout=120) as client:
-        kwargs = {"headers": headers}
+        kwargs: dict[str, Any] = {"headers": headers}
         if data is not None:
             kwargs["json"] = data
         r = await client.post(url, **kwargs)
@@ -1127,7 +1130,11 @@ async def receive_finalize(
             try:
                 await _router_post(
                     "/api/add_app",
-                    data={"repo_url": repo_url, "app_name": app_name},
+                    data={
+                        "repo_url": repo_url,
+                        "app_name": app_name,
+                        "grant_permissions_v2": True,
+                    },
                     token=router_token,
                     base_url=router_url,
                 )
@@ -1157,7 +1164,11 @@ async def receive_finalize(
                 try:
                     await _router_post(
                         "/api/add_app",
-                        data={"repo_url": builtin_url, "app_name": app_name},
+                        data={
+                            "repo_url": builtin_url,
+                            "app_name": app_name,
+                            "grant_permissions_v2": True,
+                        },
                         token=router_token,
                         base_url=router_url,
                     )

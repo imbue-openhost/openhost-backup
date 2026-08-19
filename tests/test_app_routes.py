@@ -11,7 +11,6 @@ import io
 import json
 import os
 import tarfile
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -307,7 +306,7 @@ class TestStopAllAppsEndpoint:
         assert data["ok"] is True
         assert data["stopped"] == ["app1"]
         stop_urls = [c.args[0] for c in mock_client.post.call_args_list]
-        assert stop_urls == ["http://localhost:8080/stop_app/id-app1"]
+        assert stop_urls == [f"{backup_app.ROUTER_URL}/stop_app/id-app1"]
         backup_app.ROUTER_API_TOKEN = ""
 
 

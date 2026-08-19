@@ -14,7 +14,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import gzip
 import io
 import os
 import tarfile
@@ -243,6 +242,11 @@ class TestStripUrlCredentials:
         url = "https://user:pass@example.com/path?foo=bar#section"
         result = _strip_url_credentials(url)
         assert result == "https://example.com/path?foo=bar#section"
+
+    def test_strips_ipv6_credentials(self):
+        url = "https://user:pass@[::1]:8080/repo.git"
+        result = _strip_url_credentials(url)
+        assert result == "https://[::1]:8080/repo.git"
 
 
 # ---------------------------------------------------------------------------

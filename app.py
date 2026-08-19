@@ -785,6 +785,7 @@ async def test_restic_connection(
     buf = bytearray()
 
     async def drain() -> None:
+        assert proc.stderr is not None
         while True:
             chunk = await proc.stderr.read(4096)
             if not chunk:
@@ -2372,7 +2373,12 @@ async def _get_router_apps(router_token: str) -> dict:
             raise RuntimeError(f"Router returned HTTP {r.status_code}")
         if "json" not in r.headers.get("content-type", ""):
             raise RuntimeError("Router API token is invalid or unauthorized (non-JSON response)")
-        return {a["name"]: a for a in r.json()}
+        listing = r.json()
+        return {
+            a["name"]: a
+            for a in migration._normalize_app_listing(listing)
+            if isinstance(a, dict) and a.get("name")
+        }
 
 
 @route("/api/router/test", methods=["POST"])
@@ -2547,18 +2553,6 @@ async def chown_app_data():
             _chown_tree(ALL_APP_DATA / app_name)
     else:
         _chown_tree(ALL_APP_DATA)
-
-    logger.info(
-        "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
-    )
-    return jsonify(
-        ok=True,
-        message=f"Ownership fixed on {count} items (uid={target_uid}, gid={target_gid}); "
-        f"skipped {skipped} subuid-mapped items",
-        count=count,
-        skipped=skipped,
-        errors=errors,
-    )
 
     logger.info(
         "chown complete: %d items fixed, %d skipped, %d errors", count, skipped, errors
