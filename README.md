@@ -6,7 +6,7 @@ User-controlled incremental backups and cross-instance migration for Cloud in a 
 
 This app backs up the persistent data on a Cloud in a Bottle instance to a storage backend you control: S3, Backblaze B2, SFTP, Google Cloud Storage, Azure Blob, OpenStack Swift, rclone remotes, a restic REST server, or a local directory. Backups are incremental and deduplicated (restic handles this automatically), so only changed data is transferred on each run. It also provides a migration tool that pushes apps and data from one Cloud in a Bottle instance to another over HTTP.
 
-The app has `access_all_data = true` in its manifest, which means it can see and back up every app's persistent data directory, temp data, and VM-level data. The archive tier (`/data/app_archive`) is intentionally excluded because it already lives in durable storage (an S3 bucket or host-managed local archive).
+The app has `access_all_app_data = true` in its manifest, which means it can see every app's persistent, temporary, and archive data. Restic snapshots include persistent and temporary data; the archive tier (`/data/app_archive`) is intentionally excluded because it already lives in durable storage (an S3 bucket or host-managed local archive).
 
 ## Getting started
 
@@ -191,7 +191,7 @@ All routes are registered at both `/path` and `/backup/path` to handle the Cloud
 | `operations.py` | Mutual-exclusion lock ensuring only one backup, restore, migration, or prune runs at a time |
 | `migration.py` | Cross-instance migration logic (direct push protocol, tar streaming, app deployment) |
 | `Dockerfile` | Python 3.12 Alpine image with restic and uv |
-| `openhost.toml` | App manifest (2048 MB memory, 1000 millicores CPU, `access_all_data = true`) |
+| `openhost.toml` | App manifest (2048 MB memory, 1000 millicores CPU, `access_all_app_data = true`) |
 | `templates/index.html` | Single-page web UI with Backups and Migrate tabs |
 | `tests/` | Pytest test suite covering routes, exclude logic, and migration |
 

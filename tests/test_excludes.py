@@ -1,7 +1,7 @@
 """Verify the backup app excludes the archive tier.
 
 The archive tier (``/data/app_archive`` inside the container) is
-mounted by Cloud in a Bottle when the manifest opts into ``access_all_data``,
+mounted by Cloud in a Bottle when the manifest opts into ``access_all_app_data``,
 but the bytes shouldn't end up in restic snapshots — they live in
 the archive backend (local persistent disk or S3 via JuiceFS) and
 have their own durability story.

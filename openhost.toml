@@ -15,4 +15,4 @@ memory_mb = 2048
 cpu_cores = 1.0
 
 [data]
-access_all_data = true
+access_all_app_data = true
