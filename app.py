@@ -33,7 +33,7 @@ APP_TEMP_DATA = Path("/data/app_temp_data")
 APP_ARCHIVE = Path("/data/app_archive")
 VM_DATA_DIR = Path("/data/vm_data")
 
-# Roots the backup app captures when the ``access_all_data = true``
+# Roots the backup app captures when the ``access_all_app_data = true``
 # manifest permission is in effect. Order is significant only for UI
 # display (``list_snapshot_files`` surfaces these as the top-level
 # entries when ``root`` is unset). Any root that doesn't exist on disk
@@ -41,7 +41,7 @@ VM_DATA_DIR = Path("/data/vm_data")
 # instances that only grant a subset of these mounts.
 BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
 
-# ``access_all_data = true`` mounts ``/data/app_archive`` into the
+# ``access_all_app_data = true`` mounts ``/data/app_archive`` into the
 # container so the backup app can see it for migration / inspection,
 # but the archive tier is intentionally NOT backed up:
 #
@@ -1990,7 +1990,7 @@ def _backup_scope_summary() -> dict:
 
     Surfaced in the UI so the user can tell, at a glance, that
     ``/data/app_archive`` is intentionally outside the snapshot —
-    important because access_all_data mounts the archive into the
+    important because access_all_app_data mounts the archive into the
     backup container and the file-browser path can otherwise leave
     the impression that those bytes will be in the next snapshot.
 
